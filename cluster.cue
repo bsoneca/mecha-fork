@@ -1231,10 +1231,21 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 			// ticker with nothing to sweep is a container answering pokes nobody
 			// sends.
 			if X._wakes {
-				ticker: X._image & {
+				ticker: X._image & X._host & {
 					dockerfile: {
 						from: (_from & {in: X.meta.images.ticker}).out
 						workdir: "/app"
+					}
+					expose: http: {port: 9998, env: "PORT"}
+					entrypoint: {
+						do:    "exec deno run --config \(mechaDir)/services/ticker/deno.json --allow-net --allow-env \(mechaDir)/services/ticker/main.ts"
+						shell: "sh"
+						dockerfile: {
+							do:    "deno run --allow-net --allow-env main.ts"
+							shell: "exec"
+						}
+						env: compose.environment
+						after: crud: "healthy"
 					}
 					compose: {
 						depends_on: crud: _healthy
@@ -1259,8 +1270,18 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 				}
 				// What pokes the ticker. services/clock/clock.yaml states the
 				// pipeline and why the cadence is what it is.
-				clock: X._image & {
+				clock: X._image & X._host & {
 					dockerfile: from: (_from & {in: X.meta.images.clock}).out
+					entrypoint: {
+						do:    "exec redpanda-connect run \(mechaDir)/services/clock/clock.yaml"
+						shell: "sh"
+						dockerfile: {
+							do:    "/redpanda-connect run /clock.yaml"
+							shell: "exec"
+						}
+						env: compose.environment
+						after: ticker: "started"
+					}
 					compose: {
 						depends_on: ticker: _started
 						environment: {
