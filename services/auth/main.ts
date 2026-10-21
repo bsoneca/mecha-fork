@@ -717,5 +717,6 @@ export async function handler(req: Request): Promise<Response> {
 
 if (import.meta.main) {
   await migrate();
-  Deno.serve({ port: 9999 }, handler);
+  // A host launch moves the port (cluster.cue); a container keeps 9999.
+  Deno.serve({ port: Number(Deno.env.get("AUTH_PORT") ?? 9999) }, handler);
 }

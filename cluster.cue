@@ -18,6 +18,7 @@
 package cluster
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"list"
 	"path"
@@ -214,6 +215,9 @@ _completed: {condition: "service_completed_successfully"}
 	file:   string // path relative to the app dir
 	target: string // absolute path inside the serving container
 	watch:  *false | bool
+	// A file of a mise tool's tree rather than the app's (meta.toolStatics):
+	// `file` is then from that tool's install directory.
+	tool?: string
 }
 
 // Where an image comes from, in bayt's own `from` arms: a target ref
@@ -365,6 +369,70 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		activate: ""
 	}
 
+	// A target the host runs too, under process-compose (bayt's
+	// gen_process_compose), as its `entrypoint.do`; its image keeps its own
+	// process as `entrypoint.dockerfile.do`. The host's tools are the
+	// cluster's toolchain (toolchain/tools.cue), which an app's mise pins, and
+	// its scripts are this runtime's, which mise installs as
+	// github:bonisoft3/mecha.
+	_host: "process-compose": activate: "mise x --"
+
+	// A path as one shell word. It holds no quote: process-compose rewrites
+	// the backslash a quote needs to be escaped with.
+	_quote: Q={
+		in:  string & !~"'"
+		out: "'\(Q.in)'"
+	}
+
+	// The schema a reader waits on, as an entrypoint waits: _schemaReady's
+	// targets, each run by the host too.
+	_schemaAfter: {
+		database: "healthy"
+		if len(X.state.pgroll) > 0 {migrate: "completed"}
+		if len(X.state.effects) > 0 {"airlock-upgrade": "completed"}
+		if len(X.state.timers) > 0 {"timer-check": "completed"}
+	}
+
+	// A one-shot that applies one SQL script in one transaction: the image
+	// carries it as a file, the host hands it to psql on stdin, in base64,
+	// which no shell or supervisor reads into. Its waits are its
+	// entrypoint's, which compose reads as well.
+	_psqlStep: P={
+		name: string
+		file: string
+		sql:  string
+		after: [string]: string
+		let _psql = "psql -X --set=ON_ERROR_STOP=1 --single-transaction"
+		out: {
+			dockerfile: epilogue: ["COPY <<'\(P.name)' \(P.file)\n\(P.sql)\n\(P.name)"]
+			entrypoint: {
+				do:    "printf %s \(base64.Encode(null, P.sql)) | base64 -d | \(_psql)"
+				shell: "sh"
+				dockerfile: {
+					do:    "\(_psql) --file=\(P.file)"
+					shell: "exec"
+				}
+				"after": P.after
+			}
+		}
+	}
+
+	// Each initdb step as the host reads it (services/database/host.sh): the
+	// image's own steps from this runtime's tree, the caller's from the app.
+	_hostInitdb: {
+		for _, m in X._initdb {
+			(path.Base(m, path.Unix)): [
+				if m == #TenancyMigration {"{mecha}/services/database/rls/rls.sql"},
+				if m == #ElectricPasswordStep {"{mecha}/services/database/electric_password.sh"},
+				if m == #ScheduleMigration {"{mecha}/services/ticker/schedule.sql"},
+				if m == #GraphileMigration {"{mecha}/services/airlock/graphile.sql"},
+				// The image's 012 carries the schedule table ahead of the ledger.
+				if m == #AirlockMigration {"{mecha}/services/ticker/schedule.sql+{mecha}/services/airlock/airlock.sql"},
+				m,
+			][0]
+		}
+	}
+
 
 	// What a service that reads the schema waits on: the database, and the
 	// migrations that carry it forward when there are any. A migration that
@@ -427,6 +495,11 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		[if len(X.state.effects) > 0 for m in [#GraphileMigration, #AirlockMigration] {{src: m, dst: m}}],
 	])
 
+	// What the host builds electric from: the image's tag, its commit, and
+	// the Erlang and Elixir electric's Dockerfile builds with.
+	let _electricSource = "1.8.1 0f404200402f918a4b1596bc5c8a53479a435349 29.0.2 1.20.2-otp-29"
+	// This runtime's tree on the host, as a shell word.
+	let mechaDir = "\"$(mise where github:bonisoft3/mecha)\""
 	let databaseUrl = "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@database:5432/${POSTGRES_DB:-\(X.meta.app)}"
 	let jwtSecret = "${PGRST_JWT_SECRET:-\(_devJwtSecret)}"
 	// The role's password and the userinfo of electric's DATABASE_URL at once,
@@ -444,6 +517,14 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		// What the app's absolute addresses are spelled against
 		// (docs/proxy.md, "The origin").
 		"origin": origin
+
+		// Shell commands a host launch runs, in order, before its processes
+		// start: work longer than any readiness probe allows. Electric
+		// publishes no binary, so the host builds it from its source once per
+		// version (services/electric/host.sh), and its process only runs it.
+		hostPrepare: [
+			if X.capabilities.server {"bash \(mechaDir)/services/electric/host.sh build \(_electricSource)"},
+		]
 
 		// How a client on the cluster's network reaches its database, and the
 		// secret crud and auth verify a session token under.
@@ -494,16 +575,22 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		targets: [string]: _
 		targets: {
 			if X.capabilities.server {
-				database: bayt.healthcheck.postgres & X._image & {
+				database: bayt.healthcheck.postgres & X._image & X._host & {
 					healthcheck: {
 						db:             "${POSTGRES_DB:-\(X.meta.app)}"
 						user:           "${POSTGRES_USER:-postgres}"
 						start_interval: "100ms"
 						start_period:   "5m"
 					}
-					expose: pg: port: 5432
+					// postgres reads PGPORT, which the host moves.
+					expose: pg: {port: 5432, env: "PGPORT"}
 					entrypoint: {
-						do:  "docker-entrypoint.sh postgres \(strings.Join(#PostgresArgs, " "))"
+						do:    "exec bash \(mechaDir)/services/database/host.sh \(strings.Join([for k in list.SortStrings([for k, _ in X._hostInitdb {k}]) {"\(k) \((X._quote & {in: X._hostInitdb[k]}).out)"}], " ")) -- \(strings.Join(#PostgresArgs, " "))"
+						shell: "sh"
+						dockerfile: {
+							do:    "docker-entrypoint.sh postgres \(strings.Join(#PostgresArgs, " "))"
+							shell: "exec"
+						}
 						env: compose.environment
 					}
 					srcs: globs: X.state.migrations
@@ -557,12 +644,22 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 				// none has nothing to carry forward, and its first migration
 				// baselines whatever volume it meets.
 				if len(X.state.pgroll) > 0 {
-					migrate: X._image & {
+					migrate: X._image & X._host & {
+						// The host writes each migration where migrate.sh reads it.
+						entrypoint: {
+							// In base64, which no shell or supervisor reads into.
+							do:    "exec bash \(mechaDir)/services/migrate/host.sh \(grammar.#Baseline) \(strings.Join([for n, m in X.state.pgroll {"\(n) \(base64.Encode(null, json.Marshal(m)))"}], " "))"
+							shell: "sh"
+							dockerfile: {
+								do:    "/migrate.sh \(#PgRollDir) \(grammar.#Baseline)"
+								shell: "exec"
+							}
+							env: compose.environment
+							after: database: "healthy"
+						}
 						dockerfile: {
 							// The database's own image, run as the runner.
 							from: (_from & {in: X.meta.images.database}).out
-							entrypoint: ["/migrate.sh"]
-							cmd: [#PgRollDir, grammar.#Baseline]
 							// Each migration is written into the image from the
 							// value state.pgroll holds, so what runs is what was
 							// vetted, and no file beside it can say otherwise. A
@@ -585,13 +682,17 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 					}
 				}
 				if len(X.state.effects) > 0 {
-					"airlock-upgrade": X._image & {
-						dockerfile: {
-							from: (_from & {in: X.meta.images.database}).out
-							entrypoint: ["psql"]
-							cmd: ["-X", "--set=ON_ERROR_STOP=1", "--single-transaction", "--file=/airlock-upgrade.sql"]
-							epilogue: ["COPY <<'AIRLOCK' /airlock-upgrade.sql\n\(#AirlockUpgradeSql)\n\(X.state.effectInterpreters)\nAIRLOCK"]
+					"airlock-upgrade": X._image & X._host & (_psqlStep & {
+						name: "AIRLOCK"
+						file: "/airlock-upgrade.sql"
+						sql:  "\(#AirlockUpgradeSql)\n\(X.state.effectInterpreters)"
+						after: {
+							database: "healthy"
+							if len(X.state.pgroll) > 0 {migrate: "completed"}
 						}
+					}).out & {
+						dockerfile: from: (_from & {in: X.meta.images.database}).out
+						entrypoint: env: compose.environment
 						compose: {
 							depends_on: {
 								database: _healthy
@@ -599,6 +700,7 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							}
 							environment: {
 								PGHOST:     "database"
+								PGPORT:     "5432"
 								PGUSER:     "${POSTGRES_USER:-postgres}"
 								PGPASSWORD: "${POSTGRES_PASSWORD:-postgres}"
 								PGDATABASE: "${POSTGRES_DB:-\(X.meta.app)}"
@@ -607,13 +709,18 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 					}
 				}
 				if len(X.state.timers) > 0 {
-					"timer-check": X._image & {
-						dockerfile: {
-							from: (_from & {in: X.meta.images.database}).out
-							entrypoint: ["psql"]
-							cmd: ["-X", "--set=ON_ERROR_STOP=1", "--single-transaction", "--file=/timer-check.sql"]
-							epilogue: ["COPY <<'TIMERS' /timer-check.sql\n\(X.state.timerCheck)\nTIMERS"]
+					"timer-check": X._image & X._host & (_psqlStep & {
+						name: "TIMERS"
+						file: "/timer-check.sql"
+						sql:  X.state.timerCheck
+						after: {
+							database: "healthy"
+							if len(X.state.pgroll) > 0 {migrate: "completed"}
+							if len(X.state.effects) > 0 {"airlock-upgrade": "completed"}
 						}
+					}).out & {
+						dockerfile: from: (_from & {in: X.meta.images.database}).out
+						entrypoint: env: compose.environment
 						compose: {
 							depends_on: {
 								database: _healthy
@@ -621,15 +728,16 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 								if len(X.state.effects) > 0 {"airlock-upgrade": _completed}
 							}
 							environment: {
-								PGHOST: "database"
-								PGUSER: "${POSTGRES_USER:-postgres}"
+								PGHOST:     "database"
+								PGPORT:     "5432"
+								PGUSER:     "${POSTGRES_USER:-postgres}"
 								PGPASSWORD: "${POSTGRES_PASSWORD:-postgres}"
 								PGDATABASE: "${POSTGRES_DB:-\(X.meta.app)}"
 							}
 						}
 					}
 				}
-				crud: bayt.healthcheck.http & X._image & {
+				crud: bayt.healthcheck.http & X._image & X._host & {
 					healthcheck: {
 						url:            "http://127.0.0.1:3001/ready"
 						interval:       "5s"
@@ -640,13 +748,21 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 						from: name: "postgrest/postgrest:v16.4@sha256:d155c6718ed9a9f990d159a2ab7c0a3f16944dbb6d0a0344557421042acfe0df"
 					}
 					expose: {
-						http:  port: 3000
-						admin: port: 3001
+						http: {port: 3000, env: "PGRST_SERVER_PORT"}
+						admin: {port: 3001, env: "PGRST_ADMIN_SERVER_PORT"}
 					}
 					entrypoint: {
-						do:  "postgrest"
-						env: compose.environment
-						after: database: "healthy"
+						// The host's postgrest for macOS links Homebrew's libpq, which the
+						// cluster's postgres carries too.
+						do:    "DYLD_FALLBACK_LIBRARY_PATH=\"$(pg_config --libdir)\" exec postgrest"
+						shell: "sh"
+						dockerfile: {
+							do:    "postgrest"
+							shell: "exec"
+						}
+						// Each port is its variable's, which the host moves.
+						env: {for k, v in compose.environment if k != "PGRST_SERVER_PORT" && k != "PGRST_ADMIN_SERVER_PORT" {(k): v}}
+						after: X._schemaAfter
 					}
 					compose: {
 						depends_on: X._schemaReady
@@ -672,7 +788,7 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 				}
 			}
 			if X.capabilities.auth {
-				"auth": X._image & {
+				"auth": X._image & X._host & {
 					dockerfile: {
 						from: (_from & {in: X.meta.images.auth}).out
 						// deno runs `main.ts` from the working directory, and bayt
@@ -680,11 +796,16 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 						workdir: "/app"
 						epilogue: ["RUN mkdir -p /monorepo"]
 					}
-					expose: http: port: 9999
+					expose: http: {port: 9999, env: "AUTH_PORT"}
 					entrypoint: {
-						do:    "deno run --allow-net --allow-env --config /app/deno.json /app/main.ts"
+						do:    "exec deno run --allow-net --allow-env --config \(mechaDir)/services/auth/deno.json \(mechaDir)/services/auth/main.ts"
+						shell: "sh"
+						dockerfile: {
+							do:    "deno run --allow-net --allow-env --config /app/deno.json /app/main.ts"
+							shell: "exec"
+						}
 						env:   compose.environment
-						after: database: "healthy"
+						after: X._schemaAfter
 					}
 					compose: {
 						depends_on: X._schemaReady
@@ -711,7 +832,7 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 					}
 				}
 			}
-			caddy: bayt.healthcheck.http & X._image & {
+			caddy: bayt.healthcheck.http & X._image & X._host & {
 				healthcheck: {
 					url:            "http://127.0.0.1:8080/health"
 					interval:       "5s"
@@ -782,20 +903,48 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 				// browser's six-connections-per-origin cap only exists on
 				// HTTP/1.1, and a second front door is a path that only ever
 				// runs on a laptop (docs/proxy.md).
-				expose: door: {
-					port: X.meta.door.port
-					publish: environment: X.meta.door.env
-					if X.meta.door.host != _|_ {host: X.meta.door.host}
+				expose: {
+					door: {
+						port: X.meta.door.port
+						publish: environment: X.meta.door.env
+						if X.meta.door.host != _|_ {host: X.meta.door.host}
+
+						// What the host moves it to (services/proxy/host.ts).
+						env: "DOOR_PORT"
+					}
+					// The plain listener, unpublished; only the host moves it.
+					health: {port: 8080, env: "HEALTH_PORT"}
 				}
 				let validators = #"set -e -o pipefail; roots=$(caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile | tr , '\n' | grep -o '"root":"[^"]*"' | cut -d'"' -f4 | sort -u); if [ -n "$roots" ]; then find $roots -type f ! -name '*.etag' -exec sh -c 'set -e; q=$1; shift; for f do h=$(sha256sum < "$f"); printf "$q%s$q" "${h%% *}" > "$f.etag"; done' sh '"' {} +; fi; "#
+
 				// An ORIGIN that is no origin stops the door as it starts: a
 				// template writes it into markup as it stands.
 				let admitted = #"case "${ORIGIN#http://}" in "$ORIGIN") h=${ORIGIN#https://};; *) h=${ORIGIN#http://};; esac; case "$h" in "$ORIGIN"|""|*[!A-Za-z0-9.:-]*) echo "ORIGIN '$ORIGIN' is no origin: set it to the scheme and host readers reach the door at, as https://app.example" >&2; exit 1;; esac; "#
 				let scripts = [if X.meta.served != _|_ {"PRONTO_RELEASE_SCRIPTS=$(cat /etc/caddy/release-scripts 2>/dev/null || true); export PRONTO_RELEASE_SCRIPTS; "}, ""][0]
+
+				// The peers the door proxies to that the host runs too, as
+				// `<name>=<port>`: their host addresses reach it as DOOR_PEERS.
+				let _peers = [
+					if X.capabilities.server {"crud=3000"},
+					if X.capabilities.server {"electric=3000"},
+					if X.capabilities.auth {"auth=9999"},
+				]
 				entrypoint: {
-					do: "\(admitted)\(validators)\(scripts)if [ -f /certs/localhost.pem ]; then export CADDY_TLS='/certs/localhost.pem /certs/localhost-key.pem'; fi; exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"
+					do:    "exec deno run --allow-all \(mechaDir)/services/proxy/host.ts \((X._quote & {in: X.meta.caddyfile}).out) --door \(X.meta.door.port) --health 8080 --peers \((X._quote & {in: strings.Join(_peers, ",")}).out) \(strings.Join([for s in list.Concat([X.meta.statics, X.meta.toolStatics]) {"\((X._quote & {in: s.target}).out) \((X._quote & {in: [if s.tool != _|_ {"{\(s.tool)}/\(s.file)"}, s.file][0]}).out)"}], " "))"
 					shell: "sh"
-					env:   compose.environment
+					dockerfile: {
+						do:    "\(admitted)\(validators)\(scripts)if [ -f /certs/localhost.pem ]; then export CADDY_TLS='/certs/localhost.pem /certs/localhost-key.pem'; fi; exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"
+						shell: "sh"
+					}
+					env: {
+						for k, v in compose.environment if k != "ORIGIN" {(k): v}
+
+						// ORIGIN's default names the port the person reaches the
+						// door at: the container's is its published one, the
+						// host's the door's own, which the host moves.
+						DOOR_ORIGIN: "${ORIGIN:-\(X.meta.door.scheme)://localhost:\(X.meta.door.port)}"
+						DOOR_PEERS: strings.Join([for p in _peers {strings.Replace(p, "=", ":", 1)}], " ")
+					}
 					if X.capabilities.server {
 						after: crud: "healthy"
 					}
@@ -828,7 +977,25 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 				}
 			}
 			if X.capabilities.server {
-				electric: X._image & {
+				electric: bayt.healthcheck.http & X._image & X._host & {
+					healthcheck: {
+						url:            "http://127.0.0.1:3000/v1/health"
+						interval:       "5s"
+						start_interval: "500ms"
+						start_period:   "60s"
+						retries:        12
+					}
+					expose: http: {port: 3000, env: "ELECTRIC_PORT"}
+					entrypoint: {
+						do:    "exec bash \(mechaDir)/services/electric/host.sh run \(_electricSource)"
+						shell: "sh"
+						dockerfile: {
+							do:    "/app/bin/entrypoint start"
+							shell: "exec"
+						}
+						env: compose.environment
+						after: X._schemaAfter
+					}
 					dockerfile: {
 						from: name: "docker.io/electricsql/electric:1.8.1@sha256:efb6fa43859d67cb8c73439e0c8bc0f7a3daa467500fb06f2a924bcb2070c139"
 						// Initialization must retain requests already waiting for the snapshot.
@@ -852,11 +1019,6 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							// build one, which would need CREATE on the database and
 							// ownership of every table it names.
 							ELECTRIC_MANUAL_TABLE_PUBLISHING: "true"
-						}
-						healthcheck: {
-							test: ["CMD", "curl", "-f", "http://localhost:3000/v1/health"]
-							interval:     "5s", timeout:         "5s", retries: 12
-							start_period: "60s", start_interval: "500ms"
 						}
 						restart: "on-failure"
 					}
@@ -1397,6 +1559,10 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 			tree:    string
 			scripts: string
 		}
+		// What the door serves from a mise tool's tree besides: the image's
+		// builder copies them in from that tool's image, and a host launch
+		// reads them where mise installed it.
+		toolStatics: [...#Static & {tool: string}]
 		// The workspace root and the runtime's directory, as paths from the
 		// app dir: the monorepo's unless the app states its own layout.
 		root:    *"../../" | string
@@ -1426,7 +1592,7 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		out: {
 			if W.t.compose != _|_ if W.t.compose.depends_on != _|_ {for k, v in W.t.compose.depends_on {(k): v}}
 			if W.t.entrypoint != _|_ if W.t.entrypoint.after != _|_ {
-				for k, _ in W.t.entrypoint.after {(k): _healthy}
+				for k, c in W.t.entrypoint.after {(k): {healthy: _healthy, completed: _completed, started: _started}[c]}
 			}
 		}
 	}
