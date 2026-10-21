@@ -930,6 +930,7 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 					if X.capabilities.server {"crud=3000"},
 					if X.capabilities.server {"electric=3000"},
 					if X.capabilities.auth {"auth=9999"},
+					for p in X.meta.hostPeers {p},
 				]
 				entrypoint: {
 					do:    "exec deno run --allow-all \(mechaDir)/services/proxy/host.ts \((X._quote & {in: X.meta.caddyfile}).out) --door \(X.meta.door.port) --health 8080 --peers \((X._quote & {in: strings.Join(_peers, ",")}).out) \(strings.Join([for s in list.Concat([X.meta.statics, X.meta.toolStatics]) {"\((X._quote & {in: s.target}).out) \((X._quote & {in: [if s.tool != _|_ {"{\(s.tool)}/\(s.file)"}, s.file][0]}).out)"}], " "))"
@@ -1568,6 +1569,10 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		// Whether the database runs PLV8 (a validation's predicate, a hybrid
 		// machine's rules): the image always has it; a host builds it.
 		plv8: *false | bool
+		// Peers of the door the caller adds to the cluster's own, as
+		// `<name>=<port>` (a renderer behind it): a host launch proxies to
+		// them at their host addresses too.
+		hostPeers: *[] | [...=~"^[a-z][a-z0-9-]*=[0-9]+$"]
 		// The workspace root and the runtime's directory, as paths from the
 		// app dir: the monorepo's unless the app states its own layout.
 		root:    *"../../" | string
