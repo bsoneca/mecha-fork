@@ -524,6 +524,8 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		// version (services/electric/host.sh), and its process only runs it.
 		hostPrepare: [
 			if X.capabilities.server {"bash \(mechaDir)/services/electric/host.sh build \(_electricSource)"},
+			// No PLV8 ships for a host's postgres: built once per version too.
+			if X.capabilities.server if X.meta.plv8 {"bash \(mechaDir)/services/database/plv8.sh build"},
 		]
 
 		// How a client on the cluster's network reaches its database, and the
@@ -1563,6 +1565,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		// builder copies them in from that tool's image, and a host launch
 		// reads them where mise installed it.
 		toolStatics: [...#Static & {tool: string}]
+		// Whether the database runs PLV8 (a validation's predicate, a hybrid
+		// machine's rules): the image always has it; a host builds it.
+		plv8: *false | bool
 		// The workspace root and the runtime's directory, as paths from the
 		// app dir: the monorepo's unless the app states its own layout.
 		root:    *"../../" | string

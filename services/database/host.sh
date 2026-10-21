@@ -50,6 +50,13 @@ trap 'exit 130' INT
 
 # shellcheck disable=SC2086 # the image splits POSTGRES_INITDB_ARGS the same way
 initdb -D "$data" -U "$POSTGRES_USER" $POSTGRES_INITDB_ARGS >/dev/null
+# PLV8 from where plv8.sh built it, when it has: postgres reads extensions from
+# its own installation and from there. In the configuration rather than on the
+# command line, which pg_ctl hands a shell that would expand $system.
+plv8=$(bash "$mecha/services/database/plv8.sh" dir)
+if [ -f "$plv8/share/extension/plv8.control" ]; then
+	printf "extension_control_path = '\$system:%s/share'\ndynamic_library_path = '\$libdir:%s/lib'\n" "$plv8" "$plv8" >>"$data/postgresql.conf"
+fi
 
 # The image's entrypoint runs the steps against a server only its socket
 # reaches, so nothing connects to a half-built schema.

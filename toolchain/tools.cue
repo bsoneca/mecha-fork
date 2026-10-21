@@ -12,4 +12,7 @@ package toolchain
 	"github:theseus-rs/postgresql-binaries": "18.6.1"
 	"github:PostgREST/postgrest":            "v16.4"
 	"aqua:xataio/pgroll":                    "0.16.3"
+	// What builds PLV8 for that postgres where the cluster needs it
+	// (services/database/plv8.sh).
+	"github:Kitware/CMake": "v4.1.2"
 }
