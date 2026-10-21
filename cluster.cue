@@ -630,7 +630,7 @@ _devElectricPassword: "dev-electric-password"
 						start_period:   "30s"
 					}
 					dockerfile: {
-						from: name: "postgrest/postgrest:v12.2.3@sha256:0a46780309a604cdc8b56c776c6e5e15788ce58174d709e40459ab5a2d44d228"
+						from: name: "postgrest/postgrest:v14.18@sha256:c7cd7e265a85b05248abf53f4473fcec7e327c282d0bd0cf60f1551996d09fcf"
 					}
 					expose: {
 						http:  port: 3000
