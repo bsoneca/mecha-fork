@@ -84,10 +84,12 @@ peers.forEach((p, i) => {
   const [name, port] = p.split("=");
   text = text.replace(new RegExp(`(?<![A-Za-z0-9_.-])${unquote(name)}:${port}${portEnd}`, "g"), addresses[i]);
 });
-// No admin endpoint, which every door on the host would claim at :2019, and
-// no root certificate put into the host's trust store, which asks for a
-// password: the image's caddy needs neither.
-const global = "admin off\n\tskip_install_trust";
+// No admin endpoint, which every door on the host would claim at :2019; no
+// root certificate put into the host's trust store, which asks for a
+// password; and no redirect from :80, which a user other than root cannot bind
+// on Linux. The image's caddy needs none of them, and the door is reached at
+// its https port alone.
+const global = "admin off\n\tskip_install_trust\n\tauto_https disable_redirects";
 const first = text.split("\n").find((l) => l.trim() !== "" && !l.trim().startsWith("#"));
 text = first?.trim() === "{"
   ? text.replace(/^\{\s*$/m, `{\n\t${global}`)
