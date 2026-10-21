@@ -137,8 +137,9 @@ if (import.meta.main) {
   if (WAKE_URLS === undefined) throw new Error("WAKE_URLS is required");
   const CALL_TIMEOUT_MS = Number(Deno.env.get("CALL_TIMEOUT_MS"));
   if (!(CALL_TIMEOUT_MS > 0)) throw new Error(`CALL_TIMEOUT_MS is ${Deno.env.get("CALL_TIMEOUT_MS")}, not milliseconds`);
+  // 9998 in its container; a host launch moves it (cluster.cue's ticker).
   Deno.serve(
-    { port: 9998 },
+    { port: Number(Deno.env.get("PORT") ?? 9998) },
     handler(
       httpCrud(CRUD_URL, SERVICE_JWT, CALL_TIMEOUT_MS),
       httpPoke(wakeUrls(WAKE_URLS)),
