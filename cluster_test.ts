@@ -625,7 +625,7 @@ Deno.test("the database a host runs applies initdb's steps from the runtime and 
     "003_rls.sql", "'{mecha}/services/database/rls/rls.sql'",
     "011_graphile_worker.sql", "'{mecha}/services/airlock/graphile.sql'",
     "012_airlock.sql", "'{mecha}/services/ticker/schedule.sql+{mecha}/services/airlock/airlock.sql'",
-    "899_electric_password.sh", "'{mecha}/services/database/electric_password.sh'",
+    "899_role_passwords.sh", "'{mecha}/services/database/role_passwords.sh'",
     "900_seed.sql", "'migrations/900_seed.sql'",
   ]);
 });

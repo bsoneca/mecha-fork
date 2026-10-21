@@ -423,7 +423,7 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		for _, m in X._initdb {
 			(path.Base(m, path.Unix)): [
 				if m == #TenancyMigration {"{mecha}/services/database/rls/rls.sql"},
-				if m == #ElectricPasswordStep {"{mecha}/services/database/electric_password.sh"},
+				if m == #RolePasswordsStep {"{mecha}/services/database/role_passwords.sh"},
 				if m == #ScheduleMigration {"{mecha}/services/ticker/schedule.sql"},
 				if m == #GraphileMigration {"{mecha}/services/airlock/graphile.sql"},
 				// The image's 012 carries the schedule table ahead of the ledger.
