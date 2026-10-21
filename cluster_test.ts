@@ -264,9 +264,11 @@ Deno.test("ledger upgrades require current interpreters and finish before schema
     assert.equal(got.ok, true, got.stderr);
     const t = got.value;
     const upgrade = t["airlock-upgrade"];
-    assert.deepEqual(upgrade.dockerfile.entrypoint, ["psql"]);
-    assert.ok(upgrade.dockerfile.cmd.includes("--single-transaction"));
-    assert.ok(upgrade.dockerfile.cmd.includes("--set=ON_ERROR_STOP=1"));
+    // One script in one transaction: the image's file, or the host's stdin.
+    assert.equal(upgrade.entrypoint.dockerfile.do, "psql -X --set=ON_ERROR_STOP=1 --single-transaction --file=/airlock-upgrade.sql");
+    const [, script] = upgrade.entrypoint.do.match(/^printf %s ([A-Za-z0-9+/=]+) \| base64 -d \| psql -X --set=ON_ERROR_STOP=1 --single-transaction$/) ?? [];
+    assert.match(atob(script), /LOCK TABLE airlock\.external_effect_ledger[^]*SELECT 1;$/);
+    assert.equal(upgrade.entrypoint.env.PGPORT, "5432");
     assert.deepEqual(upgrade.compose.depends_on.database, { condition: "service_healthy" });
     assert.deepEqual(upgrade.compose.depends_on.migrate, Object.keys(pgroll).length ? { condition: "service_completed_successfully" } : undefined);
     for (const reader of ["crud", "electric", "auth", "conduit", "airlock"]) {
@@ -521,11 +523,11 @@ Deno.test("the release builds exactly the published images", async () => {
 Deno.test("the migrate runner takes the database image", async () => {
   const cluster = `#Cluster & {meta: {app: "t", images: [string]: name: "img"}, state: {migrations: [], pipelines: [], schedules: [], pgroll: {"01_a": {operations: []}}}}`;
   const out = await new Deno.Command("cue", {
-    args: ["export", ".:cluster", "-e", `{from: (${cluster}).surface.targets.migrate.dockerfile.from, entrypoint: (${cluster}).surface.targets.migrate.dockerfile.entrypoint}`],
+    args: ["export", ".:cluster", "-e", `{from: (${cluster}).surface.targets.migrate.dockerfile.from, entrypoint: (${cluster}).surface.targets.migrate.entrypoint.dockerfile.do}`],
     cwd: MECHA, stdout: "piped", stderr: "piped",
   }).output();
   assert.equal(out.success, true, new TextDecoder().decode(out.stderr));
-  assert.deepEqual(JSON.parse(new TextDecoder().decode(out.stdout)), { from: { name: "img" }, entrypoint: ["/migrate.sh"] });
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(out.stdout)), { from: { name: "img" }, entrypoint: "/migrate.sh /pgroll 00_initdb" });
 });
 
 // The schedule table is initdb's alone: a volume older than the cluster's
@@ -598,4 +600,47 @@ Deno.test("a provider's program defaults stand until the deployment sets its own
   for (const bad of [{ secret: "shh" }, { scope: "openid ${HOME}" }, { params: "a=}" }]) {
     assert.equal((await exported({}, "capabilities", { signIn: { google: bad } })).ok, false, JSON.stringify(bad));
   }
+});
+
+// A host launch runs the cluster under process-compose (bayt's
+// gen_process_compose): each service's entrypoint is the host's command, from
+// this runtime's tree, and its image keeps its own process.
+Deno.test("the database a host runs applies initdb's steps from the runtime and the app, in their places", async () => {
+  const got = await exported({ migrations: ["migrations/000_ext.sql", "migrations/900_seed.sql"], effects: [PROBE] }, "surface.targets.database.entrypoint", { auth: true });
+  assert.equal(got.ok, true, got.stderr);
+  assert.match(got.value.dockerfile.do, /^docker-entrypoint\.sh postgres -c wal_level=logical /);
+  const [steps, args] = got.value.do.replace(/^exec bash "\$\(mise where github:bonisoft3\/mecha\)"\/services\/database\/host\.sh /, "").split(" -- ");
+  assert.equal(args, "-c wal_level=logical -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c shared_buffers=32MB -c max_connections=200");
+  assert.deepEqual(steps.split(" "), [
+    "000_ext.sql", "'migrations/000_ext.sql'",
+    "003_rls.sql", "'{mecha}/services/database/rls/rls.sql'",
+    "011_graphile_worker.sql", "'{mecha}/services/airlock/graphile.sql'",
+    "012_airlock.sql", "'{mecha}/services/ticker/schedule.sql+{mecha}/services/airlock/airlock.sql'",
+    "899_electric_password.sh", "'{mecha}/services/database/electric_password.sh'",
+    "900_seed.sql", "'migrations/900_seed.sql'",
+  ]);
+});
+
+Deno.test("a host's readers wait for the schema as compose's do, and a one-shot as completed", async () => {
+  const got = await evaluated(`(#Runtime & {project: "p", cluster: ${cluster({ effects: [PROBE], pgroll: { "01_a": { operations: [] } } }, { auth: true })}}).targets`);
+  assert.equal(got.ok, true, got.stderr);
+  for (const reader of ["crud", "auth"]) {
+    assert.deepEqual(got.value[reader].entrypoint.after, { database: "healthy", migrate: "completed", "airlock-upgrade": "completed" }, reader);
+    assert.deepEqual(got.value[reader].compose.depends_on["p-migrate"], { condition: "service_completed_successfully" }, reader);
+  }
+  // Each migration reaches the host's runner as one shell word, in base64.
+  assert.equal(got.value.migrate.entrypoint.do, `exec bash "$(mise where github:bonisoft3/mecha)"/services/migrate/host.sh 00_initdb 01_a ${btoa('{"operations":[]}')}`);
+});
+
+Deno.test("the door a host runs serves a tool's static from that tool, which the image leaves to its builder", async () => {
+  const statics = [{ file: "shell/index.html", target: "/srv/shell/index.html" }];
+  const toolStatics = [{ file: "interpreter/x.js", target: "/omnishell/interpreter/x.js", tool: "github:bonisoft3/omnishell" }];
+  const got = await evaluated(`(#Cluster & {meta: {app: "t", images: [string]: name: "img", statics: ${JSON.stringify(statics)}, toolStatics: ${JSON.stringify(toolStatics)}}, state: {migrations: [], pipelines: [], schedules: []}, capabilities: {auth: true}}).surface.targets.caddy`);
+  assert.equal(got.ok, true, got.stderr);
+  const caddy = got.value;
+  assert.match(caddy.entrypoint.do, / --door 8443 --health 8080 --peers 'crud=3000,electric=3000,auth=9999' '\/srv\/shell\/index\.html' 'shell\/index\.html' '\/omnishell\/interpreter\/x\.js' '\{github:bonisoft3\/omnishell\}\/interpreter\/x\.js'$/);
+  assert.equal(caddy.entrypoint.env.DOOR_PEERS, "crud:3000 electric:3000 auth:9999");
+  assert.equal(caddy.entrypoint.env.ORIGIN, undefined);
+  assert.deepEqual(caddy.srcs.globs, ["docker/Caddyfile", "shell/index.html"]);
+  assert.equal(JSON.stringify(caddy.dockerfile.copy).includes("interpreter/x.js"), false);
 });
