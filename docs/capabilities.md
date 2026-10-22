@@ -40,8 +40,9 @@ the service's identity can see as an S3 bucket of the same name
 **imgproxy** v3.31.1 listens on `:8081` and reads its sources over S3 from
 `http://rclone-s3:3900`. It is given a placeholder key pair, because its S3
 client insists on one, and region `rclone`. It caps a source at 50 megapixels,
-fetches from the store alone (`IMGPROXY_ALLOWED_SOURCES`), and passes the source's
-`Cache-Control` through. An image URL names its source
+fetches from the store alone (`IMGPROXY_ALLOWED_SOURCES`), serves only its
+presets (`thumb`, `avatar` and `picture`, each WebP, none past 1024 pixels), and
+passes the source's `Cache-Control` through. An image URL names its source
 as `s3://mecha-objects/<key>`. No signing key is set, so imgproxy checks no
 signature, and consumers write `insecure` in the signature segment.
 

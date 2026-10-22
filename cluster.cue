@@ -244,6 +244,11 @@ _devElectricSecret: "dev-electric-secret"
 _devElectricPassword: "dev-electric-password"
 _devAuthenticatorPassword: "dev-authenticator-password"
 
+// The sizes the blob plane's imgproxy serves (/img/insecure/<preset>/plain/
+// s3://mecha-objects/<key>): a square thumbnail and avatar, and a picture fit
+// within 1024 pixels, each as WebP.
+#ImgproxyPresets: "thumb=rs:fill:128:128/f:webp,avatar=rs:fill:256:256/f:webp,picture=rs:fit:1024:1024/f:webp"
+
 #Cluster: X={
 	state: {
 		migrations: [...string]
@@ -1121,6 +1126,12 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							// Only the store: a URL naming any other source would have imgproxy
 							// fetch it for whoever asked.
 							IMGPROXY_ALLOWED_SOURCES: "s3://mecha-objects/"
+							// No key signs a URL, so a reader may ask only for these sizes, each
+							// WebP: options of its own choosing would have the service resize
+							// without bound, or pass a source through as it was stored.
+							IMGPROXY_ONLY_PRESETS:         "true"
+							IMGPROXY_PRESETS:              #ImgproxyPresets
+							IMGPROXY_MAX_RESULT_DIMENSION: "1024"
 							IMGPROXY_SET_CANONICAL_HEADER:      "false"
 							IMGPROXY_CACHE_CONTROL_PASSTHROUGH: "true"
 						}
