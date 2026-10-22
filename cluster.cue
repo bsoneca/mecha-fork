@@ -247,6 +247,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 // The sizes the blob plane's imgproxy serves (/img/insecure/<preset>/plain/
 // s3://mecha-objects/<key>): a square thumbnail and avatar, and a picture fit
 // within 1024 pixels, each as WebP.
+// What imgproxy may fetch: the blob store, and Google's photo host, where the
+// picture an OIDC sign-in through Google links (services/auth) lives.
+#ImgproxySources: "s3://mecha-objects/,https://lh3.googleusercontent.com/"
 #ImgproxyPresets: "thumb=rs:fill:128:128/f:webp,avatar=rs:fill:256:256/f:webp,picture=rs:fit:1024:1024/f:webp"
 
 #Cluster: X={
@@ -1123,9 +1126,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							AWS_REGION:                         "rclone"
 							IMGPROXY_BIND:                      ":8081"
 							IMGPROXY_MAX_SRC_RESOLUTION:        "50"
-							// Only the store: a URL naming any other source would have imgproxy
-							// fetch it for whoever asked.
-							IMGPROXY_ALLOWED_SOURCES: "s3://mecha-objects/"
+							// Only the store, and the pictures the auth service links from Google:
+							// a URL naming any other source would have imgproxy fetch it for whoever asked.
+							IMGPROXY_ALLOWED_SOURCES: #ImgproxySources
 							// No key signs a URL, so a reader may ask only for these sizes, each
 							// WebP: options of its own choosing would have the service resize
 							// without bound, or pass a source through as it was stored.
