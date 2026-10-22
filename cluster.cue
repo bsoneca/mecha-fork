@@ -1118,6 +1118,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							AWS_REGION:                         "rclone"
 							IMGPROXY_BIND:                      ":8081"
 							IMGPROXY_MAX_SRC_RESOLUTION:        "50"
+							// Only the store: a URL naming any other source would have imgproxy
+							// fetch it for whoever asked.
+							IMGPROXY_ALLOWED_SOURCES: "s3://mecha-objects/"
 							IMGPROXY_SET_CANONICAL_HEADER:      "false"
 							IMGPROXY_CACHE_CONTROL_PASSTHROUGH: "true"
 						}
