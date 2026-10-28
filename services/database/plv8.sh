@@ -8,7 +8,8 @@
 #   plv8.sh build   builds it unless the cache holds it
 #   plv8.sh dir     prints the directory it is in: lib/ and share/extension/
 #
-# The first build compiles V8 and takes the better part of an hour.
+# The first build compiles V8 and takes the better part of an hour, so the build mecha published for
+# this platform (../prebuilt.sh) is fetched instead where there is one.
 set -euo pipefail
 
 version=3.2.5
@@ -19,6 +20,7 @@ case ${1:-} in
 dir) printf '%s\n' "$dir" ;;
 build)
 	[ -f "$dir/share/extension/plv8.control" ] && exit 0
+	bash "$(cd "$(dirname "$0")" && pwd)/../prebuilt.sh" plv8 "$version-pg$major" "$dir" && exit 0
 	src=$(mktemp -d "${TMPDIR:-/tmp}/plv8.XXXXXX")
 	trap 'rm -rf "$src"' EXIT
 	git clone -q --depth 1 --branch "v$version" --recurse-submodules --shallow-submodules https://github.com/plv8/plv8.git "$src/plv8"
