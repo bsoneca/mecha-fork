@@ -9,7 +9,8 @@
 #   host.sh build <version> <commit> <erlang> <elixir>
 #   host.sh run <version> <commit> <erlang> <elixir>
 #
-# `build` builds the release if the cache lacks it; `run` starts it, reading
+# `build` puts the release in the cache if it lacks it: the build mecha published for this platform
+# (../prebuilt.sh), or else built here; `run` starts it, reading
 # what the image reads (DATABASE_URL, ELECTRIC_SECRET, ...) and ELECTRIC_PORT,
 # the port the host moved it to. Building needs git, curl, a C compiler and
 # the network; Erlang and Elixir come from mise at the versions electric's
@@ -63,7 +64,7 @@ if [ "$mode" = build ] && [ ! -x "$release/bin/electric" ]; then
 		sleep 5
 	done
 	trap 'rm -rf "$release.lock"' EXIT
-	if [ ! -x "$release/bin/electric" ]; then
+	if [ ! -x "$release/bin/electric" ] && ! bash "$here/../prebuilt.sh" electric "$key" "$release"; then
 		echo "electric: building $version from its source (once per version)" >&2
 		work=$(mktemp -d "$root/build.XXXXXX")
 		build "$work" >&2
