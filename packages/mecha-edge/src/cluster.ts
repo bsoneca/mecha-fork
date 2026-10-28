@@ -183,10 +183,12 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
 
   // As the auth service makes it (services/auth/main.ts's migrate), once,
   // before the first provider sign-in reads it: a provider's subject, under
-  // the issuer that named it, is one person. A directory whose links an
-  // earlier edge made without their issuer is carried forward as the auth
-  // service carries its own: provider sign-in is refused, and nothing changed,
-  // until its owner adds the issuer of each link. Passkeys go on.
+  // the issuer that named it, is one person. An earlier edge (mecha 0.12's)
+  // made its links without their issuer, and signed in through one issuer a
+  // provider: each such link takes the issuer this edge has for its provider,
+  // the one its sign-ins name, so its person signs in as who they were. A link
+  // whose provider this edge no longer has keeps none, and provider sign-in is
+  // refused, and nothing changed, until its owner adds it. Passkeys go on.
   let linksReady: Promise<void> | undefined
   const ensureLinks = () => linksReady ??= serialize(() => db.transaction(async (tx) => {
     await tx.exec(`
@@ -203,6 +205,9 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
       ALTER TABLE identity_link ADD COLUMN IF NOT EXISTS issuer text,
         ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text;
     `)
+    for (const [name, p] of Object.entries(cfg.providers ?? {})) {
+      await tx.query('UPDATE identity_link SET issuer = $2 WHERE provider = $1 AND issuer IS NULL', [name, p.issuer])
+    }
     const [legacy] = (await tx.query<{ unassigned: boolean }>('SELECT EXISTS (SELECT 1 FROM identity_link WHERE issuer IS NULL) AS unassigned')).rows
     if (legacy.unassigned) throw new Error('identity_link has unassigned issuers: add and populate its issuer column from the original identity provider before signing in through one')
     await tx.exec(`

@@ -137,44 +137,79 @@ Deno.test({ name: 'a person signs in at the edge through a provider', sanitizeRe
   }
 })
 
-Deno.test({ name: "links an earlier edge made without their issuer refuse provider sign-in until it is named", sanitizeResources: false, sanitizeOps: false }, async () => {
+// mecha 0.12's edge: a link keyed by the provider and the subject alone.
+async function legacyDirectory(db: PGlite, links: { provider: string; sub: string }[]) {
+  await db.exec(`CREATE TABLE identity_link (
+    provider text not null, sub text not null,
+    user_id uuid not null unique references app_user(id) on delete cascade,
+    created_at timestamptz not null default now(), name text, picture text,
+    primary key (provider, sub))`)
+  const ids = []
+  for (const [n, link] of links.entries()) {
+    const id = crypto.randomUUID()
+    await db.query('INSERT INTO app_user (id, handle) VALUES ($1, $2)', [id, `amber-fox-${11 + n}`])
+    await db.query('INSERT INTO identity_link (provider, sub, user_id) VALUES ($1, $2, $3)', [link.provider, link.sub, id])
+    ids.push(id)
+  }
+  return ids
+}
+
+async function walker(edge: Awaited<ReturnType<typeof cluster>>) {
+  const call = (path: string, init: RequestInit = {}) => edge.handle(new Request(`${door}${path}`, init))
+  const walk = async () => {
+    const start = await call('/auth/oidc/test/start')
+    const back = await fetch(start.headers.get('location')!, { redirect: 'manual' })
+    const callback = new URL(back.headers.get('location')!)
+    return await call(`${callback.pathname}${callback.search}`, { headers: { cookie: cookiesOf(start).join('; ') } })
+  }
+  const user = async (signedIn: Response) => {
+    const session = await call('/auth/oidc/session', { method: 'POST', headers: { cookie: cookiesOf(signedIn).join('; '), origin: door } })
+    return (await session.json() as { user: unknown }).user
+  }
+  return { call, walk, user }
+}
+
+Deno.test({ name: "links an earlier edge made without their issuer take their provider's, and sign in as who they were", sanitizeResources: false, sanitizeOps: false }, async () => {
   const idp = await provider()
   const db = await fixture()
   try {
-    // mecha 0.12's edge: a link keyed by the provider and the subject alone.
-    const id = crypto.randomUUID()
-    await db.exec(`CREATE TABLE identity_link (
-      provider text not null, sub text not null,
-      user_id uuid not null unique references app_user(id) on delete cascade,
-      created_at timestamptz not null default now(), name text, picture text,
-      primary key (provider, sub))`)
-    await db.query("INSERT INTO app_user (id, handle) VALUES ($1, 'amber-fox-11')", [id])
-    await db.query("INSERT INTO identity_link (provider, sub, user_id) VALUES ('test', 'alice-sub', $1)", [id])
-    const edge = await cluster(db, idp.issuer)
-    const call = (path: string, init: RequestInit = {}) => edge.handle(new Request(`${door}${path}`, init))
-    const walk = async () => {
-      const start = await call('/auth/oidc/test/start')
-      const back = await fetch(start.headers.get('location')!, { redirect: 'manual' })
-      const callback = new URL(back.headers.get('location')!)
-      return await call(`${callback.pathname}${callback.search}`, { headers: { cookie: cookiesOf(start).join('; ') } })
-    }
-    const refused = await walk()
-    assert.equal(refused.status, 500)
-    assert.match((await refused.json() as { error: string }).error, /unassigned issuers/)
-    // Passkeys and guests go on meanwhile.
-    assert.equal((await call('/auth/guest', { method: 'POST' })).status, 200)
-    assert.equal((await call('/auth/login/start', { method: 'POST' })).status, 200)
-    // Its owner names the issuer: the person signs in as who they were.
-    await db.exec('ALTER TABLE identity_link ADD COLUMN issuer text')
-    await db.query('UPDATE identity_link SET issuer = $1', [idp.issuer])
+    const [id] = await legacyDirectory(db, [{ provider: 'test', sub: 'alice-sub' }])
+    const { walk, user } = await walker(await cluster(db, idp.issuer))
     const signedIn = await walk()
     assert.equal(signedIn.status, 303, await signedIn.clone().text())
-    const session = await call('/auth/oidc/session', { method: 'POST', headers: { cookie: cookiesOf(signedIn).join('; '), origin: door } })
-    assert.deepEqual((await session.json() as { user: unknown }).user, { id, handle: 'amber-fox-11' })
+    assert.deepEqual(await user(signedIn), { id, handle: 'amber-fox-11' })
+    const { rows: links } = await db.query<{ issuer: string }>("SELECT issuer FROM identity_link WHERE sub = 'alice-sub'")
+    assert.deepEqual(links, [{ issuer: idp.issuer }])
     const { rows } = await db.query<{ k: string[] }>(`SELECT array_agg(a.attname ORDER BY a.attname) AS k FROM pg_constraint c
       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
       WHERE c.conrelid = 'identity_link'::regclass AND c.contype = 'p'`)
     assert.deepEqual(rows[0].k, ['issuer', 'provider', 'sub'])
+  } finally {
+    await db.close()
+    await idp.stop()
+  }
+})
+
+Deno.test({ name: 'a link whose provider the edge no longer has refuses provider sign-in until its issuer is named', sanitizeResources: false, sanitizeOps: false }, async () => {
+  const idp = await provider()
+  const db = await fixture()
+  try {
+    const [, bob] = await legacyDirectory(db, [{ provider: 'gone', sub: 'carol-sub' }, { provider: 'test', sub: 'alice-sub' }])
+    const { call, walk, user } = await walker(await cluster(db, idp.issuer))
+    const refused = await walk()
+    assert.equal(refused.status, 500)
+    assert.match((await refused.json() as { error: string }).error, /unassigned issuers/)
+    // Nothing changed meanwhile, the link this edge could name included, and passkeys and guests go on.
+    const { rows: columns } = await db.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'identity_link' AND column_name = 'issuer'")
+    assert.equal(columns.length, 0)
+    assert.equal((await call('/auth/guest', { method: 'POST' })).status, 200)
+    assert.equal((await call('/auth/login/start', { method: 'POST' })).status, 200)
+    // Its owner names the issuer: provider sign-in goes on, its person as who they were.
+    await db.exec('ALTER TABLE identity_link ADD COLUMN issuer text')
+    await db.query("UPDATE identity_link SET issuer = 'https://gone.example' WHERE provider = 'gone'")
+    const signedIn = await walk()
+    assert.equal(signedIn.status, 303, await signedIn.clone().text())
+    assert.deepEqual(await user(signedIn), { id: bob, handle: 'amber-fox-12' })
   } finally {
     await db.close()
     await idp.stop()
