@@ -9,11 +9,14 @@
 // at a failed drain's retry, which an evicted isolate's timer would not keep.
 // The environment: CLUSTER, the object's namespace; JWT_SECRET, the tokens'
 // secret; IMPORT_TOKEN, the bearer /import/* takes; CF_VERSION_METADATA, the
-// Worker's version; ASSETS, the static files, where it has any.
+// Worker's version; ASSETS, the static files, where it has any; OIDC_*, the
+// providers a person may sign in through, as the auth service reads them
+// (services/auth/README.md#provider-sign-in), a client secret as a secret.
 import { DurableObject } from 'cloudflare:workers'
 import type { PGlite } from '@electric-sql/pglite'
 import { type Assets, DataDirectory } from '../../pglite-workerd/src/data-directory.ts'
 import type { StorageFormat } from '../../pglite-workerd/src/storage-block.ts'
+import { providersFrom } from '../../../services/auth/oidc.ts'
 import { createEdgeCluster, type EdgeCluster, type EdgeClusterConfig } from './cluster.ts'
 import { type Clock, createClock, hasSchedules, serviceCrud } from './clock.ts'
 import type { Drain } from '../../mecha-browser/drains.ts'
@@ -27,6 +30,7 @@ export interface EdgeEnv {
   IMPORT_TOKEN: string
   CF_VERSION_METADATA: { id: string }
   ASSETS?: Fetcher
+  [setting: `OIDC_${string}`]: string | undefined
 }
 
 export interface EdgeOptions {
@@ -57,6 +61,9 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
 
     #boot() {
       return this.#cluster ??= (async () => {
+        // A provider that cannot be signed in through refuses the boot, as it
+        // refuses the auth service's start.
+        const providers = providersFrom((name) => this.env[name as `OIDC_${string}`])
         const db = await this.#dir.open(assets)
         // A machine's steps run read committed, ordered by the locks they hold
         // on their players (its serial() refuses any other level): the
@@ -66,7 +73,7 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
         await installEngines(db, Object.keys(machines))
         const ticks = clockMode === 'ticker' && await hasSchedules(db)
         const cluster = await createEdgeCluster({
-          db, tables, schema, secret: this.env.JWT_SECRET, log: console.error, drains,
+          db, tables, schema, secret: this.env.JWT_SECRET, providers, log: console.error, drains,
           // A hole in a shape log is answered by a fresh object: a new log,
           // under new handles every client refetches from.
           fail: (e) => this.ctx.abort(String(e)),
