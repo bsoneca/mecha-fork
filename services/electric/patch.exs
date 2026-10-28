@@ -63,12 +63,24 @@ defmodule Mecha.SnapshotWaiterRegression do
   end
 end
 
-if System.get_env("MECHA_ELECTRIC_TEST_ONLY") == "1" do
-  Mecha.SnapshotWaiterRegression.run()
-else
-  "1.8.1" = Application.spec(:electric, :vsn) |> List.to_string()
-  source_url = "https://raw.githubusercontent.com/electric-sql/electric/0f404200402f918a4b1596bc5c8a53479a435349/packages/sync-service/lib/electric/shapes/consumer/state.ex"
-  checksum = "e94be3ef70ebcca4e072db4ba537dddcd77a1af5b9137e24c92651076f8862cb"
+defmodule Mecha.ManualPublicationRegression do
+  # With ELECTRIC_MANUAL_TABLE_PUBLISHING the cluster creates the publication and
+  # adds its tables (008_publication.sql), and electric holds no CREATE on the
+  # database, so electric's own CREATE PUBLICATION only fails into the database's
+  # log before electric finds the publication there.
+  def run do
+    for manual <- [true, false] do
+      config = Electric.Application.configuration(manual_table_publishing?: manual, persistent_kv: Electric.PersistentKV.Memory.new!())
+      expected = not manual
+      ^expected = config |> Keyword.fetch!(:replication_opts) |> Keyword.get(:try_creating_publication?, true)
+    end
+
+    IO.puts("Electric creates no publication when its tables are published by hand")
+  end
+end
+
+patch = fn module, path, checksum, before, replacement ->
+  source_url = "https://raw.githubusercontent.com/electric-sql/electric/0f404200402f918a4b1596bc5c8a53479a435349/packages/sync-service/" <> path
 
   source = case System.cmd("curl", ["--fail", "--silent", "--show-error", "--location", source_url], stderr_to_stdout: true) do
     {source, 0} -> source
@@ -76,20 +88,46 @@ else
   end
 
   ^checksum = :crypto.hash(:sha256, source) |> Base.encode16(case: :lower)
-  before = "    initial_snapshot_state = InitialSnapshot.new(pg_snapshot)"
-  replacement = """
-      initial_snapshot_state = %{
-        InitialSnapshot.new(pg_snapshot)
-        | awaiting_snapshot_start: state.initial_snapshot_state.awaiting_snapshot_start
-      }
-  """ |> String.trim_trailing()
   [prefix, suffix] = String.split(source, before)
 
-  module = Electric.Shapes.Consumer.State
   Code.ensure_loaded!(module)
   beam_path = :code.which(module)
   Code.compiler_options(ignore_module_conflict: true)
-  [{^module, beam}] = Code.compile_string(prefix <> replacement <> suffix, "lib/electric/shapes/consumer/state.ex")
+  [{^module, beam}] = Code.compile_string(prefix <> replacement <> suffix, path)
+  {beam_path, beam}
+end
+
+if System.get_env("MECHA_ELECTRIC_TEST_ONLY") == "1" do
   Mecha.SnapshotWaiterRegression.run()
-  File.write!(beam_path, beam)
+  Mecha.ManualPublicationRegression.run()
+else
+  "1.8.1" = Application.spec(:electric, :vsn) |> List.to_string()
+
+  state = patch.(
+    Electric.Shapes.Consumer.State,
+    "lib/electric/shapes/consumer/state.ex",
+    "e94be3ef70ebcca4e072db4ba537dddcd77a1af5b9137e24c92651076f8862cb",
+    "    initial_snapshot_state = InitialSnapshot.new(pg_snapshot)",
+    """
+        initial_snapshot_state = %{
+          InitialSnapshot.new(pg_snapshot)
+          | awaiting_snapshot_start: state.initial_snapshot_state.awaiting_snapshot_start
+        }
+    """ |> String.trim_trailing()
+  )
+  Mecha.SnapshotWaiterRegression.run()
+
+  application = patch.(
+    Electric.Application,
+    "lib/electric/application.ex",
+    "81fb3519f73098d2d7b2a4c0aee60abf91298fb635a2393cbaee3a9a0a30b4b4",
+    "        slot_temporary?: get_env(opts, :replication_slot_temporary?),\n",
+    """
+            slot_temporary?: get_env(opts, :replication_slot_temporary?),
+            try_creating_publication?: not get_env(opts, :manual_table_publishing?),
+    """
+  )
+  Mecha.ManualPublicationRegression.run()
+
+  for {beam_path, beam} <- [state, application], do: File.write!(beam_path, beam)
 end
