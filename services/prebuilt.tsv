@@ -1,0 +1,3 @@
+# name	key	platform	url	sha256 (services/prebuilt.sh)
+electric	1.8.1-b75a8c2ee1f6	linux-x64	https://github.com/bsoneca/pronto-fork/releases/download/mecha-prebuilt-linux-x64-1/electric-1.8.1-b75a8c2ee1f6-linux-x64.tar.gz	bdc5e643ddf28afacc9ec3e3a4ed51d793957f8af639dadb9535dfd6d001aa22
+plv8	3.2.5-pg18	linux-x64	https://github.com/bsoneca/pronto-fork/releases/download/mecha-prebuilt-linux-x64-1/plv8-3.2.5-pg18-linux-x64.tar.gz	092d0dd1ea788ea1d9fc779657ec569fa2cf008eb38d7e3523c6345a46dbfd6b
