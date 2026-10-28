@@ -40,8 +40,9 @@ export interface Worker {
 }
 
 /** Starts `wrangler dev --config <config>`, keeping state in `state` and its
- * output in `<state>.log{,.err}`. */
-export async function startWorker(config: URL, state: string): Promise<Worker> {
+ * output in `<state>.log{,.err}`; `vars` are put beside the config's, for a
+ * value only the test knows, such as a port. */
+export async function startWorker(config: URL, state: string, vars: Record<string, string> = {}): Promise<Worker> {
   const dir = new URL('.', config).pathname
   const port = freePort()
   const log = `${state}.log`
@@ -50,7 +51,7 @@ export async function startWorker(config: URL, state: string): Promise<Worker> {
     const out = await Deno.open(log, { write: true, create: true, truncate: true })
     const err = await Deno.open(`${log}.err`, { write: true, create: true, truncate: true })
     child = new Deno.Command(wrangler, {
-      args: ['dev', '--test-scheduled', '--config', config.pathname, '--port', String(port), '--inspector-port', String(freePort()), '--persist-to', state],
+      args: ['dev', '--test-scheduled', '--config', config.pathname, '--port', String(port), '--inspector-port', String(freePort()), '--persist-to', state, ...Object.entries(vars).flatMap(([k, v]) => ['--var', `${k}:${v}`])],
       cwd: dir,
       stdout: 'piped',
       stderr: 'piped',

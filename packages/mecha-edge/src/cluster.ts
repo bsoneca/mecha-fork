@@ -2,10 +2,14 @@
 // with HS256 tokens, each request's role, scopes and claims set inside its own
 // transaction (postgrest-js), and Electric's shape protocol answered for the
 // subject a shape token names (mecha-browser's shapes.ts), and the app's
-// drains called as their tables change (mecha-browser's drains.ts).
+// drains called as their tables change (mecha-browser's drains.ts). A person
+// signs in by a passkey, or through the providers the environment names (the
+// auth service's oidc.ts), over this connection: nothing here migrates but
+// webauthn_credential and identity_link, which the auth service makes for
+// itself too.
 // Routes: /auth/guest, /auth/whoami, /auth/shape, /auth/register/start,
-// /auth/register/verify, /auth/login/start, /auth/login/verify, /crud/*,
-// /electric/v1/shape.
+// /auth/register/verify, /auth/login/start, /auth/login/verify, /auth/oidc/*,
+// /crud/*, /electric/v1/shape.
 import type { PGlite } from '@electric-sql/pglite'
 import {
   generateAuthenticationOptions,
@@ -15,6 +19,7 @@ import {
 } from '@simplewebauthn/server'
 import { createRestHandler, planRead, ReadQueryError, type ReadSchema } from '@mecha/postgrest-js'
 import { shapeWhere, signJwt, verifyJwt } from '../../../services/auth/jwt.ts'
+import { type Links, oidc, type Profile, type Provider } from '../../../services/auth/oidc.ts'
 import { createDrains, type Drain, type Drains } from '../../mecha-browser/drains.ts'
 import { createShapes } from '../../mecha-browser/shapes.ts'
 import { publicSnapshot, PublicSnapshotCapacity, type PublicSnapshot } from './public-snapshot.ts'
@@ -35,6 +40,9 @@ export interface EdgeClusterConfig {
   retry?: () => void
   rpId?: string
   origin?: string
+  /** The providers a person may sign in through (oidc.ts's providersFrom),
+   * none by default. */
+  providers?: Record<string, Provider>
 }
 
 export interface EdgeCluster {
@@ -170,6 +178,56 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
   }
   const ensureAuthTables = () => authTablesReady ??= serialize(createAuthTables).catch((e) => {
     authTablesReady = undefined
+    throw e
+  })
+
+  // As the auth service makes it (services/auth/main.ts's migrate), once,
+  // before the first provider sign-in reads it: a provider's subject, under
+  // the issuer that named it, is one person. A directory whose links an
+  // earlier edge made without their issuer is carried forward as the auth
+  // service carries its own: provider sign-in is refused, and nothing changed,
+  // until its owner adds the issuer of each link. Passkeys go on.
+  let linksReady: Promise<void> | undefined
+  const ensureLinks = () => linksReady ??= serialize(() => db.transaction(async (tx) => {
+    await tx.exec(`
+      CREATE TABLE IF NOT EXISTS identity_link (
+        provider text not null,
+        issuer text not null,
+        sub text not null,
+        user_id uuid not null unique references app_user(id) on delete cascade,
+        created_at timestamptz not null default now(),
+        name text,
+        picture text,
+        primary key (provider, issuer, sub)
+      );
+      ALTER TABLE identity_link ADD COLUMN IF NOT EXISTS issuer text,
+        ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text;
+    `)
+    const [legacy] = (await tx.query<{ unassigned: boolean }>('SELECT EXISTS (SELECT 1 FROM identity_link WHERE issuer IS NULL) AS unassigned')).rows
+    if (legacy.unassigned) throw new Error('identity_link has unassigned issuers: add and populate its issuer column from the original identity provider before signing in through one')
+    await tx.exec(`
+      ALTER TABLE identity_link ALTER COLUMN issuer SET NOT NULL;
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+          WHERE c.conrelid = 'identity_link'::regclass AND c.contype = 'p' AND a.attname = 'issuer') THEN
+          ALTER TABLE identity_link DROP CONSTRAINT identity_link_pkey;
+          ALTER TABLE identity_link ADD PRIMARY KEY (provider, issuer, sub);
+        END IF;
+      END $$;
+      ALTER TABLE identity_link ENABLE ROW LEVEL SECURITY;
+      REVOKE ALL ON identity_link FROM PUBLIC;
+      DO $$
+      DECLARE
+        r text;
+      BEGIN
+        FOR r IN SELECT rolname FROM pg_roles WHERE rolname IN ('app_user', 'service', 'anon') LOOP
+          EXECUTE format('REVOKE ALL ON identity_link FROM %I', r);
+        END LOOP;
+      END $$;
+    `)
+  })).catch((e) => {
+    linksReady = undefined
     throw e
   })
 
@@ -394,6 +452,63 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     return json(200, { token, user: { id: cred.user_id, handle: cred.handle } })
   }
 
+  // The auth service's links (main.ts) on the one connection: the database
+  // lane is the lock that keeps two sign-ins of one subject from making two
+  // people.
+  const links: Links = {
+    userFor: async (p: Profile) => {
+      await ensureLinks()
+      return serialize(() => db.transaction(async (tx) => {
+        const [link] = (await tx.query<{ user_id: string }>(
+          'UPDATE identity_link SET name = $4, picture = $5 WHERE provider = $1 AND issuer = $2 AND sub = $3 RETURNING user_id',
+          [p.provider, p.issuer, p.sub, p.name, p.picture],
+        )).rows
+        if (link) {
+          const [u] = (await tx.query<{ handle: string }>('SELECT handle FROM app_user WHERE id = $1', [link.user_id])).rows
+          return { id: link.user_id, handle: u.handle }
+        }
+        const id = crypto.randomUUID()
+        // Generated handles can collide; regenerate and retry — never a user error.
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const handle = generateHandle()
+          await tx.exec('SAVEPOINT handle')
+          try {
+            await tx.query('INSERT INTO app_user (id, handle) VALUES ($1, $2)', [id, handle])
+          } catch (e) {
+            if ((e as { code?: string }).code !== '23505') throw e
+            await tx.exec('ROLLBACK TO SAVEPOINT handle')
+            continue
+          }
+          await tx.query(
+            'INSERT INTO identity_link (provider, issuer, sub, user_id, name, picture) VALUES ($1, $2, $3, $4, $5, $6)',
+            [p.provider, p.issuer, p.sub, id, p.name, p.picture],
+          )
+          return { id, handle }
+        }
+        throw new Error('could not allocate identity')
+      }))
+    },
+    handleOf: async (provider: string, issuer: string, id: string) => {
+      await ensureLinks()
+      const [u] = (await serialize(() => db.query<{ handle: string }>(
+        `SELECT u.handle FROM app_user u
+          WHERE u.id = $1 AND EXISTS (SELECT 1 FROM identity_link l WHERE l.user_id = u.id AND l.provider = $2 AND l.issuer = $3)`,
+        [id, provider, issuer],
+      ))).rows
+      return u ? u.handle : null
+    },
+  }
+  // The door is the Worker's, whose request the object is handed whole, so
+  // the provider sends the reader back to the origin it came through. The
+  // session is the auth service's: no guest's.
+  const providerSignIn = oidc({
+    secret,
+    origin: (req) => new URL(req.url).origin,
+    providers: cfg.providers ?? {},
+    links,
+    issue: (user) => signJwt(secret, { role: 'app_user', sub: user.id, handle: user.handle, guest: false, exp: now() + USER_TOKEN_TTL_S }),
+  })
+
   async function shapeToken(req: Request): Promise<Response> {
     const claims = await session(req)
     if (!claims) return json(401, { error: 'invalid token' })
@@ -484,6 +599,8 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     try {
       await ensureShapes()
       await drains()
+      const signedIn = providerSignIn(req)
+      if (signedIn !== null) return await signedIn
       if (req.method === 'POST' && path === '/auth/guest') return await guest()
       if (req.method === 'GET' && path === '/auth/whoami') return await whoami(req)
       if (req.method === 'POST' && path === '/auth/shape') return await shapeToken(req)
