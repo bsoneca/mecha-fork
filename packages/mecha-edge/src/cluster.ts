@@ -50,6 +50,7 @@ export interface EdgeCluster {
   /** A /crud/* request as the service role, for the object's own clock:
    * what the ticker writes on the container tier. Never routed. */
   service: (req: Request) => Promise<Response>
+  serialize: <T>(fn: () => Promise<T>, priority?: 'high' | 'low') => Promise<T>
   publicSnapshot<T>(generation: string, use: (snapshot: PublicSnapshot) => Promise<T>, priority?: 'high' | 'low'): Promise<T>
   /** The drains, installed and called once on first use: never by a boot
    * that only migrates, whose drains may name tables the migration makes. */
@@ -627,6 +628,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     handle,
     service,
     drains,
+    serialize,
     installed: () => installed,
     async publicSnapshot(generation, use, priority = 'high') {
       // Admit per lane before joining the database queue so queued low-priority
