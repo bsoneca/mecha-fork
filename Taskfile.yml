@@ -57,7 +57,14 @@ tasks:
       - task: test:auth
       - task: test:pgroll
       - task: test:cluster
+      - task: test:imgproxy
       - task: test:browser
+
+  test:imgproxy:
+    desc: "The host's imgproxy stand-in"
+    dir: services/imgproxy
+    cmds:
+      - mise x -- deno test --allow-all host_test.ts
 
   test:auth:
     desc: "OIDC authorization, issuer isolation and browser sessions"
