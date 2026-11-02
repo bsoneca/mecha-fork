@@ -62,14 +62,54 @@ const cleanup = () => Deno.removeSync(root, { recursive: true });
 
 // Copied, not linked, so what the door serves matches the validator written
 // beside it until the door restarts, as an image's files do.
+const omnishellTools = new Set<string>();
 for (let i = 0; i < pairs.length; i += 2) {
   const [target, file] = [pairs[i], await resolve(pairs[i + 1])];
+  const tool = pairs[i + 1].match(/^\{([^}]+)\}\/interpreter\//)?.[1];
+  if (tool && target.startsWith("/omnishell/")) omnishellTools.add(tool);
   const dst = `${root}${target}`;
   await Deno.mkdir(dst.slice(0, dst.lastIndexOf("/")), { recursive: true });
   await Deno.copyFile(file, dst);
-  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", await Deno.readFile(dst)));
-  await Deno.writeTextFile(`${dst}.etag`, `"${Array.from(hash, (b) => b.toString(16).padStart(2, "0")).join("")}"`);
 }
+
+// A release's tree, as the image's door serves it (cluster.cue's `served`):
+// omnishell's server/address.ts addresses it in place, every file also at
+// _immutable-<sha256>-<name> and each entry carrying the #pronto-assets map
+// that names them, and writes the inline scripts the policy hashes. A page
+// asks its own address when it is shown again and plans from the two maps
+// (omnishell's release-plan.js), so an edit the door is restarted for (a
+// launch's watch) reaches an open tab in place. The tree is /srv's files with
+// omnishell's at omnishell/, as the image's stage lays it out.
+let releaseScripts = "";
+const entry = await Deno.stat(`${root}/srv/shell/index.html`).then(() => true, () => false);
+if (entry && omnishellTools.size === 1) {
+  const home = await where([...omnishellTools][0]);
+  const tree = `${root}/srv`;
+  const runtime = await Deno.stat(`${root}/omnishell`).then(() => true, () => false);
+  if (runtime) await Deno.rename(`${root}/omnishell`, `${tree}/omnishell`);
+  const scripts = `${root}/release-scripts`;
+  const out = await new Deno.Command("deno", {
+    args: ["run", "--frozen", "--config", `${home}/server/deno.json`, `--allow-read=${tree},${home}`, `--allow-write=${tree},${scripts}`, "--allow-env", `${home}/server/address.ts`, tree, scripts],
+    stdout: "inherit",
+    stderr: "inherit",
+  }).output();
+  if (runtime) await Deno.rename(`${tree}/omnishell`, `${root}/omnishell`);
+  if (!out.success) fail(`omnishell's server/address.ts exited ${out.code}`);
+  releaseScripts = (await Deno.readTextFile(scripts)).trim();
+}
+
+// Each file's validator beside it, the addressed copies' too.
+const validate = async (dir: string): Promise<void> => {
+  for await (const e of Deno.readDir(dir)) {
+    const path = `${dir}/${e.name}`;
+    if (e.isDirectory) await validate(path);
+    else if (e.isFile && !e.name.endsWith(".etag") && e.name !== "Caddyfile" && e.name !== "release-scripts") {
+      const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", await Deno.readFile(path)));
+      await Deno.writeTextFile(`${path}.etag`, `"${Array.from(hash, (b) => b.toString(16).padStart(2, "0")).join("")}"`);
+    }
+  }
+};
+await validate(root);
 
 const portEnd = "(?![0-9])";
 const unquote = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -102,7 +142,7 @@ const tls = await Deno.stat(cert).then(() => `${cert} ${Deno.cwd()}/.certs/local
 
 const caddy = new Deno.Command("caddy", {
   args: ["run", "--config", `${root}/Caddyfile`, "--adapter", "caddyfile"],
-  env: { ORIGIN: origin, ...(tls ? { CADDY_TLS: tls } : {}) },
+  env: { ORIGIN: origin, ...(tls ? { CADDY_TLS: tls } : {}), ...(releaseScripts ? { PRONTO_RELEASE_SCRIPTS: releaseScripts } : {}) },
 }).spawn();
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   Deno.addSignalListener(signal, () => caddy.kill(signal));
