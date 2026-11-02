@@ -258,6 +258,27 @@ Deno.test("discovery compares the exact issuer and rewrites only endpoints under
   );
 });
 
+Deno.test("discovery waits out a provider still starting, and stops at a refusal or after its tries", async () => {
+  const p = providersFrom((name) => ({ ...BROKERED, OIDC_GOOGLE_ISSUER: "https://broker.test/", OIDC_GOOGLE_INTERNAL: "https://broker.test/" })[name]).google;
+  const document = { issuer: p.issuer, authorization_endpoint: "https://broker.test/authorize", token_endpoint: "https://broker.test/token", jwks_uri: "https://broker.test/jwks" };
+  const slept: number[] = [];
+  const sleep = (ms: number) => (slept.push(ms), Promise.resolve());
+  // Cloud Run's 429 and 500 while the broker starts, a dropped connection, then the document.
+  const answers: (() => Response)[] = [() => new Response("", { status: 429 }), () => new Response("", { status: 500 }), () => { throw new TypeError("connection reset"); }, () => Response.json(document)];
+  let n = 0;
+  const endpoints = await discovery(() => Promise.resolve().then(() => answers[n++]()), [1, 2, 3, 4], sleep)(p);
+  assertEquals(endpoints.authorize, document.authorization_endpoint);
+  assertEquals(slept, [1, 2, 3]);
+  // A refusal is the provider's answer: asked once.
+  let asked = 0;
+  await assertRejects(() => discovery(() => (asked++, Promise.resolve(new Response("", { status: 404 }))), [1, 2], sleep)(p), Error, "discovery: 404");
+  assertEquals(asked, 1);
+  // Still failing after every wait: the last status says why.
+  asked = 0;
+  await assertRejects(() => discovery(() => (asked++, Promise.resolve(new Response("", { status: 503 }))), [1, 2], sleep)(p), Error, "discovery: 503");
+  assertEquals(asked, 3);
+});
+
 Deno.test("signing in again is the same person, with the provider's new name", async () => {
   const s = await setup();
   assertEquals((await signIn(s)).status, 303);

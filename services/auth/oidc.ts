@@ -98,7 +98,16 @@ export type Endpoints = { authorize: string; token: string; jwks: string };
 /** A provider's endpoints from its discovery document, held once found. The
  * reader is sent to the authorization endpoint as published; this service
  * reaches the token endpoint and the keys at `internal` where that differs. */
-export function discovery(fetcher: typeof fetch = fetch): (p: Provider) => Promise<Endpoints> {
+/** Waits between tries of a discovery the provider could not answer yet: a broker on
+ * Cloud Run scaled to zero takes ~20s to start, and Cloud Run answers 429 or 500 to a
+ * request it gave up waiting for. A refusal (4xx but 429) is not tried again. */
+export const DISCOVERY_RETRIES = [1000, 2000, 4000, 8000, 8000];
+
+export function discovery(
+  fetcher: typeof fetch = fetch,
+  waits: number[] = DISCOVERY_RETRIES,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): (p: Provider) => Promise<Endpoints> {
   const found = new Map<string, Promise<Endpoints>>();
   const inside = (p: Provider, url: string) => {
     const issuer = p.issuer.replace(/\/$/, "");
@@ -109,9 +118,24 @@ export function discovery(fetcher: typeof fetch = fetch): (p: Provider) => Promi
     let hit = found.get(p.issuer);
     if (hit === undefined) {
       hit = (async () => {
-        const res = await fetcher(`${p.internal.replace(/\/$/, "")}/.well-known/openid-configuration`);
-        if (!res.ok) throw new Error(`${p.issuer}'s discovery: ${res.status}`);
-        const d = await res.json() as { issuer?: string; authorization_endpoint: string; token_endpoint: string; jwks_uri: string };
+        const url = `${p.internal.replace(/\/$/, "")}/.well-known/openid-configuration`;
+        let res: Response | undefined;
+        for (let i = 0; ; i++) {
+          const transient = (r: Response | undefined) => !r || r.status >= 500 || r.status === 429;
+          try {
+            res = await fetcher(url);
+          } catch (e) {
+            if (i >= waits.length) throw e;
+            res = undefined;
+          }
+          if (!transient(res) || i >= waits.length) break;
+          await res?.body?.cancel();
+          await sleep(waits[i]);
+        }
+        // Out of the loop with an answer: a throw past the last wait has left already.
+        const answer = res as Response;
+        if (!answer.ok) throw new Error(`${p.issuer}'s discovery: ${answer.status}`);
+        const d = await answer.json() as { issuer?: string; authorization_endpoint: string; token_endpoint: string; jwks_uri: string };
         // OpenID Connect Discovery 1.0 §4.3: the document names the issuer it was asked of.
         if (d.issuer !== p.issuer) throw new Error(`${p.issuer}'s discovery names the issuer ${d.issuer}`);
         return { authorize: d.authorization_endpoint, token: inside(p, d.token_endpoint), jwks: inside(p, d.jwks_uri) };
