@@ -19,6 +19,7 @@ import {
   sha256url,
   STATE_COOKIE,
   type User,
+  withHandoff,
 } from "./oidc.ts";
 
 const ORIGIN = "https://app.test";
@@ -411,7 +412,9 @@ Deno.test("an app signs in through the system browser: its link back carries a c
   const back = new URL(done.headers.get("location")!, ORIGIN);
   assertEquals(back.pathname, "/table/r1");
   assertEquals(back.searchParams.get("seat"), "w");
-  const handoff = back.searchParams.get("handoff")!;
+  // In the fragment, which no browser sends on.
+  assert(back.hash.startsWith("#handoff="), back.hash);
+  const handoff = back.hash.slice("#handoff=".length);
   // The system browser keeps no session of the app's: only the spent state.
   assertEquals(jar(done), { [STATE_COOKIE]: "" });
 
@@ -428,7 +431,7 @@ Deno.test("an app signs in through the system browser: its link back carries a c
 Deno.test("a handoff code is refused without its secret, past its minute, as a cookie, or once the link is gone", async () => {
   const s = await setup();
   const { secret, done } = await nativeSignIn(s);
-  const handoff = new URL(done.headers.get("location")!, ORIGIN).searchParams.get("handoff")!;
+  const handoff = new URL(done.headers.get("location")!, ORIGIN).hash.slice("#handoff=".length);
   // Whoever caught the link has the code and not the secret.
   assertEquals((await s.serve(redeem({ handoff, secret: "another-secret" }))).status, 401);
   assertEquals((await s.serve(redeem({ handoff }))).status, 401);
@@ -444,6 +447,18 @@ Deno.test("a handoff code is refused without its secret, past its minute, as a c
   assertEquals((await s.serve(redeem("not an object"))).status, 401);
   s.links.users.clear();
   assertEquals((await s.serve(redeem({ handoff, secret }))).status, 401);
+});
+
+Deno.test("a handoff's return stays on this origin once the code is added", async () => {
+  const s = await setup();
+  for (const ret of ["/a/..//evil.test/catch", "/a/../\\evil.test", "/x#y"]) {
+    const { done } = await nativeSignIn(s, ret);
+    const to = done.headers.get("location")!;
+    assertEquals(new URL(to, ORIGIN).origin, ORIGIN, to);
+    assert(to.startsWith("/") && !to.startsWith("//") && !to.startsWith("/\\"), to);
+  }
+  assertEquals(withHandoff("/a/..//evil.test/catch", "C"), "/#handoff=C");
+  assertEquals(withHandoff("/x?y=1#z", "C"), "/x?y=1#handoff=C");
 });
 
 Deno.test("a native start names an S256 hash, or it is refused", async () => {

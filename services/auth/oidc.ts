@@ -17,7 +17,8 @@
 // An app on a device signs in in the system browser, whose cookie it never
 // reads. Its start carries the hash of a secret it keeps (`native`), and the
 // callback hands the app, by its link back, a code that only that secret
-// redeems, once, within a minute: PKCE again, between the door and the app.
+// redeems, within a minute (once per instance): PKCE again, between the door
+// and the app.
 //
 // Pure but for what Config hands it — the origin, the links, the network — so
 // oidc_test.ts drives every refusal against a provider of its own.
@@ -264,11 +265,14 @@ export function safeReturn(raw: string | null): string {
   return raw;
 }
 
-/** `ret` with `handoff` added to its query, whatever query it had. */
+/** `ret` with the handoff code as its fragment, which no browser sends on to a
+ * server or in a Referer. Checked again once serialized: a path the URL parser
+ * normalizes (`/a/..//elsewhere`) must not become another origin. */
 export function withHandoff(ret: string, handoff: string): string {
   const u = new URL(ret, "http://door");
-  u.searchParams.set("handoff", handoff);
-  return u.pathname + u.search + u.hash;
+  u.hash = `handoff=${handoff}`;
+  const out = u.pathname + u.search + u.hash;
+  return u.origin === "http://door" && safeReturn(out) === out ? out : `/#handoff=${handoff}`;
 }
 
 function cookieOf(req: Request, name: string): string | null {

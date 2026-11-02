@@ -57,10 +57,11 @@ a page the door serves:
 - An app on a device signs in in the system browser, whose cookie it never
   reads. It keeps a random secret and starts with
   `start?return=<path>&native=<S256(secret)>`; the callback then leaves no
-  session cookie and returns to `<path>?handoff=<code>` (the app's link back),
-  and `POST /auth/oidc/session` with the JSON body `{handoff, secret}` answers
-  the user token, once, within a minute of the callback. Whoever catches the
-  link has the code and not the secret: PKCE again, between door and app.
+  session cookie and returns to `<path>#handoff=<code>` (the app's link back;
+  a fragment, which no browser sends on), and `POST /auth/oidc/session` with
+  the JSON body `{handoff, secret}` answers the user token within a minute of
+  the callback, once per instance. Whoever catches the link has the code and
+  not the secret: PKCE again, between door and app.
 
 A provider is found by its discovery document. Each setting is `signIn`'s
 default for the provider (`issuer`, `internal`, `client`, `scope`, `params`),
