@@ -139,6 +139,23 @@ export async function migrate(): Promise<void> {
   await sql`INSERT INTO mecha.rls_exempt VALUES
     ('public.identity_link', 'the auth service''s own table: read by it alone, on its own connection')
     ON CONFLICT DO NOTHING`;
+  // Both tables say who may sign in as whom, and an app's grants (its default privileges, or a
+  // migration granting every public table on each replay) would hand them to app_user, service and
+  // anon through the CRUD API: a session could read every link and passkey, or attach its own to
+  // another account. As the edge cluster closes them (packages/mecha-edge/src/cluster.ts): row
+  // security, with a policy for this service's own role alone, so a grant made later still reaches no
+  // row, and no app role keeps a grant.
+  for (const table of ["webauthn_credential", "identity_link"]) {
+    await sql.unsafe(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+    await sql.unsafe(`DROP POLICY IF EXISTS auth_service ON ${table}`);
+    await sql.unsafe(`DO $$ BEGIN EXECUTE format('CREATE POLICY auth_service ON ${table} TO %I USING (true) WITH CHECK (true)', current_user); END $$`);
+    await sql.unsafe(`REVOKE ALL ON ${table} FROM PUBLIC`);
+    await sql.unsafe(`DO $$ DECLARE r text; BEGIN
+      FOR r IN SELECT rolname FROM pg_roles WHERE rolname IN ('app_user', 'service', 'anon') AND rolname <> current_user LOOP
+        EXECUTE format('REVOKE ALL ON ${table} FROM %I', r);
+      END LOOP;
+    END $$`);
+  }
 }
 
 // --- HS256 JWT via WebCrypto, under this service's secret ---
