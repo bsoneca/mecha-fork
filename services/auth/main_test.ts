@@ -1063,6 +1063,41 @@ Deno.test("a provider named without its client is refused at startup", async () 
   assertStringIncludes(new TextDecoder().decode(stderr), "OIDC_GOOGLE_CLIENT_ID is required");
 });
 
+Deno.test({
+  name: "no app role reaches the links or the passkeys, even granted them after the migration, and sign-in still works",
+  ...opts,
+  fn: async () => {
+    const u = await links.userFor({ provider: "google", issuer: "https://accounts.google.com", sub: "g-closed", name: "Closed", picture: null });
+    await sql`insert into webauthn_credential (id, user_id, public_key) values ('cred-closed', ${u.id}, '\\x00') on conflict do nothing`;
+    const as = async (q: string): Promise<string> => {
+      const c = await sql.reserve();
+      try {
+        await c.unsafe("SET ROLE app_user");
+        const rows = await c.unsafe(q);
+        return `rows:${rows.length}`;
+      } catch (e) {
+        return String((e as Error).message);
+      } finally {
+        await c.unsafe("RESET ROLE");
+        c.release();
+      }
+    };
+    for (const t of ["identity_link", "webauthn_credential"]) {
+      assertStringIncludes(await as(`select * from ${t}`), "permission denied", `${t} is granted to no app role`);
+    }
+    // What an app's migration does on each replay: every public table granted to its roles.
+    await sql`GRANT SELECT, INSERT, UPDATE, DELETE ON identity_link, webauthn_credential TO app_user`;
+    assertEquals(await as("select * from identity_link"), "rows:0", "a link reaches no session");
+    assertEquals(await as("select * from webauthn_credential"), "rows:0", "nor a passkey");
+    assertStringIncludes(await as(`insert into webauthn_credential (id, user_id, public_key) values ('cred-stolen', '${u.id}', '\\x00') returning id`), "row-level security");
+    assertEquals(await as(`update identity_link set name = 'taken' where sub = 'g-closed' returning sub`), "rows:0");
+    await migrate();
+    assertStringIncludes(await as("select * from identity_link"), "permission denied", "the next start takes the grant back");
+    assertEquals((await links.userFor({ provider: "google", issuer: "https://accounts.google.com", sub: "g-closed", name: "Closed Again", picture: null })).id, u.id);
+    assertEquals((await sql`select name from identity_link where sub = 'g-closed'`)[0].name, "Closed Again");
+  },
+});
+
 // Last, and it has to be: Deno runs tests in source order, and this closes the
 // pool every test above it queries through.
 Deno.test({
