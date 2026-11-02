@@ -120,7 +120,8 @@ export async function migrate(): Promise<void> {
       primary key (provider, issuer, sub)
     )`;
     await tx`ALTER TABLE identity_link ADD COLUMN IF NOT EXISTS issuer text,
-      ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text`;
+      ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text,
+      ADD COLUMN IF NOT EXISTS email text`;
     // A legacy provider label may have named any issuer. Its owner must supply
     // that issuer before these accounts can safely accept another sign-in.
     const [legacy] = await tx`SELECT EXISTS (SELECT 1 FROM identity_link WHERE issuer IS NULL) AS unassigned`;
@@ -641,7 +642,7 @@ export const links: Links = {
       // One sign-in at a time per subject, so two tabs signing in at once make
       // one person, not two.
       await tx`select pg_advisory_xact_lock(hashtext(${JSON.stringify([p.provider, p.issuer, p.sub])}))`;
-      const [link] = await tx`update identity_link set name = ${p.name}, picture = ${p.picture}
+      const [link] = await tx`update identity_link set name = ${p.name}, picture = ${p.picture}, email = ${p.email}
         where provider = ${p.provider} and issuer = ${p.issuer} and sub = ${p.sub} returning user_id`;
       if (link) {
         const [u] = await tx`select handle from app_user where id = ${link.user_id}`;
@@ -657,8 +658,8 @@ export const links: Links = {
           if ((e as { code?: string }).code === "23505") continue;
           throw e;
         }
-        await tx`insert into identity_link (provider, issuer, sub, user_id, name, picture)
-          values (${p.provider}, ${p.issuer}, ${p.sub}, ${id}, ${p.name}, ${p.picture})`;
+        await tx`insert into identity_link (provider, issuer, sub, user_id, name, picture, email)
+          values (${p.provider}, ${p.issuer}, ${p.sub}, ${id}, ${p.name}, ${p.picture}, ${p.email})`;
         return { id, handle };
       }
       throw new Error("could not allocate identity");

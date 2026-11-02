@@ -39,7 +39,7 @@ export async function provider() {
         form.get('redirect_uri') !== grant.redirect || (await sha256url(form.get('code_verifier') ?? '')) !== grant.challenge
       ) return Response.json({ error: 'invalid_grant' }, { status: 400 })
       const head = b64(JSON.stringify({ alg: 'ES256', kid: 'k1', typ: 'JWT' }))
-      const body = b64(JSON.stringify({ iss: issuer, aud: CLIENT, sub: grant.sub, name: 'Alice', nonce: grant.nonce, exp: Math.floor(Date.now() / 1000) + 300 }))
+      const body = b64(JSON.stringify({ iss: issuer, aud: CLIENT, sub: grant.sub, name: 'Alice', email: 'alice@mail.test', email_verified: true, nonce: grant.nonce, exp: Math.floor(Date.now() / 1000) + 300 }))
       const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, keys.privateKey, new TextEncoder().encode(`${head}.${body}`)))
       return Response.json({ id_token: `${head}.${body}.${encodeBase64Url(sig)}` })
     }

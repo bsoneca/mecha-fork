@@ -138,7 +138,7 @@ export function keySource(fetcher: typeof fetch = fetch): (jwks: string, kid: st
   };
 }
 
-export type Profile = { provider: string; issuer: string; sub: string; name: string | null; picture: string | null };
+export type Profile = { provider: string; issuer: string; sub: string; name: string | null; picture: string | null; email: string | null };
 export type User = { id: string; handle: string };
 
 /** What the service needs of Postgres. */
@@ -213,7 +213,15 @@ export async function verifyIdToken(
   if (typeof c.sub !== "string" || c.sub === "" || c.sub.length > 255) return null;
   const name = typeof c.name === "string" && c.name.trim() !== "" ? c.name.trim().slice(0, 120) : null;
   const picture = typeof c.picture === "string" && c.picture.startsWith("https://") ? c.picture : null;
-  return { provider, issuer: p.issuer, sub: c.sub, name, picture };
+  return { provider, issuer: p.issuer, sub: c.sub, name, picture, email: emailOf(c) };
+}
+
+/** The e-mail a verified ID token vouches for: only where the provider says it
+ * verified it (`email_verified` true, OIDC Core 5.1), else none. */
+export function emailOf(c: Record<string, unknown>): string | null {
+  if (c.email_verified !== true || typeof c.email !== "string") return null;
+  const email = c.email.trim();
+  return email.length <= 254 && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) ? email : null;
 }
 
 /** A same-origin path to come back to, or the root: never another origin, and

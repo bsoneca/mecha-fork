@@ -201,10 +201,12 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
         created_at timestamptz not null default now(),
         name text,
         picture text,
+        email text,
         primary key (provider, issuer, sub)
       );
       ALTER TABLE identity_link ADD COLUMN IF NOT EXISTS issuer text,
-        ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text;
+        ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text,
+        ADD COLUMN IF NOT EXISTS email text;
     `)
     for (const [name, p] of Object.entries(cfg.providers ?? {})) {
       await tx.query('UPDATE identity_link SET issuer = $2 WHERE provider = $1 AND issuer IS NULL', [name, p.issuer])
@@ -466,8 +468,8 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
       await ensureLinks()
       return serialize(() => db.transaction(async (tx) => {
         const [link] = (await tx.query<{ user_id: string }>(
-          'UPDATE identity_link SET name = $4, picture = $5 WHERE provider = $1 AND issuer = $2 AND sub = $3 RETURNING user_id',
-          [p.provider, p.issuer, p.sub, p.name, p.picture],
+          'UPDATE identity_link SET name = $4, picture = $5, email = $6 WHERE provider = $1 AND issuer = $2 AND sub = $3 RETURNING user_id',
+          [p.provider, p.issuer, p.sub, p.name, p.picture, p.email],
         )).rows
         if (link) {
           const [u] = (await tx.query<{ handle: string }>('SELECT handle FROM app_user WHERE id = $1', [link.user_id])).rows
@@ -486,8 +488,8 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
             continue
           }
           await tx.query(
-            'INSERT INTO identity_link (provider, issuer, sub, user_id, name, picture) VALUES ($1, $2, $3, $4, $5, $6)',
-            [p.provider, p.issuer, p.sub, id, p.name, p.picture],
+            'INSERT INTO identity_link (provider, issuer, sub, user_id, name, picture, email) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+            [p.provider, p.issuer, p.sub, id, p.name, p.picture, p.email],
           )
           return { id, handle }
         }

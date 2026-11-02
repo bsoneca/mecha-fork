@@ -72,7 +72,7 @@ async function provider(p: { issuer: string; reachedAt?: string; alg: Alg; clien
         form.get("redirect_uri") !== grant.redirect || (await sha256url(form.get("code_verifier") ?? "")) !== grant.challenge ||
         form.get("client_secret") !== (p.secret ?? null)
       ) return Response.json({ error: "invalid_grant" }, { status: 400 });
-      const claims = { iss: p.iss ?? p.issuer, aud: grant.client, sub: "alice-sub", name: "Alice", picture: "https://pics.test/a", nonce: grant.nonce, exp: now() + 300, ...bend };
+      const claims = { iss: p.iss ?? p.issuer, aud: grant.client, sub: "alice-sub", name: "Alice", email: "alice@mail.test", email_verified: true, picture: "https://pics.test/a", nonce: grant.nonce, exp: now() + 300, ...bend };
       return Response.json({ id_token: await sign(p.alg, signer.key, signer.kid, claims) });
     }
     throw new Error(`the test's provider was asked ${url}`);
@@ -96,14 +96,15 @@ async function provider(p: { issuer: string; reachedAt?: string; alg: Alg; clien
   };
 }
 
-function memory(): Links & { users: Map<string, User & { name: string | null }> } {
-  const users = new Map<string, User & { name: string | null }>();
+function memory(): Links & { users: Map<string, User & { name: string | null; email: string | null }> } {
+  const users = new Map<string, User & { name: string | null; email: string | null }>();
   return {
     users,
     userFor(p) {
       const key = `${p.provider}:${p.issuer}:${p.sub}`;
-      const u = users.get(key) ?? { id: crypto.randomUUID(), handle: `h-${users.size}`, name: p.name };
+      const u = users.get(key) ?? { id: crypto.randomUUID(), handle: `h-${users.size}`, name: p.name, email: p.email };
       u.name = p.name;
+      u.email = p.email;
       users.set(key, u);
       return Promise.resolve({ id: u.id, handle: u.handle });
     },
@@ -207,7 +208,7 @@ Deno.test("Google signs a person in by code and PKCE, and the cookie becomes a n
 Deno.test("an issuer in Google's place is a public client named by the door, reached inside the cluster", async () => {
   const s = await setup(BROKERED);
   // Asked for `openid` alone, it vouches for a subject and says nothing else.
-  s.idp.bend({ name: undefined, picture: undefined });
+  s.idp.bend({ name: undefined, picture: undefined, email: undefined, email_verified: undefined });
   const { to, state, verifier } = await begin(s.serve);
   assertEquals(to.origin, "https://broker.test");
   assertEquals(to.searchParams.get("client_id"), ORIGIN);
@@ -219,6 +220,7 @@ Deno.test("an issuer in Google's place is a public client named by the door, rea
   assertEquals(done.status, 303);
   // The broker gives a subject and nothing about the person.
   assertEquals(s.links.users.get("google:https://broker.test:alice-sub")?.name, null);
+  assertEquals(s.links.users.get("google:https://broker.test:alice-sub")?.email, null);
   // Discovery, keys and the code all went to the cluster's address; the reader alone went to the issuer's.
   assert(s.idp.asked.every((u) => u.startsWith("http://broker.internal:28443/")), s.idp.asked.join(" "));
 });
@@ -263,6 +265,25 @@ Deno.test("signing in again is the same person, with the provider's new name", a
   assertEquals((await signIn(s)).status, 303);
   assertEquals(s.links.users.size, 1);
   assertEquals(s.links.users.get("google:https://accounts.google.com:alice-sub")!.name, "Alice B.");
+});
+
+Deno.test("the provider's verified e-mail is kept, and refreshed at the next sign-in", async () => {
+  const s = await setup();
+  assertEquals((await signIn(s)).status, 303);
+  const alice = () => s.links.users.get("google:https://accounts.google.com:alice-sub")!;
+  assertEquals(alice().email, "alice@mail.test");
+  s.idp.bend({ email: " alice.b@mail.test " });
+  assertEquals((await signIn(s)).status, 303);
+  assertEquals(alice().email, "alice.b@mail.test");
+});
+
+Deno.test("an e-mail the provider did not verify, or none, is no e-mail", async () => {
+  for (const bend of [{ email_verified: false }, { email_verified: "true" }, { email_verified: undefined }, { email: undefined }, { email: "not an address" }, { email: `${"a".repeat(250)}@x.co` }]) {
+    const s = await setup();
+    s.idp.bend(bend);
+    assertEquals((await signIn(s)).status, 303);
+    assertEquals(s.links.users.get("google:https://accounts.google.com:alice-sub")!.email, null, JSON.stringify(bend));
+  }
 });
 
 Deno.test("a callback is refused without this browser's verifier, and its code is then spent for nobody", async () => {
