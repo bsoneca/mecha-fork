@@ -593,6 +593,21 @@ Deno.test("a sign-in provider turns auth on and reaches it as a required client,
   assert.equal("OIDC_GOOGLE_CLIENT_ID" in off.value, false);
   assert.equal((await exported({}, "capabilities", { signIn: { google: {} }, auth: false })).ok, false);
   assert.equal((await exported({}, "capabilities", { signIn: { myspace: {} } })).ok, false);
+  assert.equal((await exported({}, "capabilities", { signIn: { "My-Space": { issuer: "https://id.example.com" } } })).ok, false);
+});
+
+// A provider the service has no preset for is the issuer the program names in
+// its place (an identity broker's phone sign-in), beside Google.
+Deno.test("a provider with no preset signs in through the issuer the program names", async () => {
+  const phone = { issuer: "http://localhost:28443", internal: "http://identity:28443/", client: "origin", scope: "openid", params: "provider=phone" };
+  const env = await exported({}, "surface.targets.auth.compose.environment", { signIn: { google: {}, phone } });
+  assert.equal(env.ok, true, env.stderr);
+  assert.equal(env.value.OIDC_PROVIDERS, "google,phone");
+  assert.equal(env.value.OIDC_PHONE_ISSUER, "${OIDC_PHONE_ISSUER:-http://localhost:28443}");
+  assert.equal(env.value.OIDC_PHONE_AUTHORIZE_PARAMS, "${OIDC_PHONE_AUTHORIZE_PARAMS:-provider=phone}");
+  assert.equal(env.value.OIDC_PHONE_CLIENT_ID, "${OIDC_PHONE_CLIENT_ID:-origin}");
+  // Its environment is never written without the issuer standing in its place.
+  assert.equal((await exported({}, "surface.targets.auth.compose.environment", { signIn: { phone: { client: "origin" } } })).ok, false);
 });
 
 Deno.test("a provider's program defaults stand until the deployment sets its own, and a secret is never one", async () => {
