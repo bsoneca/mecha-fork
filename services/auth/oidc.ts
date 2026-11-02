@@ -14,6 +14,12 @@
 // /auth/oidc/session. The cookie outlives the tab, so a tab opened later
 // adopts the same sign-in; a readable hint cookie says one may be there.
 //
+// An app on a device signs in in the system browser, whose cookie it never
+// reads. Its start carries the hash of a secret it keeps (`native`), and the
+// callback hands the app, by its link back, a code that only that secret
+// redeems, within a minute (once per instance): PKCE again, between the door
+// and the app.
+//
 // Pure but for what Config hands it — the origin, the links, the network — so
 // oidc_test.ts drives every refusal against a provider of its own.
 import { decodeBase64Url, encodeBase64Url, signJwt, verifyJwt } from "./jwt.ts";
@@ -23,6 +29,7 @@ export const SESSION_COOKIE = "mecha_oidc";
 export const STATE_COOKIE = "mecha_oidc_state";
 export const HINT_COOKIE = "mecha_oidc_hint";
 const STATE_TTL_S = 600;
+const HANDOFF_TTL_S = 60;
 const COOKIE_TTL_S = 30 * 24 * 3600;
 /** The client id that stands for the door a request came through. */
 export const ORIGIN_CLIENT = "origin";
@@ -187,6 +194,8 @@ export type Config = {
 const dec = new TextDecoder();
 const enc = new TextEncoder();
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+// What an S256 hash looks like: 32 bytes, base64url without padding.
+const S256 = /^[A-Za-z0-9_-]{43}$/;
 const random = (bytes: number) => encodeBase64Url(crypto.getRandomValues(new Uint8Array(bytes)));
 export const sha256url = async (text: string) => encodeBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(text))));
 
@@ -256,6 +265,16 @@ export function safeReturn(raw: string | null): string {
   return raw;
 }
 
+/** `ret` with the handoff code as its fragment, which no browser sends on to a
+ * server or in a Referer. Checked again once serialized: a path the URL parser
+ * normalizes (`/a/..//elsewhere`) must not become another origin. */
+export function withHandoff(ret: string, handoff: string): string {
+  const u = new URL(ret, "http://door");
+  u.hash = `handoff=${handoff}`;
+  const out = u.pathname + u.search + u.hash;
+  return u.origin === "http://door" && safeReturn(out) === out ? out : `/#handoff=${handoff}`;
+}
+
 function cookieOf(req: Request, name: string): string | null {
   for (const part of (req.headers.get("cookie") ?? "").split(";")) {
     const [k, ...v] = part.trim().split("=");
@@ -292,10 +311,22 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     const verifier = random(32);
     const nonce = random(16);
     const challenge = await sha256url(verifier);
-    const ret = safeReturn(new URL(req.url).searchParams.get("return"));
+    const q = new URL(req.url).searchParams;
+    const ret = safeReturn(q.get("return"));
+    const native = q.get("native");
+    if (native !== null && !S256.test(native)) return refuse(400, "native is no S256 hash");
     // The verifier stays in this browser's cookie; the state, which the
     // provider sees, carries only its hash.
-    const state = await signJwt(cfg.secret, { purpose: "oidc", provider: name, issuer: p.issuer, nonce, bind: challenge, ret, exp: now() + STATE_TTL_S });
+    const state = await signJwt(cfg.secret, {
+      purpose: "oidc",
+      provider: name,
+      issuer: p.issuer,
+      nonce,
+      bind: challenge,
+      ret,
+      ...(native === null ? {} : { native }),
+      exp: now() + STATE_TTL_S,
+    });
     const to = new URL((await endpoints(p)).authorize);
     to.search = new URLSearchParams({
       ...p.params,
@@ -345,23 +376,71 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     const profile = await verifyIdToken(name, idToken, (kid) => keys(ends.jwks, kid), { issuer: p.issuer, issuers: p.issuers, client, nonce: state.nonce });
     if (profile === null) return refuse(401, "id token refused");
     const user = await cfg.links.userFor(profile);
+    const ret = safeReturn(typeof state.ret === "string" ? state.ret : null);
+    if (typeof state.native === "string") {
+      // The system browser is not the app: it keeps no session, and the app's
+      // link back carries a code only the app's secret redeems.
+      const handoff = await signJwt(cfg.secret, {
+        purpose: "oidc-handoff",
+        provider: name,
+        issuer: p.issuer,
+        sub: user.id,
+        native: state.native,
+        jti: random(16),
+        exp: now() + HANDOFF_TTL_S,
+      });
+      return redirect(withHandoff(ret, handoff), [stateCookie(origin, name, "", 0)]);
+    }
     const session = await signJwt(cfg.secret, { purpose: "oidc-session", provider: name, issuer: p.issuer, sub: user.id, exp: now() + COOKIE_TTL_S });
-    return redirect(safeReturn(typeof state.ret === "string" ? state.ret : null), [
+    return redirect(ret, [
       `${SESSION_COOKIE}=${session}; Path=${PREFIX}; HttpOnly; SameSite=Lax${secure(origin)}; Max-Age=${COOKIE_TTL_S}`,
       `${HINT_COOKIE}=${name}; Path=/; SameSite=Lax${secure(origin)}; Max-Age=${COOKIE_TTL_S}`,
       stateCookie(origin, name, "", 0),
     ]);
   }
 
-  // The cookie as this tab's session. A cross-site POST carries no Lax
-  // cookie, and the Origin a browser sends is checked besides.
+  // Handoff codes redeemed, until each expires. Held by this instance: the
+  // secret, which never left the app, is what binds a code to it; this only
+  // stops the app itself redeeming one twice here.
+  const spent = new Map<string, number>();
+  const spend = (jti: string, exp: number) => {
+    for (const [k, e] of spent) if (e <= now()) spent.delete(k);
+    if (spent.has(jti)) return false;
+    spent.set(jti, exp);
+    return true;
+  };
+
+  /** The claims of the code an app hands back with its secret, or null. */
+  async function handedOff(req: Request): Promise<Record<string, unknown> | null> {
+    let body: unknown;
+    try {
+      body = await req.json();
+    } catch {
+      return null;
+    }
+    if (!isObject(body) || typeof body.handoff !== "string" || typeof body.secret !== "string") return null;
+    const c = await verifyJwt(cfg.secret, body.handoff);
+    if (c === null || c.purpose !== "oidc-handoff" || typeof c.native !== "string" || typeof c.jti !== "string") return null;
+    if ((await sha256url(body.secret)) !== c.native) return null;
+    return spend(c.jti, c.exp as number) ? c : null;
+  }
+
+  // The cookie as this tab's session, or an app's handoff code with its
+  // secret. A cross-site POST carries no Lax cookie, and the Origin a browser
+  // sends is checked besides.
   async function session(req: Request): Promise<Response> {
     const origin = req.headers.get("origin");
     if (origin !== null && origin !== cfg.origin(req)) return refuse(403, "another origin");
-    const raw = cookieOf(req, SESSION_COOKIE);
-    if (raw === null) return refuse(401, "not signed in");
-    const c = await verifyJwt(cfg.secret, raw);
-    if (c === null || c.purpose !== "oidc-session" || typeof c.sub !== "string" || typeof c.provider !== "string" || typeof c.issuer !== "string") {
+    let c: Record<string, unknown> | null;
+    if ((req.headers.get("content-type") ?? "").startsWith("application/json")) {
+      c = await handedOff(req);
+    } else {
+      const raw = cookieOf(req, SESSION_COOKIE);
+      if (raw === null) return refuse(401, "not signed in");
+      c = await verifyJwt(cfg.secret, raw);
+      if (c?.purpose !== "oidc-session") c = null;
+    }
+    if (c === null || typeof c.sub !== "string" || typeof c.provider !== "string" || typeof c.issuer !== "string") {
       return refuse(401, "not signed in");
     }
     // An issuer replacement cannot inherit the previous issuer's sessions.

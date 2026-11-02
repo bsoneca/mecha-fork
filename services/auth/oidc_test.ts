@@ -19,6 +19,7 @@ import {
   sha256url,
   STATE_COOKIE,
   type User,
+  withHandoff,
 } from "./oidc.ts";
 
 const ORIGIN = "https://app.test";
@@ -384,6 +385,87 @@ Deno.test("the session exchange is refused from another origin, without the cook
   assertEquals((await s.serve(exchange(session, null))).status, 200);
   s.links.users.clear();
   assertEquals((await s.serve(exchange(session))).status, 401);
+});
+
+/** An app's sign-in in the system browser: its start carries the hash of a
+ * secret the app keeps, and the link back carries the handoff code. */
+async function nativeSignIn(s: Awaited<ReturnType<typeof setup>>, ret = "/table/r1?seat=w") {
+  const secret = encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const res = await s.serve(new Request(`${ORIGIN}/auth/oidc/google/start?return=${encodeURIComponent(ret)}&native=${await sha256url(secret)}`));
+  assertEquals(res.status, 303);
+  const to = new URL(res.headers.get("location")!);
+  const done = await s.serve(callback({ code: s.idp.authorize(to), state: to.searchParams.get("state")! }, jar(res)[STATE_COOKIE]));
+  return { secret, done };
+}
+
+const redeem = (body: unknown, origin: string | null = null) =>
+  new Request(`${ORIGIN}/auth/oidc/session`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(origin === null ? {} : { origin }) },
+    body: JSON.stringify(body),
+  });
+
+Deno.test("an app signs in through the system browser: its link back carries a code only its secret redeems, once", async () => {
+  const s = await setup();
+  const { secret, done } = await nativeSignIn(s);
+  assertEquals(done.status, 303);
+  const back = new URL(done.headers.get("location")!, ORIGIN);
+  assertEquals(back.pathname, "/table/r1");
+  assertEquals(back.searchParams.get("seat"), "w");
+  // In the fragment, which no browser sends on.
+  assert(back.hash.startsWith("#handoff="), back.hash);
+  const handoff = back.hash.slice("#handoff=".length);
+  // The system browser keeps no session of the app's: only the spent state.
+  assertEquals(jar(done), { [STATE_COOKIE]: "" });
+
+  const id = s.links.users.get("google:https://accounts.google.com:alice-sub")!.id;
+  const answer = await s.serve(redeem({ handoff, secret }));
+  assertEquals(answer.status, 200);
+  const body = await answer.json();
+  assertEquals(body.user, { id, handle: "h-0" });
+  assert(typeof body.token === "string");
+  // Once.
+  assertEquals((await s.serve(redeem({ handoff, secret }))).status, 401);
+});
+
+Deno.test("a handoff code is refused without its secret, past its minute, as a cookie, or once the link is gone", async () => {
+  const s = await setup();
+  const { secret, done } = await nativeSignIn(s);
+  const handoff = new URL(done.headers.get("location")!, ORIGIN).hash.slice("#handoff=".length);
+  // Whoever caught the link has the code and not the secret.
+  assertEquals((await s.serve(redeem({ handoff, secret: "another-secret" }))).status, 401);
+  assertEquals((await s.serve(redeem({ handoff }))).status, 401);
+  assertEquals((await s.serve(redeem({ handoff, secret }, "https://evil.test"))).status, 403);
+  // A code is no browser session, and a browser session no code.
+  assertEquals((await s.serve(exchange(handoff))).status, 401);
+  const session = jar(await signIn(s))[SESSION_COOKIE];
+  assertEquals((await s.serve(redeem({ handoff: session, secret }))).status, 401);
+  const id = s.links.users.get("google:https://accounts.google.com:alice-sub")!.id;
+  const claims = { purpose: "oidc-handoff", provider: "google", issuer: "https://accounts.google.com", sub: id, native: await sha256url(secret) };
+  assertEquals((await s.serve(redeem({ handoff: await signJwt(SECRET, { ...claims, jti: "j1", exp: now() - 1 }), secret }))).status, 401);
+  assertEquals((await s.serve(redeem({ handoff: await signJwt("another-secret-of-at-least-32-chars!", { ...claims, jti: "j2", exp: now() + 60 }), secret }))).status, 401);
+  assertEquals((await s.serve(redeem("not an object"))).status, 401);
+  s.links.users.clear();
+  assertEquals((await s.serve(redeem({ handoff, secret }))).status, 401);
+});
+
+Deno.test("a handoff's return stays on this origin once the code is added", async () => {
+  const s = await setup();
+  for (const ret of ["/a/..//evil.test/catch", "/a/../\\evil.test", "/x#y"]) {
+    const { done } = await nativeSignIn(s, ret);
+    const to = done.headers.get("location")!;
+    assertEquals(new URL(to, ORIGIN).origin, ORIGIN, to);
+    assert(to.startsWith("/") && !to.startsWith("//") && !to.startsWith("/\\"), to);
+  }
+  assertEquals(withHandoff("/a/..//evil.test/catch", "C"), "/#handoff=C");
+  assertEquals(withHandoff("/x?y=1#z", "C"), "/x?y=1#handoff=C");
+});
+
+Deno.test("a native start names an S256 hash, or it is refused", async () => {
+  const s = await setup();
+  for (const native of ["", "short", "a".repeat(44), `${"a".repeat(42)}=`]) {
+    assertEquals((await s.serve(new Request(`${ORIGIN}/auth/oidc/google/start?native=${encodeURIComponent(native)}`))).status, 400, native);
+  }
 });
 
 Deno.test("sign-out clears the session and its hint, and only from this origin", async () => {
