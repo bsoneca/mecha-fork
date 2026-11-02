@@ -54,6 +54,13 @@ a page the door serves:
   false, while the link still stands: the terminal keeps a tab's session in
   sessionStorage, which a redirect cannot write, and a tab opened later adopts
   the same sign-in this way. `POST /auth/oidc/signout` clears both cookies.
+- An app on a device signs in in the system browser, whose cookie it never
+  reads. It keeps a random secret and starts with
+  `start?return=<path>&native=<S256(secret)>`; the callback then leaves no
+  session cookie and returns to `<path>?handoff=<code>` (the app's link back),
+  and `POST /auth/oidc/session` with the JSON body `{handoff, secret}` answers
+  the user token, once, within a minute of the callback. Whoever catches the
+  link has the code and not the secret: PKCE again, between door and app.
 
 A provider is found by its discovery document. Each setting is `signIn`'s
 default for the provider (`issuer`, `internal`, `client`, `scope`, `params`),
