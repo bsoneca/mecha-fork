@@ -606,6 +606,8 @@ Deno.test("a provider with no preset signs in through the issuer the program nam
   assert.equal(env.value.OIDC_PHONE_ISSUER, "${OIDC_PHONE_ISSUER:-http://localhost:28443}");
   assert.equal(env.value.OIDC_PHONE_AUTHORIZE_PARAMS, "${OIDC_PHONE_AUTHORIZE_PARAMS:-provider=phone}");
   assert.equal(env.value.OIDC_PHONE_CLIENT_ID, "${OIDC_PHONE_CLIENT_ID:-origin}");
+  // Its environment is never written without the issuer standing in its place.
+  assert.equal((await exported({}, "surface.targets.auth.compose.environment", { signIn: { phone: { client: "origin" } } })).ok, false);
 });
 
 Deno.test("a provider's program defaults stand until the deployment sets its own, and a secret is never one", async () => {

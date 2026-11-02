@@ -841,7 +841,13 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 								}
 								for o, v in {client: "CLIENT_ID", issuer: "ISSUER", internal: "INTERNAL", secret: "CLIENT_SECRET", scope: "SCOPE", params: "AUTHORIZE_PARAMS"} if o != "client" || d.client != _|_ {
 									let e = "OIDC_\(strings.ToUpper(p))_\(v)"
-									(e): "${\(e):-\(*d[o] | "")}"
+									// A provider with no preset has no issuer but the program's.
+									if o != "issuer" || p == "google" {
+										(e): "${\(e):-\(*d[o] | "")}"
+									}
+									if o == "issuer" && p != "google" {
+										(e): "${\(e):-\(d.issuer)}"
+									}
 								}
 							}
 						}
