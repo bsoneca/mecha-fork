@@ -950,6 +950,8 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 					if X.capabilities.server {"crud=3000"},
 					if X.capabilities.server {"electric=3000"},
 					if X.capabilities.auth {"auth=9999"},
+					if X.capabilities.blobs {"rclone-s3=3900"},
+					if X.capabilities.blobs {"imgproxy=8081"},
 					for p in X.meta.hostPeers {p},
 				]
 				entrypoint: {
@@ -1113,24 +1115,55 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 			}
 			if X.capabilities.blobs {
 				// rclone's own image: its entrypoint makes the bucket and serves it.
-				"rclone-s3": X._image & {
-					dockerfile: {
-						from: name: "rclone/rclone:1.71.0@sha256:fd635aecd9667ee3c3bf920d14118090d4f2a83a080c1fa77e0bafbd4587ca87"
-						entrypoint: ["sh", "-c", "mkdir -p \"/data/$RCLONE_LOCAL_BUCKET\" && exec rclone serve s3 --addr=0.0.0.0:3900 --vfs-cache-mode=off /data"]
+				"rclone-s3": bayt.healthcheck.http & X._image & X._host & {
+					healthcheck: {
+						url:            "http://127.0.0.1:3900/"
+						interval:       "5s"
+						start_interval: "500ms"
+						start_period:   "10s"
+					}
+					dockerfile: from: name: "rclone/rclone:1.71.0@sha256:fd635aecd9667ee3c3bf920d14118090d4f2a83a080c1fa77e0bafbd4587ca87"
+					expose: http: {port: 3900, env: "RCLONE_S3_PORT"}
+					// The host serves a fresh directory per start, as a recreated
+					// container starts with an empty /data, on the rclone mise pins
+					// (toolchain/tools.cue).
+					entrypoint: {
+						do:    #"d=$(mktemp -d); trap 'rm -rf "$d"' EXIT; mkdir -p "$d/$RCLONE_LOCAL_BUCKET"; rclone serve s3 --addr=127.0.0.1:$RCLONE_S3_PORT --vfs-cache-mode=off "$d""#
+						shell: "sh"
+						dockerfile: {
+							do:    #"mkdir -p "/data/$RCLONE_LOCAL_BUCKET" && exec rclone serve s3 --addr=0.0.0.0:3900 --vfs-cache-mode=off /data"#
+							shell: "sh"
+						}
+						env: compose.environment
 					}
 					compose: {
 						environment: RCLONE_LOCAL_BUCKET: "mecha-objects"
-						healthcheck: {
-							test: ["CMD-SHELL", "wget -S -O /dev/null http://127.0.0.1:3900/ 2>&1 | grep -q 'HTTP/'"]
-							interval:     "5s", timeout:         "5s", retries: 6
-							start_period: "10s", start_interval: "500ms"
-						}
 					}
 				}
-				imgproxy: X._image & {
+				imgproxy: bayt.healthcheck.http & X._image & X._host & {
+					healthcheck: {
+						url:            "http://127.0.0.1:8081/health"
+						interval:       "5s"
+						start_interval: "500ms"
+						start_period:   "30s"
+					}
 					dockerfile: from: name: "ghcr.io/imgproxy/imgproxy:v3.31.1@sha256:2b7a56dbf9c8a8e12e7109a5bdd27d31a8c1aa49f2116c927c6aedc37e18db98"
+					// imgproxy links libvips and has no macOS binary: the host runs a
+					// stand-in for the requests the cluster makes of it
+					// (services/imgproxy/host.ts), and the image runs imgproxy.
+					expose: http: {port: 8081, env: "IMGPROXY_PORT"}
+					entrypoint: {
+						do:    "exec deno run --allow-all \(mechaDir)/services/imgproxy/host.ts"
+						shell: "sh"
+						dockerfile: {
+							do:    "imgproxy"
+							shell: "exec"
+						}
+						env: compose.environment
+						after: "rclone-s3": "healthy"
+					}
 					compose: {
-						depends_on: "rclone-s3": _started
+						depends_on: "rclone-s3": _healthy
 						environment: {
 							IMGPROXY_USE_S3:      "true"
 							IMGPROXY_S3_ENDPOINT: "http://rclone-s3:3900"
@@ -1152,11 +1185,6 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							IMGPROXY_MAX_RESULT_DIMENSION: "1024"
 							IMGPROXY_SET_CANONICAL_HEADER:      "false"
 							IMGPROXY_CACHE_CONTROL_PASSTHROUGH: "true"
-						}
-						healthcheck: {
-							test: ["CMD-SHELL", #"bash -c 'echo -e "GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n" > /dev/tcp/127.0.0.1/8081'"#]
-							interval:     "5s", timeout:         "5s", retries: 6
-							start_period: "10s", start_interval: "500ms"
 						}
 						restart: "on-failure"
 					}

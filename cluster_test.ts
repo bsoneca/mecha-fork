@@ -558,10 +558,28 @@ Deno.test("a schedule makes the migrate runner require its table", async () => {
 // The blob store is rclone's own image: the bucket made and the server
 // started by its entrypoint, no image of mecha's.
 Deno.test("the blob store runs rclone's own image", async () => {
-  const got = await exported({}, "surface.targets[\"rclone-s3\"].dockerfile", { blobs: true });
+  const got = await exported({}, "surface.targets[\"rclone-s3\"]", { blobs: true });
   assert.equal(got.ok, true, got.stderr);
-  assert.match(got.value.from.name, /^rclone\/rclone:[0-9.]+@sha256:[0-9a-f]{64}$/);
-  assert.match(got.value.entrypoint.join(" "), /mkdir -p .*RCLONE_LOCAL_BUCKET.* && exec rclone serve s3/);
+  assert.match(got.value.dockerfile.from.name, /^rclone\/rclone:[0-9.]+@sha256:[0-9a-f]{64}$/);
+  assert.match(got.value.entrypoint.dockerfile.do, /mkdir -p .*RCLONE_LOCAL_BUCKET.* && exec rclone serve s3/);
+});
+
+// A host runs the blob plane too, so a local door answers /blobs and /img: rclone
+// itself over a directory of its own, and a stand-in for imgproxy (which has no
+// macOS binary), each a peer of the door, and imgproxy after the store.
+Deno.test("a host launch runs the blob plane and the door reaches it", async () => {
+  const got = await exported({}, "surface.targets", { blobs: true });
+  assert.equal(got.ok, true, got.stderr);
+  const t = got.value;
+  assert.match(t["rclone-s3"].entrypoint.do, /rclone serve s3 --addr=127\.0\.0\.1:\$RCLONE_S3_PORT/);
+  assert.equal(t["rclone-s3"].expose.http.env, "RCLONE_S3_PORT");
+  assert.match(t.imgproxy.entrypoint.do, /services\/imgproxy\/host\.ts/);
+  assert.equal(t.imgproxy.entrypoint.after["rclone-s3"], "healthy");
+  assert.equal(t.imgproxy.expose.http.env, "IMGPROXY_PORT");
+  assert.match(t.caddy.entrypoint.do, /--peers [^ ]*rclone-s3=3900,imgproxy=8081/);
+  const off = await exported({}, "surface.targets", {});
+  assert.equal(off.value["rclone-s3"], undefined);
+  assert.doesNotMatch(off.value.caddy.entrypoint.do, /rclone-s3/);
 });
 
 Deno.test("a cluster takes the published images and no others", async () => {
