@@ -1001,6 +1001,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 			}
 			if X.capabilities.server {
 				electric: bayt.healthcheck.http & X._image & X._host & {
+					// Electric answers a stop only after its open long-poll requests drain (about 19s
+					// measured), and the database stops after it. Nothing it holds outlives a run.
+					"process-compose": shutdown: timeout_seconds: 2
 					healthcheck: {
 						url:            "http://127.0.0.1:3000/v1/health"
 						interval:       "5s"
