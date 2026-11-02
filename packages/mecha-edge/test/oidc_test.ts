@@ -79,8 +79,8 @@ Deno.test({ name: 'a person signs in at the edge through a provider', sanitizeRe
       assert.deepEqual(await who.json(), { id: alice.user.id, handle: alice.user.handle })
     })
     await t.step('the link names the provider, its issuer and the subject', async () => {
-      const { rows } = await db.query<{ provider: string; issuer: string; sub: string; user_id: string; name: string }>('SELECT provider, issuer, sub, user_id, name FROM identity_link')
-      assert.deepEqual(rows, [{ provider: 'test', issuer: idp.issuer, sub: 'alice-sub', user_id: alice.user.id, name: 'Alice' }])
+      const { rows } = await db.query<{ provider: string; issuer: string; sub: string; user_id: string; name: string; email: string }>('SELECT provider, issuer, sub, user_id, name, email FROM identity_link')
+      assert.deepEqual(rows, [{ provider: 'test', issuer: idp.issuer, sub: 'alice-sub', user_id: alice.user.id, name: 'Alice', email: 'alice@mail.test' }])
     })
     await t.step("the session is no guest's, and its rows are its own", async () => {
       const [, payload] = alice.token.split('.')

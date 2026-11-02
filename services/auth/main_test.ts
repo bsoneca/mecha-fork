@@ -994,7 +994,7 @@ Deno.test("a configured origin is exact, and only localhost stands for the dev d
   assert(ceremonyOrigin("https://localhost:*", null).endsWith("*"));
 });
 
-const alice = { provider: "google", issuer: "https://accounts.google.com", sub: "g-alice", name: "Alice", picture: null };
+const alice = { provider: "google", issuer: "https://accounts.google.com", sub: "g-alice", name: "Alice", picture: null, email: "alice@mail.test" };
 
 Deno.test({
   name: "a provider's subject is one person, however many sign-ins race to make it",
@@ -1012,6 +1012,9 @@ Deno.test({
     assertEquals(link.user_id, users[0].id);
     await links.userFor({ ...alice, name: "Alice B." });
     assertEquals((await sql`select name from identity_link where sub = 'g-alice'`)[0].name, "Alice B.");
+    assertEquals((await sql`select email from identity_link where sub = 'g-alice'`)[0].email, "alice@mail.test");
+    await links.userFor({ ...alice, email: null });
+    assertEquals((await sql`select email from identity_link where sub = 'g-alice'`)[0].email, null, "the provider no longer vouches for one");
     assertEquals(await links.handleOf("google", alice.issuer, users[0].id), users[0].handle);
   },
 });
@@ -1044,7 +1047,7 @@ Deno.test({
     await sql`alter table identity_link add column issuer text`;
     await sql`update identity_link set issuer = ${alice.issuer}`;
     await migrate();
-    assertEquals((await links.userFor({ ...alice, sub: "pairwise-1", name: null, picture: null })).id, guest.id);
+    assertEquals((await links.userFor({ ...alice, sub: "pairwise-1", name: null, picture: null, email: null })).id, guest.id);
     const replacement = await links.userFor({ ...alice, issuer: "https://broker.test", sub: "pairwise-1" });
     assert(replacement.id !== guest.id);
     assertEquals(await links.handleOf("google", "https://broker.test", guest.id), null);
