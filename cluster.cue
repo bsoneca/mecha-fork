@@ -310,9 +310,15 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		// may name another issuer in the provider's place and an environment
 		// another still; a provider whose client neither gives refuses to start.
 		// A secret is the deployment's alone. A provider signs a person in, so
-		// it presupposes `auth`.
-		signIn: [("google")]: {
+		// it presupposes `auth`. Its name is a lowercase word, as the service
+		// reads OIDC_PROVIDERS; one the service has no preset for (Google's) is
+		// whatever issuer the program names in its place, such as an identity
+		// broker's phone sign-in, so the program must name one.
+		signIn: [N=(=~"^[a-z][a-z0-9]*$")]: {
 			[("issuer" | "internal" | "client" | "scope" | "params")]: string & !="" & !~"[$}]"
+			if N != "google" {
+				issuer!: _
+			}
 		}
 		if len(signIn) > 0 {
 			auth: true
