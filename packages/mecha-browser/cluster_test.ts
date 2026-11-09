@@ -377,10 +377,9 @@ Deno.test('a change whose row cannot be read back fails the page, and every read
 })
 
 // Regression: a change whose row was gone by its read-back left the log
-// without waking the live requests waiting on that change, and each waited out
-// its 20 s timeout to answer 204. A TRUNCATE in the change's transaction
-// removes the row with no notification of its own to wake them.
-Deno.test('a change whose row is gone by its read-back answers the live request at once', async () => {
+// without waking live requests. TRUNCATE invalidates the entire shape, even
+// when a prior row notification is still waiting to read the removed row.
+Deno.test('truncate wakes a live request and invalidates queued row changes', async () => {
   const { db, get } = await scopedCluster()
   const first = await get('offset=-1')
   const at = `offset=${first.headers.get('electric-offset')}&handle=${first.headers.get('electric-handle')}`
@@ -390,7 +389,8 @@ Deno.test('a change whose row is gone by its read-back answers the live request 
   const started = Date.now()
   const waited = await live
   assert.ok(Date.now() - started < 5_000, 'the live request was answered when the change dropped, not at its timeout')
-  assert.equal(waited.status, 204)
+  assert.equal(waited.status, 409)
+  assert.deepEqual(await waited.json(), [{ headers: { control: 'must-refetch' } }])
   await db.close()
 })
 
@@ -412,6 +412,24 @@ Deno.test('a subset leaves the stream where it was, so a change outside it still
   for (let i = 0; i < 100 && !seen.some((m) => m.headers.operation === 'update'); i++) await new Promise((r) => setTimeout(r, 20))
   assert.deepEqual(seen.map((m) => `${m.headers.operation} ${m.value?.id} ${m.value?.game ?? ''}`), ['insert 1 7', 'update 3 9'])
   stream.unsubscribeAll()
+  await db.close()
+})
+
+// Regression: a non-live catch-up request with no new entries answered 204
+// with an empty body, which left a reopened ShapeStream in replay mode without
+// an up-to-date control message and spun it into its fast-retry-loop 502; and
+// a subset snapshot without electric-up-to-date caused ShapeStream's chunk
+// prefetcher to re-request the subset URL.
+Deno.test('a non-live catch-up with no entries answers 200 up-to-date, and a subset marks itself up-to-date', async () => {
+  const { db, get } = await scopedCluster()
+  const first = await get('offset=now&log=changes_only&replica=full')
+  const at = `offset=${first.headers.get('electric-offset')}&handle=${first.headers.get('electric-handle')}&log=changes_only&replica=full`
+  const catchup = await get(at)
+  assert.equal(catchup.status, 200)
+  assert.deepEqual(await catchup.json(), [{ headers: { control: 'up-to-date', global_last_seen_lsn: '0' } }])
+  assert.notEqual(catchup.headers.get('electric-cursor'), first.headers.get('electric-cursor'))
+  const snap = await get(`log=changes_only&${subset('"game" = $1', '{"1":"7"}')}`)
+  assert.equal(snap.headers.get('electric-up-to-date'), 'true')
   await db.close()
 })
 

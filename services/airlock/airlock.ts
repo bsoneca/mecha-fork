@@ -20,8 +20,9 @@
 import { run, type Runner, type Task } from "graphile-worker";
 import { EventEmitter } from "node:events";
 import pg from "pg";
-import { type Answer, type Effect, outcome, type Outcome, step } from "./reentry.ts";
-import type { Handler, Transport } from "./handler.ts";
+import { type Answer, type Effect, ledgerKeySql, outcome, type Outcome, step, undeployed } from "./reentry.ts";
+import { BreakerOpen, type Handler, type Transport } from "./handler.ts";
+import { type BlobStore, stowed } from "./blobs.ts";
 
 export type Airlock = {
   connectionString: string;
@@ -34,6 +35,14 @@ export type Airlock = {
   /** The header each effect's credential adds to its sink calls, read once;
    * the handler never holds it. */
   headers: Record<string, Record<string, string>>;
+  /** The cluster's blob plane, where an answer's bytes go and a handler's
+   * content keys are read; absent without one. */
+  blobs?: BlobStore;
+  /** The door's origin, a handler's sink.origin. */
+  origin?: string;
+  /** The release target this airlock runs on, which a bridge naming its
+   * targets is checked against. */
+  target?: string;
 };
 
 const q = (name: string) => `"${name}"`;
@@ -103,19 +112,22 @@ async function settle(a: Airlock, key: string, l: { row: Record<string, unknown>
     "UPDATE airlock.external_effect_ledger SET outcome = $2, settled_at = clock_timestamp() WHERE key = $1 AND outcome IS NULL",
     [key, settled],
   );
-  const match = effect.row.map((c, i) => `${q(c)}::text = $${i + 3}`).join(" AND ");
-  const args = [settled.target, effect.state, ...effect.row.map((c) => String(l.row[c]))];
+  const match = effect.row.map((c, i) => `${q(c)}::text = $${i + 4}`).join(" AND ");
+  const keyed = ledgerKeySql(key.slice(0, key.indexOf(":")), effect);
+  const args = [settled.target, effect.state, key, ...effect.row.map((c) => String(l.row[c]))];
   const moved = await a.db.query(
-    `UPDATE ${q(effect.table)} SET ${q(effect.field)} = $1 WHERE ${q(effect.field)} = $2 AND ${match}`,
+    `UPDATE ${q(effect.table)} SET ${q(effect.field)} = $1 WHERE ${q(effect.field)} = $2 AND ${keyed} = $3 AND ${match}`,
     args,
   );
   if (moved.rowCount !== 1) {
     // The guard holds a row in its invoking state until the outcome lands,
-    // so a row still there was not moved by this outcome; one anywhere else,
-    // or gone, was moved by an earlier delivery of it and then by the program.
-    const where = effect.row.map((c, i) => `${q(c)}::text = $${i + 1}`).join(" AND ");
-    const { rows: [row] } = await a.db.query(`SELECT ${q(effect.field)} AS at FROM ${q(effect.table)} WHERE ${where}`, args.slice(2));
-    if (row?.at === effect.state) {
+    // so a row still there under this key was not moved by this outcome; one
+    // anywhere else, gone, or back in the state for another invocation, was
+    // moved by an earlier delivery of it and then by the program.
+    const where = effect.row.map((c, i) => `${q(c)}::text = $${i + 2}`).join(" AND ");
+    const { rows: [row] } = await a.db.query(
+      `SELECT ${q(effect.field)} AS at, ${keyed} = $1 AS ours FROM ${q(effect.table)} WHERE ${where}`, [key, ...args.slice(3)]);
+    if (row?.at === effect.state && row.ours) {
       throw new Error(`${key}: ${effect.table} ${JSON.stringify(l.row)} stays in ${effect.state}: its move to ${settled.target} was refused`);
     }
   }
@@ -194,7 +206,7 @@ export async function start(a: Airlock, key: string, opts: { noHandleSignals?: b
     );
     if (l === undefined) throw new Error(`airlock.external_effect_ledger holds no ${key}`);
     const effect = a.effects[l.effect] ?? die(`${key}: effect ${l.effect} is not in effects.json`);
-    let settled = l.outcome;
+    let settled = l.outcome ?? undeployed(effect, a.target);
     if (settled === null) {
       const { rows: [c] } = await a.db.query(
         "UPDATE airlock.external_effect_ledger SET entered = entered + 1 WHERE key = $1 RETURNING entered",
@@ -215,19 +227,30 @@ export async function start(a: Airlock, key: string, opts: { noHandleSignals?: b
 
 /** The handler run the ledger's count calls for, as an outcome. A throw is no
  * answer: retried while the ledger counts fewer runs than the effect's
- * attempts, `unknown` on the last, and a run past them calls nothing. */
+ * attempts, `unknown` on the last, and a run past them calls nothing. An open
+ * breaker spends no attempt. */
 async function perform(a: Airlock, name: string, effect: Effect, key: string, input: unknown, entered: number) {
   const handler = a.handlers[name] ?? die(`no handler is admitted for ${name}`);
   if (entered > effect.attempts) return outcome(effect, "unknown", false);
   const next = step(effect, entered);
   if (next === "unknown") return outcome(effect, "unknown", false);
+  // A reconcile that answered reached the sink, so a breaker its issue meets is a throw.
+  let reached = false;
   try {
     if (next === "reconcile") {
-      const known = await handler.call("reconcile", input, key, a.transport, a.secrets[name], a.headers[name]);
-      if (!("absent" in known)) return outcome(effect, known, true);
+      const known = await handler.call("reconcile", input, key, a.transport, a.secrets[name], a.headers[name], { blobs: a.blobs, origin: a.origin });
+      reached = true;
+      if (!("absent" in known)) return outcome(effect, await stowed(known, key, a.blobs), true);
     }
-    return outcome(effect, await handler.call("issue", input, key, a.transport, a.secrets[name], a.headers[name]) as Answer, false);
+    const answer = await handler.call("issue", input, key, a.transport, a.secrets[name], a.headers[name], { blobs: a.blobs, origin: a.origin }) as Answer;
+    return outcome(effect, await stowed(answer, key, a.blobs), false);
   } catch (e) {
+    if (e instanceof BreakerOpen && !reached) {
+      // Nothing was asked of the sink, so the run the ledger counted did not
+      // happen; the queue's backoff brings it back.
+      await a.db.query("UPDATE airlock.external_effect_ledger SET entered = entered - 1 WHERE key = $1", [key]);
+      throw e;
+    }
     if (entered < effect.attempts) throw e;
     console.error(`${key}: no answer after ${entered} runs, so unknown:`, e);
     return outcome(effect, "unknown", false);

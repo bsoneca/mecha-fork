@@ -4,12 +4,13 @@ import type { Collection, LoadSubsetOptions } from "@tanstack/db"
 import { electricCollectionOptions } from "@tanstack/electric-db-collection"
 import { BroadcastChannelLeader, NonRetriableError, startOfflineExecutor, WebLocksLeader } from "@tanstack/offline-transactions"
 import type { LeaderElection } from "@tanstack/offline-transactions"
-import { localOnlyCollectionOptions, localStorageCollectionOptions } from "@tanstack/db"
+import { localOnlyCollectionOptions } from "@tanstack/db"
 import { idempotentSink } from "./sync-sink.js"
 import { unionCollectionOptions } from "./union.js"
 import { carriers, types } from "./types.js"
 import type { CarrierField, Carriers, CarrierTable, TypeField, Types, TypeTable } from "./types.js"
 import { createStorageAdapter } from "./storage.js"
+import { PUBLIC_WHERE } from "./public-where.js"
 
 /**
  * Mecha client v2 — the platform's at-least-once data plane for one app.
@@ -120,7 +121,12 @@ export type RowKey = { column: string; value: string }
  * header on the next poll rather than a new shape. The predicate is the
  * mint's own string, which is what the gate compares.
  */
-function shapeAuthority(authUrl: string, token: (() => string | null) | undefined, fetcher: typeof fetch) {
+function shapeAuthority(
+  authUrl: string,
+  token: (() => string | null) | undefined,
+  fetcher: typeof fetch,
+  publicTables: ReadonlySet<string>,
+) {
   type Held = { token: string; where: string; expiresAt: number }
   const held = new Map<string, Held>()
   const inflight = new Map<string, Promise<Held>>()
@@ -163,11 +169,27 @@ function shapeAuthority(authUrl: string, token: (() => string | null) | undefine
     return p
   }
 
+  // A public table's shape carries the session itself: its `where` is the same
+  // for every subject, so there is nothing to mint, and a screen mounts without
+  // a round trip per table.
+  const sessionOf = (table: string) => {
+    const session = token?.()
+    if (!session) throw new Error(`the public shape ${table} needs a session`)
+    return session
+  }
+  const open = (table: string, key?: RowKey) => key === undefined && publicTables.has(table)
+
   return {
-    authorization: (table: string, key?: RowKey) => async () => `Bearer ${(await current(table, key)).token}`,
-    where: (table: string, key?: RowKey) => async () => (await current(table, key)).where,
-    /** Drops a held token, so the next request mints. */
-    forget: (table: string, key?: RowKey) => void held.delete(JSON.stringify([token?.(), nameOf(table, key)])),
+    authorization: (table: string, key?: RowKey) => async () =>
+      `Bearer ${open(table, key) ? sessionOf(table) : (await current(table, key)).token}`,
+    where: (table: string, key?: RowKey) => async () => open(table, key) ? PUBLIC_WHERE : (await current(table, key)).where,
+    /** Drops a held token, so the next request mints; false when the shape
+     * carries the session, which a refusal leaves nothing to re-mint for. */
+    forget: (table: string, key?: RowKey) => {
+      if (open(table, key)) return false
+      held.delete(JSON.stringify([token?.(), nameOf(table, key)]))
+      return true
+    },
   }
 }
 
@@ -371,8 +393,10 @@ export function coalescedLoad(load: (opts: LoadSubsetOptions) => true | Promise<
     for (let at = 0; at < waiting.length; at += SUBSET_BATCH) {
       const part = waiting.slice(at, at + SUBSET_BATCH)
       const where = part.length === 1 ? part[0].where : new IR.Func("or", part.map((w) => w.where)) as IR.BasicExpression<boolean>
+      // load may answer a synchronous true, which then() cannot take as a
+      // PromiseLike<void>; awaited, the type is the same in both branches.
       Promise.resolve()
-        .then(() => load({ where }))
+        .then(async () => { await load({ where }) })
         .then(() => { for (const w of part) w.resolve() }, (e) => { for (const w of part) w.reject(e) })
     }
   }
@@ -388,6 +412,69 @@ export function coalescedLoad(load: (opts: LoadSubsetOptions) => true | Promise<
       batch.push({ where, resolve, reject })
     })
   }
+}
+
+// A device table's rows, kept across restarts in this browser's localStorage. TanStack's
+// localStorage collection (0.8.0) confirms a write inside its own onInsert and never clears
+// the optimistic row, so every device row read as an unconfirmed write forever: the table is
+// a local-only collection, which is always confirmed, written through to the key in the
+// format that collection kept ({"s:<key>": {versionKey, data}}), so rows stored before stay.
+// Another tab's write arrives as a storage event. Where no localStorage exists (a server
+// render) it is local-only alone, as TanStack's in-memory storage was. A row stored before
+// a column was declared takes the column's default when read: a release that added
+// columns met readers' saved forms without them, and a binding to one threw.
+/** A row with every defaulted column it left out filled in: what a database
+ * does for a server table, and nothing does for a local one. */
+function withDefaults(fields: readonly TypeField[] | undefined, row: Record<string, unknown>): Record<string, unknown> {
+  const filled = { ...row }
+  for (const f of fields ?? []) if (f.default !== undefined && !(f.name in filled)) filled[f.name] = f.default
+  return filled
+}
+
+function deviceCollection(t: { id: string; key: string; fields?: readonly TypeField[] }): Collection<any, any, any> {
+  const storageKey = `mecha:${t.id}`
+  const storage = (globalThis as { localStorage?: Storage }).localStorage
+  const read = (): Map<unknown, Record<string, unknown>> => {
+    const raw = storage?.getItem(storageKey) ?? null
+    const parsed = raw === null ? {} : JSON.parse(raw)
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error(`${storageKey} does not hold a device table`)
+    return new Map(Object.entries(parsed).map(([slot, stored]: [string, any]) => {
+      if (typeof stored !== "object" || stored === null || typeof stored.data !== "object") throw new Error(`${storageKey}: ${slot} is not a stored row`)
+      const row = withDefaults(t.fields, stored.data)
+      return [row[t.key], row]
+    }))
+  }
+  const collection = createCollection(localOnlyCollectionOptions({
+    id: `mecha:${t.id}`,
+    getKey: (item: any) => item[t.key],
+    initialData: [...read().values()],
+  }))
+  if (storage === undefined) return collection
+  const own = (row: Record<string, unknown>) => Object.fromEntries(Object.entries(row).filter(([k]) => !k.startsWith("$")))
+  // A constant versionKey: two tabs holding the same rows write the same text, and an
+  // unchanged value raises no storage event, so they settle instead of echoing.
+  const slot = (key: unknown) => typeof key === "number" ? `n:${key}` : `s:${String(key)}`
+  collection.subscribeChanges(() => {
+    const text = JSON.stringify(Object.fromEntries([...collection.values()].map((row: any) => [slot(row[t.key]), { versionKey: "mecha", data: own(row) }])))
+    if (storage.getItem(storageKey) !== text) storage.setItem(storageKey, text)
+  })
+  globalThis.addEventListener?.("storage", (event: Event) => {
+    const e = event as StorageEvent
+    if (e.key !== storageKey || e.storageArea !== storage) return
+    const next = read()
+    for (const row of collection.toArray as Record<string, unknown>[]) {
+      if (!next.has(row[t.key])) collection.delete(row[t.key] as any)
+    }
+    for (const [key, row] of next) {
+      const held = collection.get(key as any) as Record<string, unknown> | undefined
+      if (held === undefined) collection.insert(row)
+      else if (JSON.stringify(own(held)) !== JSON.stringify(row)) collection.update(key as any, (draft: any) => {
+        for (const k of Object.keys(draft)) if (!k.startsWith("$") && !(k in row)) delete draft[k]
+        Object.assign(draft, row)
+      })
+    }
+  })
+  return collection
 }
 
 export function createMechaClient(config: MechaClientConfig): MechaClient {
@@ -430,7 +517,12 @@ export function createMechaClient(config: MechaClientConfig): MechaClient {
     fields.length === 0 ? row : typeTable().normalizeRow(fields, row, source)
   const electricUrl = resolveUrl(config.electricUrl ?? "/electric")
   const crudUrl = config.crudUrl ?? "/crud"
-  const shapes = shapeAuthority(config.authUrl, config.token, config.fetcher ?? fetch)
+  const shapes = shapeAuthority(
+    config.authUrl,
+    config.token,
+    config.fetcher ?? fetch,
+    new Set(config.tables.filter((t) => t.access?.scope === "public").map((t) => t.table)),
+  )
   const doFetch = config.fetcher ?? fetch
   const maxAge = config.maxTransactionAgeMs ?? 7 * 24 * 60 * 60 * 1000
 
@@ -496,10 +588,7 @@ export function createMechaClient(config: MechaClientConfig): MechaClient {
         // into a 401, and the retry resolves the header afresh. Anything
         // else stops the stream, as it would unhandled.
         onError: (e: any) => {
-          if (e?.status === 401) {
-            shapes.forget(t.table, key)
-            return {}
-          }
+          if (e?.status === 401 && shapes.forget(t.table, key)) return {}
           throw e
         },
         // Every column a field declares arrives as Postgres's text and is
@@ -603,15 +692,9 @@ export function createMechaClient(config: MechaClientConfig): MechaClient {
   const isLocal = (t: Table) => t.durability === "tab" || t.durability === "device"
   for (const t of byId.values()) {
     if (isLocal(t)) {
-      collections[t.id] = createCollection(
-        t.durability === "device"
-          ? localStorageCollectionOptions({
-              id: `mecha:${t.id}`,
-              storageKey: `mecha:${t.id}`,
-              getKey: (item: any) => item[t.key],
-            })
-          : localOnlyCollectionOptions({ id: `mecha:${t.id}`, getKey: (item: any) => item[t.key] }),
-      )
+      collections[t.id] = t.durability === "device"
+        ? deviceCollection(t)
+        : createCollection(localOnlyCollectionOptions({ id: `mecha:${t.id}`, getKey: (item: any) => item[t.key] }))
       continue
     }
     if (!reachable.has(t.id)) {
@@ -999,10 +1082,7 @@ export function createMechaClient(config: MechaClientConfig): MechaClient {
           parser: parserOf(t),
           signal: controller.signal,
           onError: (error: any) => {
-            if (error?.status === 401 && identity() === subject) {
-              shapes.forget(t.table)
-              return {}
-            }
+            if (error?.status === 401 && identity() === subject && shapes.forget(t.table)) return {}
           },
         })
         const unsubscribe = stream.subscribe((messages) => {
@@ -1078,8 +1158,10 @@ export function createMechaClient(config: MechaClientConfig): MechaClient {
       }
       if (normalizedRows.length === 0) return Promise.resolve()
       // One call, whatever the batch's size: the collection recomputes the live
-      // queries over this table once for it.
-      if (isLocal(t)) return Promise.resolve(void collections[tableId].insert(normalizedRows))
+      // queries over this table once for it. A local table has no database to
+      // fill the columns a row leaves out, so its defaults land here, as they
+      // do when a device row is read back (deviceCollection).
+      if (isLocal(t)) return Promise.resolve(void collections[tableId].insert(normalizedRows.map((row) => withDefaults(t.fields, row))))
       return run(
         `insert:${tableId}`,
         normalizedRows.map((row) => `${tableId}:${String(row[t.key])}`),

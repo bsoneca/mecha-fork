@@ -5,7 +5,6 @@
 // A shape is served whole from offset -1, or from `offset=now` with only the
 // changes after it, and then by subset snapshots its client asks for: what the
 // stack's Electric answers a collection synced on demand.
-import type { PGlite } from '@electric-sql/pglite'
 import {
   isSubsetWhere,
   SHAPE_FIXED_PARAMS,
@@ -17,8 +16,14 @@ import {
   subsetPositions,
 } from '../../services/auth/jwt.ts'
 
+export interface ShapesDb {
+  query<T = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: T[] }>
+  exec(text: string): Promise<unknown>
+  listen(channel: string, onNotify: (payload: string) => void): Promise<() => Promise<void>>
+}
+
 export interface ShapesConfig {
-  db: PGlite
+  db: ShapesDb
   /** Server tables that carry shapes. */
   tables: string[]
   schema?: Record<string, { durability?: string }>
@@ -30,10 +35,15 @@ export interface ShapesConfig {
   fail: (error: Error) => void
 }
 
+export interface ShapeKey {
+  column: string
+  value: string
+}
+
 export interface Shapes {
   has: (table: string) => boolean
-  /** Answers `/electric/v1/shape` for a subject reaching `reach()`'s scopes. */
-  serve: (req: Request, reach: () => Promise<string[]>) => Promise<Response>
+  /** Answers `/electric/v1/shape` for a subject reaching `reach()`'s scopes, or a keyed row predicate. */
+  serve: (req: Request, reach: () => Promise<string[]>, key?: ShapeKey) => Promise<Response>
 }
 
 /** Entries kept per table; a client further behind than this refetches. */
@@ -51,6 +61,8 @@ interface Log {
    * order they were numbered, through the one serialized connection, so the
    * `tail - filled` newest are the unfilled ones. */
   filled: number
+  /** The highest offset evicted from `entries` by `RETAINED`. */
+  trimmed: number
   entries: Entry[]
   waiters: Map<string, Set<() => void>>
   waitersAll: Set<() => void>
@@ -113,7 +125,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
       const at = pk.indexOf(c.column_name)
       schema[c.column_name] = { type: c.udt_name, ...(at >= 0 ? { pk_index: at } : {}), ...(c.is_nullable === 'NO' ? { not_null: true } : {}) }
     }
-    logs.set(table, { handle: `${table}-${bootId}`, tail: 0, filled: 0, entries: [], waiters: new Map(), waitersAll: new Set(), schema, pk })
+    logs.set(table, { handle: `${table}-${bootId}`, tail: 0, filled: 0, trimmed: 0, entries: [], waiters: new Map(), waitersAll: new Set(), schema, pk })
   }
 
   // The notification carries the key and the scope, not the row: pg_notify
@@ -125,16 +137,48 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
   // own `txid` column is the 64-bit xid8 it is ordered by, which differs from
   // the xid once the epoch moves, so no message's txids read it.
   await db.exec(`CREATE OR REPLACE FUNCTION shape_notify() RETURNS trigger LANGUAGE plpgsql AS $$
-    DECLARE r jsonb; k jsonb := '{}'::jsonb; c text;
+    DECLARE r jsonb; k jsonb; c text; n integer;
+      used integer := COALESCE(NULLIF(current_setting('mecha.shape_notifications', true), ''), '0')::integer;
+      reset_key text := 'mecha.shape_reset_' || TG_RELID;
     BEGIN
-      IF TG_OP = 'DELETE' THEN r := to_jsonb(OLD); ELSE r := to_jsonb(NEW); END IF;
-      FOREACH c IN ARRAY TG_ARGV LOOP k := k || jsonb_build_object(c, r -> c); END LOOP;
-      PERFORM pg_notify('shape', json_build_object('table', TG_TABLE_NAME, 'op', TG_OP, 'key', k, 'scope', r -> 'scope_id', 'txid', pg_current_xact_id()::xid::text::bigint)::text);
+      IF current_setting(reset_key, true) = 'true' THEN RETURN NULL; END IF;
+      IF TG_OP <> 'TRUNCATE' THEN
+        SELECT count(*) INTO n FROM (SELECT 1 FROM shape_rows LIMIT ${RETAINED} - used + 1) bounded;
+        IF n = 0 THEN RETURN NULL; END IF;
+      END IF;
+      IF TG_OP = 'TRUNCATE' OR used + n > ${RETAINED} THEN
+        PERFORM set_config(reset_key, 'true', true);
+        PERFORM pg_notify('shape', json_build_object('table', TG_TABLE_NAME, 'op', 'RESET')::text);
+        RETURN NULL;
+      END IF;
+      PERFORM set_config('mecha.shape_notifications', (used + n)::text, true);
+      FOR r IN SELECT to_jsonb(t) FROM shape_rows t LOOP
+        IF TG_OP = 'DELETE' THEN
+          SELECT coalesce(jsonb_object_agg(kv.key, kv.value), '{}'::jsonb) INTO k
+            FROM jsonb_each(r) kv
+            WHERE kv.key = ANY(TG_ARGV) OR octet_length(coalesce(kv.value #>> '{}', '')) <= 200;
+        ELSE
+          k := '{}'::jsonb;
+          FOREACH c IN ARRAY TG_ARGV LOOP k := k || jsonb_build_object(c, r -> c); END LOOP;
+        END IF;
+        PERFORM pg_notify('shape', json_build_object('table', TG_TABLE_NAME, 'op', TG_OP, 'key', k, 'scope', r -> 'scope_id', 'txid', pg_current_xact_id()::xid::text::bigint)::text);
+      END LOOP;
       RETURN NULL;
     END $$;`)
+  const installed = await db.query<{ schema: string; table: string; trigger: string }>(`
+    SELECT n.nspname AS schema, c.relname AS table, t.tgname AS trigger
+    FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE t.tgfoid='shape_notify()'::regprocedure AND NOT t.tgisinternal`)
+  for (const row of installed.rows) {
+    await db.exec(`DROP TRIGGER ${ident(row.trigger)} ON ${ident(row.schema)}.${ident(row.table)}`)
+  }
   for (const [table, l] of logs) {
-    await db.exec(`DROP TRIGGER IF EXISTS shape_notify ON ${ident(table)};
-      CREATE TRIGGER shape_notify AFTER INSERT OR UPDATE OR DELETE ON ${ident(table)} FOR EACH ROW EXECUTE FUNCTION shape_notify(${l.pk.map(literal).join(', ')});`)
+    for (const op of ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) {
+      const trigger = ident('shape_notify_' + op.toLowerCase())
+      const transition = op === 'TRUNCATE' ? '' : `REFERENCING ${op === 'DELETE' ? 'OLD' : 'NEW'} TABLE AS shape_rows`
+      await db.exec(`CREATE TRIGGER ${trigger} AFTER ${op} ON ${ident(table)} ${transition}
+        FOR EACH STATEMENT EXECUTE FUNCTION shape_notify(${l.pk.map(literal).join(', ')});`)
+    }
   }
 
   // A row as Electric sends it: each value Postgres's text for it, which the
@@ -183,13 +227,25 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
     const { table, op, key, scope, txid } = JSON.parse(payload) as { table: string; op: string; key: Row; scope: string | null; txid: number }
     const l = logs.get(table)
     if (!l) return
+    if (op === 'RESET') {
+      l.handle = `${table}-${crypto.randomUUID().slice(0, 8)}`
+      l.tail = l.filled = l.trimmed = 0
+      l.entries = []
+      wakeAll(l)
+      l.waiters.clear()
+      l.waitersAll.clear()
+      return
+    }
+    const generation = l.handle
     const entry: Entry = { offset: ++l.tail, message: null, scope }
     l.entries.push(entry)
     serialize(async () => {
+      if (l.handle !== generation) return
       let row: Row = Object.fromEntries(Object.entries(key).map(([c, v]) => [c, v === null ? null : String(v)]))
       if (op !== 'DELETE') {
         const where = l.pk.map((c, i) => `${ident(c)} = $${i + 1}`).join(' AND ')
         const r = await db.query<{ r: Row }>(`SELECT ${asText(table)} AS r FROM ${ident(table)} t WHERE ${where}`, l.pk.map((c) => key[c]))
+        if (l.handle !== generation) return
         if (r.rows.length === 0) {
           l.entries.splice(l.entries.length - (l.tail - l.filled), 1)
           l.filled = entry.offset
@@ -203,9 +259,13 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
       entry.message = { ...base, headers: { ...base.headers, lsn: String(entry.offset), op_position: 0, last: true } }
       l.filled = entry.offset
       const trim = l.entries.length - (l.tail - l.filled) - RETAINED
-      if (trim > 0) l.entries.splice(0, trim)
+      if (trim > 0) {
+        l.trimmed = l.entries[trim - 1].offset
+        l.entries.splice(0, trim)
+      }
       wake(l, entry.scope)
     }).catch((e) => {
+      if (l.handle !== generation) return
       const first = l.broken === undefined
       l.broken ??= e instanceof Error ? e : new Error(String(e))
       wakeAll(l)
@@ -250,7 +310,12 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
     })
   }
 
-  async function serve(req: Request, reachOf: () => Promise<string[]>): Promise<Response> {
+  let cursor = Date.now()
+  const refetch = (l: Log) => new Response(JSON.stringify([{ headers: { control: 'must-refetch' } }]), {
+    status: 409, headers: { 'electric-handle': l.handle, 'cache-control': 'no-store', 'content-type': 'application/json' },
+  })
+
+  async function serve(req: Request, reachOf: () => Promise<string[]>, key?: ShapeKey): Promise<Response> {
     const p = new URL(req.url).searchParams
     const table = p.get('table') ?? ''
     const offset = p.get('offset') ?? '-1'
@@ -259,11 +324,14 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
     const changesOnly = p.get('log') === 'changes_only'
     const l = logs.get(table)
     if (!l) return json(400, { error: `${table} is not a shape table` })
+    if (key !== undefined && !(key.column in l.schema)) return json(400, { error: `${key.column} is not a column of ${table}` })
+    const generation = l.handle
     // A 410, which Electric's client does not retry as it does a 500: its
     // stream stops, and a subset's read fails.
     const lost = () => l.broken && json(410, { error: `${table}'s log lost a change whose row could not be read back: ${l.broken.message}` })
     const gone = lost()
     if (gone) return gone
+    if (handle !== null && handle !== generation) return refetch(l)
     // Every update here carries its whole row, which is what `full` asks for.
     for (const [k, v] of Object.entries(SHAPE_FIXED_PARAMS)) {
       if (p.has(k) && p.get(k) !== v) return json(400, { error: `${k}=${p.get(k)} is not served here` })
@@ -278,34 +346,42 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
     const base: Record<string, string> = { 'electric-handle': l.handle, 'cache-control': 'no-store', 'content-type': 'application/json' }
     const upToDate = () => ({ headers: { control: 'up-to-date', global_last_seen_lsn: String(l.filled) } })
 
-    if (subset.length > 0) return await snapshot(table, l, p, reachOf, base)
+    if (subset.length > 0) return await snapshot(table, l, p, reachOf, key, base)
     // From now, or from the start with no snapshot: no rows, only the position.
     if (offset === 'now' || (offset === '-1' && changesOnly)) {
       return new Response(JSON.stringify([upToDate()]), {
-        headers: { ...base, 'electric-offset': offsetOf(l.filled), 'electric-schema': JSON.stringify(l.schema), 'electric-up-to-date': 'true' },
+        headers: { ...base, 'electric-offset': offsetOf(l.filled), 'electric-cursor': String(++cursor), 'electric-schema': JSON.stringify(l.schema), 'electric-up-to-date': 'true' },
       })
     }
     if (offset === '-1') {
-      const reach = await reachOf()
-      // Each row under the transaction that last wrote it, its xmin, so a write
-      // a page awaits is confirmed by a log read from the start too.
-      const rows = await serializeLow(() => db.query<{ r: Row; x: string }>(`SELECT ${asText(table)} AS r, t.xmin::text AS x FROM ${ident(table)} t WHERE ${shapeWhere(reach)}`))
-      const msgs: unknown[] = rows.rows.map((x) => rowMessage(table, 'insert', x.r, Number(x.x)))
-      msgs.push(upToDate())
+      const whereClause = key ? `${ident(key.column)} = ${literal(key.value)}` : shapeWhere(await reachOf())
+      if (l.handle !== generation) return refetch(l)
+      // Snapshot visibility confirms committed deletes too, when no surviving
+      // row's xmin can acknowledge the transaction after a reset.
+      const { rows, seen } = await serializeLow(async () => ({
+        seen: await visibility(),
+        rows: (await db.query<{ r: Row; x: string }>(`SELECT ${asText(table)} AS r, t.xmin::text AS x FROM ${ident(table)} t WHERE ${whereClause}`)).rows,
+      }))
+      if (l.handle !== generation) return refetch(l)
+      const msgs: unknown[] = rows.map((x) => rowMessage(table, 'insert', x.r, Number(x.x)))
+      msgs.push({ headers: { control: 'snapshot-end', xmin: seen.xmin, xmax: seen.xmax, xip_list: seen.xip } }, upToDate())
       return new Response(JSON.stringify(msgs), {
-        headers: { ...base, 'electric-offset': offsetOf(l.filled), 'electric-schema': JSON.stringify(l.schema), 'electric-up-to-date': 'true' },
+        headers: { ...base, 'electric-offset': offsetOf(l.filled), 'electric-cursor': String(++cursor), 'electric-schema': JSON.stringify(l.schema), 'electric-up-to-date': 'true' },
       })
     }
     const after = parseOffset(offset)
     // A client behind the retained window has missed entries nothing can
     // replay; it starts over from a snapshot.
-    const oldest = l.entries.length ? l.entries[0].offset : l.tail + 1
-    if (handle !== l.handle || after < oldest - 1) {
-      return new Response(JSON.stringify([{ headers: { control: 'must-refetch' } }]), { status: 409, headers: base })
-    }
+    const expired = () => handle !== l.handle || after < l.trimmed
+    if (expired()) return refetch(l)
     let reached: string[] | undefined
-    // The snapshot's predicate names scopes, so a row in none is in no shape.
+    // The snapshot's predicate names scopes, or a keyed column value.
     const pending = async () => {
+      if (key !== undefined) {
+        const upTo = l.filled
+        const entries = l.entries.filter((e) => e.offset > after && e.offset <= upTo && (e.message as { value?: Row } | null)?.value?.[key.column] === key.value)
+        return { entries, upTo }
+      }
       const reach = reached ??= await reachOf()
       const upTo = l.filled
       const candidates = l.entries.filter((e) => e.offset > after && e.offset <= upTo && e.scope !== null)
@@ -313,21 +389,24 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
       return { entries: candidates.filter((e) => reach.includes(e.scope!)), upTo }
     }
     let { entries, upTo } = await pending()
+    if (expired()) return refetch(l)
     if (entries.length === 0 && live) {
-      const reach = reached ??= await reachOf()
+      const reach = key !== undefined ? [] : (reached ??= await reachOf())
       await waitFor(l, reach, 20_000, req.signal)
+      if (expired()) return refetch(l)
       const gone = lost()
       if (gone) return gone
       ;({ entries, upTo } = await pending())
+      if (expired()) return refetch(l)
     }
     const headers: Record<string, string> = {
       ...base,
       'electric-offset': offsetOf(entries.length ? entries[entries.length - 1].offset : upTo),
-      'electric-cursor': String(Date.now()),
+      'electric-cursor': String(++cursor),
       'electric-up-to-date': 'true',
     }
     if (!live) headers['electric-schema'] = JSON.stringify(l.schema)
-    if (entries.length === 0) return new Response(null, { status: 204, headers })
+    if (entries.length === 0 && live) return new Response(null, { status: 204, headers })
     const msgs: unknown[] = entries.map((e) => e.message)
     msgs.push(upToDate())
     return new Response(JSON.stringify(msgs), { headers })
@@ -338,8 +417,11 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
   // whose transactions a change's txid is judged against, and the first log
   // position not in it: the client retires a snapshot when a change at its
   // `database_lsn` arrives, before judging that change against it.
+  const visibility = async () => (await db.query<{ xmin: string; xmax: string; xip: string[] }>(
+    'SELECT pg_snapshot_xmin(s)::xid::text AS xmin, pg_snapshot_xmax(s)::xid::text AS xmax, ARRAY(SELECT pg_snapshot_xip(s)::xid::text) AS xip FROM pg_current_snapshot() s',
+  )).rows[0]
   let marks = 0
-  async function snapshot(table: string, l: Log, p: URLSearchParams, reachOf: () => Promise<string[]>, base: Record<string, string>): Promise<Response> {
+  async function snapshot(table: string, l: Log, p: URLSearchParams, reachOf: () => Promise<string[]>, key: ShapeKey | undefined, base: Record<string, string>): Promise<Response> {
     const bound = subsetParams(p.get('subset__params'))
     if (bound === undefined) return refuse('params', `subset__params=${p.get('subset__params')} is not an object of positions to strings`)
     const where = p.get('subset__where')
@@ -361,13 +443,13 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
     const from = p.get('offset')
     const own = from === null || from === 'now' || from === '-1' ? null : from
     if (own !== null && !/^[0-9]+_0$/.test(own)) return refuse('offset', `offset=${own} is not a position`)
-    const reach = await reachOf()
-    const sql = `SELECT ${asText(table)} AS r FROM ${ident(table)} t WHERE (${shapeWhere(reach)})` +
+    const generation = l.handle
+    const whereClause = key ? `${ident(key.column)} = ${literal(key.value)}` : shapeWhere(await reachOf())
+    if (l.handle !== generation) return refetch(l)
+    const sql = `SELECT ${asText(table)} AS r FROM ${ident(table)} t WHERE (${whereClause})` +
       (where === null ? '' : ` AND (${where})`) + (order === null ? '' : ` ORDER BY ${order}`) + (limit === null ? '' : ` LIMIT ${limit}`)
     const read = await serializeLow(async () => {
-      const seen = (await db.query<{ xmin: string; xmax: string; xip: string[] }>(
-        'SELECT pg_snapshot_xmin(s)::xid::text AS xmin, pg_snapshot_xmax(s)::xid::text AS xmax, ARRAY(SELECT pg_snapshot_xip(s)::xid::text) AS xip FROM pg_current_snapshot() s',
-      )).rows[0]
+      const seen = await visibility()
       // A predicate Postgres refuses (a column it lacks, a literal its column
       // cannot hold) is the client's error; a 500 would be retried as the
       // server's. Any other failure is the server's.
@@ -379,6 +461,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
         throw e
       }
     })
+    if (l.handle !== generation) return refetch(l)
     if (read.refused !== undefined) return refuse('where', read.refused)
     const { rows, seen } = read
     const mark = ++marks
@@ -389,7 +472,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
       return m
     })
     return new Response(JSON.stringify({ metadata, data }), {
-      headers: { ...base, 'electric-offset': own ?? offsetOf(l.filled), 'electric-schema': JSON.stringify(l.schema) },
+      headers: { ...base, 'electric-offset': own ?? offsetOf(l.filled), 'electric-schema': JSON.stringify(l.schema), 'electric-up-to-date': 'true' },
     })
   }
 

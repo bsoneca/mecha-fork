@@ -37,11 +37,14 @@ passkey (the relying party is the Worker's door), or through a provider the
 Worker's environment names as the auth service's does (`OIDC_PROVIDERS` and
 each one's `OIDC_<NAME>_*`, a client secret as a Worker secret): the object
 runs the auth service's `oidc.ts`, links the provider's subject, under its
-issuer, to its own `app_user` in `identity_link`, which it creates on the
+issuer, to its own `app_user` in `identity_link` (in `mecha_auth`, beside the passkeys' table), which it creates on the
 first sign-in as the auth service does, and gives the handle the auth service
 would. A provider that cannot be signed in through refuses the object's boot.
 Links an earlier edge kept without their issuer refuse provider sign-in, as
 they refuse the auth service's start, until their owner adds it.
+Passkeys sign in through the same ceremonies (`/auth/register/*`, `/auth/login/*`); both tables live in
+`mecha_auth`, out of the REST handler's `public`, as the auth service keeps them
+([schema.ts](../../services/auth/schema.ts)), sealed when the cluster starts.
 
 Read metadata includes the shell schema's field references. PostgreSQL views
 carry no foreign-key constraints, so their declared `ref` fields supply the
@@ -82,7 +85,7 @@ renderer and experiments are described in [[../../../../plugins/omnishell/docs/n
 
 ## Machines
 
-An app's machines (pronto's hybrid machines,
+An app's machines (pronto's mecha machines,
 emitted by pronto's `mecha-reducer.ts`) step in the object. Their migration
 declares each `hybrid_<name>.step` over a `hybrid_<name>.engine` it leaves to
 the tier: PostgreSQL's is plv8, inside the migration's `-- tier: container`
@@ -109,6 +112,79 @@ none, since the release's drains may name a table its migration creates. A
 failed call's retry stands at the alarm, which calls it within the alarm, so
 an eviction does not lose it.
 
+## Effects
+
+An app's effects run in two Workers. The object claims each due run through
+Graphile, settles in place what needs no call — an outcome already recorded, a
+bridge not deployed on `cloudflare`, a run the reentry policy settles `unknown`
+— and leases the rest with a Graphile job keyed by the ledger key, then, after
+that commit and outside any transaction, enqueues it on `AIRLOCK_QUEUE` as
+`{key, token}`. The token is the lease job's id and revision, which Graphile
+bumps each time the key is scheduled again, so a later lease, renewal or
+backoff makes it stale ([`airlock.ts`](src/airlock.ts)). An object whose
+program declares effects and has no `AIRLOCK_QUEUE` refuses to boot.
+
+A sent run waits one lease to be claimed, the handler's bound and a minute;
+each resend of a run still unclaimed waits twice the last, up to an hour, so a
+queue backlog is waited out rather than fed. A send that fails, or never
+happens because the object was evicted after the commit, spends no run: the
+lease sends it again under a new token, and the job that tried ends there.
+
+The dispatcher Worker, the queue's consumer, calls the object's
+`effectClaim(key, token, claimant)`, the claimant naming that delivery: while
+the token is the key's current dispatch and the key unsettled, the claim counts
+the run in `entered`, decides it against the reentry policy as the container
+does when a run begins, and renews its lease for as long as the run can still
+call its sink (reconcile where asked, issue, and storing its bytes, each
+bounded by the handler's bound), returning the instant that lease ends. The
+same claimant asking again for the same dispatch, as after a lost reply, gets
+the run it counted; any other claimant, as a second delivery of the message,
+gets null and counts nothing.
+
+The dispatcher runs the handler with the container's sink and cage, stows
+answered bytes in `BLOB_OBJECTS`, and calls `effectAnswer` with the outcome or
+the error, fenced by the run's number ([`dispatch.ts`](src/dispatch.ts)). A
+sink is tsbifrost, a declared origin, or a bridge deployed on `cloudflare`: a
+Cloudflare Container the dispatcher owns as a Durable Object class, `Bridge<Name>`
+bound as `BRIDGE_<NAME>` ([`bridge.ts`](src/bridge.ts)), whose stub the sink's
+call goes to under the bridge's name, on the port the class holds. The
+container's answer is the sink's; what the infrastructure fails at, as no
+instance while a first deploy provisions it, the stub throws, and the run errs
+as on an origin's transport
+([container bridges](../../../../plugins/pronto/docs/container-bridges.md#cloudflare)).
+Both
+calls are tried again briefly on what Cloudflare marks retryable, never on a
+refusal, and an effect the dispatcher does not know is the run's error. While
+a directory loads a claim is no run's, and an answer is refused: the
+dispatcher holds it until the run's lease would end, then fails loudly. Both
+calls reach the object with its drains and computations installed, since a
+claim or an answer settles rows, as on every path that writes, and the object
+stays until the drains have settled. An outcome is recorded once and moves only
+the invocation its ledger key names (Airlock's
+[move rule](../../services/airlock/README.md#in-a-cluster)); an error of the
+current run schedules the next after Graphile's backoff, or settles `unknown`
+on the last attempt. The queue never redelivers: a run whose answer never comes
+is sent again when its lease runs out, and counted when that run is claimed
+([the record](../../docs/archive/2026-11-06-edge-airlock-dispatcher.md)).
+
+## Computation
+
+A release with computations binds private Query and Compute Workers, each with
+its own Durable Object. Query execution uses the statically packaged DuckDB
+runtime; pure JavaScript and WASM run in the separate SES execution realm.
+No compute Container is required. The release packager emits and the publisher
+deploys both companions before updating the database binding.
+
+The object owns the [[../compute-snapshot/docs/index|durable snapshot coordinator]]:
+source transactions record changes, and the alarm captures consistent source
+rows, executes outside the database queue, then publishes typed sinks and the
+completion receipt atomically. A pending alarm survives eviction; failed runs
+retain their captured input and retry. Filter-table edits use the same path.
+
+Companions have neither database credentials nor public execution routes. They
+accept packaged computation names and versions and return the exact capture
+identity. See [[../../docs/compute#cloudflare-snapshot-execution|the computation contract]] for isolation, deployment ordering and per-isolate capacity limits.
+
 ## The clock
 
 The object runs [the ticker's](../../services/ticker/README.md) sweep
@@ -121,8 +197,8 @@ past the row: there is no change-capture unit here, the row is in the
 database the sweep wrote it to, where a drain naming its table is owed and a
 machine's `fire` trigger takes the schedule and wakes the instance in that
 same transaction. Every request's
-transaction runs serializable, the level a machine's `serial()` demands: one
-connection, so the level costs no conflict.
+transaction runs read committed, the level a machine's `serial()` demands;
+machine steps hold their players' transaction advisory locks.
 
 Two clocks, as the ticker asks of every tier, and each tick's `caller` says
 which minted it:
@@ -168,7 +244,7 @@ reruns to it.
 
 For a frozen archive, `edgeObject({ clock: 'disabled', ... })` runs no
 clock: boot and alarm delivery clear any standing alarm but a failed drain's
-retry, a poke is refused (409), and the schedule rows are kept as they were. The default is
+retry or pending computation, a poke is refused (409), and the schedule rows are kept as they were. The default is
 `clock: 'ticker'`. Alarms do not boot an incomplete data directory. Reset
 deletes the alarm before replacing the directory.
 

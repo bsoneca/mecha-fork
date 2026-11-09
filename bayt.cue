@@ -25,19 +25,23 @@ import (
 
 	bayt "github.com/bonisoft3/bayt/core:bayt"
 	apt "github.com/bonisoft3/bayt/distros/apt"
+	zypper "github.com/bonisoft3/bayt/distros/zypper"
+	deno "github.com/bonisoft3/bayt/stacks/deno"
 	mise "github.com/bonisoft3/bayt/stacks/mise"
 	sayt "github.com/bonisoft3/bayt/stacks/sayt"
 	cluster "github.com/bonisoft3/mecha:cluster"
+	activepieces "github.com/bonisoft3/mecha/services/activepieces:activepieces"
+	pljs "github.com/bonisoft3/mecha/services/database/pljs"
 )
 
 _postgres: "postgres:18-trixie@sha256:073e7c8b84e2197f94c8083634640ab37105effe1bc853ca4d5fbece3219b0e8"
 // The one pgroll in the repository: every migration a cluster is given runs
 // through it, and pgroll/pgroll_test.ts holds the grammar to its tag.
-_pgroll: "ghcr.io/xataio/pgroll:v0.16.3@sha256:aca5425285691ed78079196c1629de039e7d7b795773b1ff63e1419d79dbd830"
+_pgroll:  "ghcr.io/xataio/pgroll:v0.16.3@sha256:aca5425285691ed78079196c1629de039e7d7b795773b1ff63e1419d79dbd830"
 _connect: "redpandadata/connect:4.114.0@sha256:481e8df48ed733f080623ae67f0dccc82d29ae509dfb3f957347a9e900e74910"
 // The services' Deno is the repository's (mise.toml), on glibc, which the
 // compute service's DuckDB binding needs; one base for all three.
-_deno: "denoland/deno:debian-2.9.7@sha256:fa335acdf6b72106eda2cb6a8cb5f4187e7630e357467489db4b2e7352d5e432"
+_deno:    "denoland/deno:debian-2.9.7@sha256:fa335acdf6b72106eda2cb6a8cb5f4187e7630e357467489db4b2e7352d5e432"
 _busybox: "busybox:1.36.1-musl@sha256:2f9af5cf39068ec3a9e124feceaa11910c511e23a1670dcfdff0bc16793545fb"
 _curl:    "tarampampam/curl@sha256:617b3306349beaacb7ad82bddda8d6876a40c3bad06d7a28981504d230802d7e"
 
@@ -59,18 +63,19 @@ _stack: cluster.#Cluster & {
 	meta: {
 		app: "mecha"
 		images: {
-			database:   {ref: ":database-image"}
-			mesh:       {ref: ":mesh-image"}
-			conduit:    {ref: ":conduit-image"}
-			auth:       {ref: ":auth-image"}
-			ticker:     {ref: ":ticker-image"}
-			clock:      {ref: ":clock-image"}
-			compute:    {ref: ":compute-image"}
-			airlock:    {ref: ":airlock-image"}
+			database: {ref: ":database-image"}
+			extensions: {ref: ":extensions-image"}
+			mesh: {ref: ":mesh-image"}
+			conduit: {ref: ":conduit-image"}
+			auth: {ref: ":auth-image"}
+			ticker: {ref: ":ticker-image"}
+			clock: {ref: ":clock-image"}
+			compute: {ref: ":compute-image"}
+			airlock: {ref: ":airlock-image"}
 		}
 		// A plain-HTTP door: mecha's proxy config serves no TLS, and the
 		// smoke suites and the benchmark address localhost:8080.
-		caddyfile:       "services/proxy/Caddyfile"
+		caddyfile: "services/proxy/Caddyfile"
 		door: {port: 8080, scheme: "http", env: "MECHA_DOOR_HOST_PORT", host: 8080}
 		conduitTemplate: "services/cdc/pipelines/cdc-to-dapr.yaml"
 		statics: []
@@ -80,7 +85,7 @@ _stack: cluster.#Cluster & {
 	}
 	state: {
 		// mecha's own schema, the identity table its auth plane keeps, then the
-		// validation-seat fixtures the crud smoke asserts against.
+		// validation-seat fixtures the crud smoke asserts against and pljs's unicode.
 		migrations: [
 			"services/database/migrations/000_extensions.sql",
 			"services/database/migrations/001_roles.sql",
@@ -90,6 +95,7 @@ _stack: cluster.#Cluster & {
 			"services/database/migrations/006_conduit_publication.sql",
 			"services/database/007_identity.sql",
 			"tests/008_validation_smoke.sql",
+			"tests/009_pljs_unicode.sql",
 		]
 		// A change to a table the migrations above built, so every boot of the
 		// stack runs the migrate target; services/migrate/migrate_test.ts
@@ -132,32 +138,64 @@ _mecha: bayt.#project & _where & {
 		// that the tmpl embeds need.
 		"build": sayt.build & mise.exec & {
 			srcs: globs: ["proto/**"]
-			cmd: "builtin": do: "buf lint proto"
+			cmd: "builtin": do:    "buf lint proto"
 			dockerfile: from: ref: ":setup"
 		}
 
 		// ---- The images -------------------------------------------------
 
+		// pljs as `plv8` and pg_ivm for the docker appliance's PostgreSQL, which
+		// Leap ships without either, from the recipe the database image runs,
+		// against that server's own headers (cluster.#AppliancePostgres), built
+		// once for every app's appliance.
+		"extensions-build": {
+			// Public, as the image it builds for: a consumer's compose resolves it.
+			visibility: "public"
+			cmd: "builtin": null
+			activate: ""
+			srcs: globs: ["services/database/pljs/pins.cue"]
+			dockerfile: bayt.nubox & {
+				defaultPreamble: "zypper-pg-extensions": (zypper.#install & {
+					pkgs: [
+						"postgresql18-server-devel=\(cluster.#AppliancePostgres)",
+						"gcc=15-160000.2.2",
+						"make=4.4.1-160000.3.2",
+						"git=2.51.0-160000.1.2",
+						"patch=2.7.6-160000.4.1",
+						"perl=5.42.0-160000.3.1",
+					]
+					then: list.Concat([
+						(pljs.#Build & {pgConfig: "/usr/lib/postgresql18/bin/pg_config", fetch: "curl -fsSL -o"}).steps,
+						[
+							"mkdir -p /pg-extensions/lib /pg-extensions/extension",
+							#"cp "$(/usr/lib/postgresql18/bin/pg_config --pkglibdir)/pljs.so" "$(/usr/lib/postgresql18/bin/pg_config --pkglibdir)/pg_ivm.so" /pg-extensions/lib/"#,
+							#"cp "$(/usr/lib/postgresql18/bin/pg_config --sharedir)"/extension/pljs* "$(/usr/lib/postgresql18/bin/pg_config --sharedir)"/extension/plv8* "$(/usr/lib/postgresql18/bin/pg_config --sharedir)"/extension/pg_ivm* /pg-extensions/extension/"#,
+						],
+					])
+				}).out
+			}
+		}
+		// What an appliance copies, its libraries and extension files
+		// (/pg-extensions), without the toolchain that built them.
+		"extensions-image": _image & {
+			srcs: globs: ["services/database/pljs/pins.cue"]
+			deps: [":extensions-build"]
+			dockerfile: {
+				from: null
+				copy: [{from: ref: ":extensions-build", srcs: ["/pg-extensions"], dst: "/pg-extensions"}]
+			}
+		}
 		"database-image": _image & {
-			srcs: globs: ["services/database/rls/rls.sql", "services/database/role_passwords.sh", "services/ticker/schedule.sql", "services/airlock/graphile.sql", "services/airlock/airlock.sql", "services/migrate/migrate.sh"]
+			srcs: globs: ["services/database/rls/rls.sql", "services/database/role_passwords.sh", "services/ticker/schedule.sql", "services/durex/graphile.sql", "services/airlock/airlock.sql", "services/migrate/migrate.sh"]
 			dockerfile: {
 				from: name: _postgres
-				// plv8 hosts a Jessie validation inside the write's transaction.
-				// PGDG apt carries no plv8: the artifact is Pigsty's, fetched by
-				// exact name and checked against its published sha256 per
-				// architecture, inside the same RUN so the .deb and the fetch
-				// tooling leave no layer behind.
+				// QuickJS's pljs hosts the database's Jessie as the `plv8` language
+				// (services/database/pljs), built from the pinned tag inside the
+				// same RUN as pg_ivm so its sources and toolchain leave no layer.
 				defaultPreamble: extensions: (apt.#install & {
-					pkgs: ["ca-certificates", "wget"]
-					then: [
-						"arch=$(dpkg --print-architecture)",
-						"case \"$arch\" in amd64) sum=969ca7bbf2341ea747f8ffa99226f0ae7ce2cd74353d12e9d13b09cc2362c47f;; arm64) sum=52bb956d95a3e51262250316cb3124e5cfd38aaeef60379cba615b0c5aedd05a;; *) echo \"no plv8 artifact for $arch\" >&2; exit 1;; esac",
-						"wget -qO /tmp/plv8.deb \"https://repo.pigsty.io/apt/pgsql/trixie/pool/main/p/plv8/postgresql-18-plv8_3.2.5-1PGSTY~trixie_$arch.deb\"",
-						"echo \"$sum  /tmp/plv8.deb\" | sha256sum -c -",
-						"dpkg -i /tmp/plv8.deb",
-						"rm /tmp/plv8.deb",
-					]
-					purge: ["wget", "ca-certificates"]
+					pkgs: ["ca-certificates", "wget", "git", "build-essential", "postgresql-server-dev-18"]
+					then: (pljs.#Build & {pgConfig: "/usr/lib/postgresql/18/bin/pg_config"}).steps
+					purge: ["wget", "git", "ca-certificates", "build-essential", "postgresql-server-dev-18"]
 				}).out
 				// The data directory lives on the container's writable layer.
 				preamble: ["ENV PGDATA=/postgresql-data"]
@@ -172,7 +210,7 @@ _mecha: bayt.#project & _where & {
 					{srcs: ["services/database/rls/rls.sql"], dst: "\(cluster.#InitdbDir)/\(cluster.#TenancyMigration)"},
 					{srcs: ["services/ticker/schedule.sql"], dst: "\(cluster.#StagedDir)/\(cluster.#ScheduleStaged)"},
 					{srcs: ["services/ticker/schedule.sql"], dst: "\(cluster.#StagedDir)/\(cluster.#ScheduleMigration)"},
-					{srcs: ["services/airlock/graphile.sql"], dst: "\(cluster.#StagedDir)/\(cluster.#GraphileMigration)"},
+					{srcs: ["services/durex/graphile.sql"], dst: "\(cluster.#StagedDir)/\(cluster.#GraphileMigration)"},
 					{srcs: ["services/airlock/airlock.sql"], dst: "\(cluster.#StagedDir)/\(cluster.#AirlockMigration)"},
 					{srcs: ["services/database/role_passwords.sh"], dst: "\(cluster.#StagedDir)/\(cluster.#RolePasswordsStep)"},
 					{from: {name: _pgroll}, srcs: ["/usr/bin/pgroll"], dst: "/usr/local/bin/pgroll"},
@@ -220,54 +258,60 @@ _mecha: bayt.#project & _where & {
 				]
 			}
 		}
-		"auth-image": _image & {
-			srcs: globs: ["services/auth/deno.json", "services/auth/deno.lock", "services/auth/jwt.ts", "services/auth/main.ts", "services/auth/oidc.ts", "services/auth/origins.ts"]
+		"auth-image": _image & (deno.#cache & {entrypoints: "main.ts", frozen: false}).out & {
+			srcs: globs: ["services/auth/deno.json", "services/auth/deno.lock", "services/auth/jwt.ts", "services/auth/main.ts", "services/auth/oidc.ts", "services/auth/origins.ts", "services/auth/schema.ts"]
 			dockerfile: {
 				from: name: _deno
 				// deno runs `main.ts` from the working directory.
 				workdir: "/app"
-				copy: [{srcs: ["services/auth/deno.json", "services/auth/deno.lock", "services/auth/jwt.ts", "services/auth/main.ts", "services/auth/oidc.ts", "services/auth/origins.ts"], dst: "/app/"}]
-				epilogue: ["RUN deno cache main.ts"]
+				copy: [{srcs: ["services/auth/deno.json", "services/auth/deno.lock", "services/auth/jwt.ts", "services/auth/main.ts", "services/auth/oidc.ts", "services/auth/origins.ts", "services/auth/schema.ts"], dst: "/app/"}]
 				expose: [9999]
 				cmd: ["run", "--allow-net", "--allow-env", "main.ts"]
 			}
 		}
-		"ticker-image": _image & {
+		"ticker-image": _image & (deno.#cache & {entrypoints: "main.ts", frozen: false}).out & {
 			srcs: globs: ["services/ticker/deno.json", "services/ticker/deno.lock", "services/ticker/due.ts", "services/ticker/sweep.ts", "services/ticker/main.ts", "services/ticker/tick-id.ts", "services/ticker/crud.ts"]
 			dockerfile: {
 				from: name: _deno
 				workdir: "/app"
 				copy: [{srcs: ["services/ticker/deno.json", "services/ticker/deno.lock", "services/ticker/due.ts", "services/ticker/sweep.ts", "services/ticker/main.ts", "services/ticker/tick-id.ts", "services/ticker/crud.ts"], dst: "/app/"}]
-				epilogue: ["RUN deno cache main.ts"]
 				cmd: ["run", "--allow-net", "--allow-env", "main.ts"]
 			}
 		}
 		// The extensions a computation's lake needs are installed at build: a
 		// running service reaches no extension host. Workers take no
 		// permissions of their own, an option Deno still calls unstable.
-		"compute-image": _image & {
-			let _files = ["deno.json", "deno.lock", "main.ts", "workers.ts", "cage.ts", "compartment.ts", "realm.ts", "crypto.ts", "endowments.ts", "language.ts", "job.ts", "wasi.ts", "install.ts"]
-			srcs: globs: [for f in _files {"services/compute/\(f)"}]
+		"compute-image": _image & (deno.#cache & {entrypoints: "main.ts cage.ts job.ts", frozen: false}).out & {
+			let _files = ["deno.json", "deno.lock", "main.ts", "feldera.ts", "portable.ts", "portable-contract.ts", "batches.ts", "batches.sql", "batch-machine.sql", "migrate-durex.ts", "publication.ts", "native-runtime.ts", "native-feldera.ts", "native-cleanup.ts", "native-sources.ts", "deltas.ts", "workers.ts", "query-stages.ts", "cage.ts", "compartment.ts", "realm.ts", "crypto.ts", "cheerio.ts", "endowments.ts", "language.ts", "job.ts", "job-cache.ts", "job-cache.sql", "wasi.ts", "install.ts", "events.yaml"]
+			// endowments.ts imports the Pdf endowment from its sibling, the airlock.
+			srcs: globs: list.Concat([[for f in _files {"services/compute/\(f)"}], ["services/airlock/pdf.ts", "services/durex/work.ts", "services/durex/work.sql", "services/durex/migrate.ts", "packages/client/src/types.ts", "packages/lake/src/lake-types.ts", "packages/compute-snapshot/src/sink-writes.ts"]])
+			cmd: "duckdb": (deno.#duckdbContainerCmd & {
+				do: "deno run --allow-ffi --allow-read --allow-write --allow-net --allow-env --allow-sys=homedir install.ts"
+			}).out
 			dockerfile: {
 				from: name: _deno
 				workdir: "/app"
-				copy: [{srcs: [for f in _files {"services/compute/\(f)"}], dst: "/app/"}]
-				epilogue: [
-					"RUN deno cache main.ts cage.ts job.ts",
-					"RUN deno run --allow-ffi --allow-read --allow-write --allow-net --allow-env install.ts",
+				copy: [
+					{srcs: [for f in _files {"services/compute/\(f)"}], dst: "/app/"},
+					{srcs: ["services/airlock/pdf.ts"], dst: "/airlock/"},
+					{srcs: ["services/durex/work.ts", "services/durex/work.sql", "services/durex/migrate.ts"], dst: "/durex/"},
+					{srcs: ["packages/client/src/types.ts"], dst: "/packages/client/src/"},
+					{srcs: ["packages/lake/src/lake-types.ts"], dst: "/packages/lake/src/"},
+					{srcs: ["packages/compute-snapshot/src/sink-writes.ts"], dst: "/packages/compute-snapshot/src/"},
 				]
-				cmd: ["run", "--unstable-worker-options", "--allow-ffi", "--allow-read", "--allow-write", "--allow-net", "--allow-env", "/app/main.ts"]
+				cmd: ["run", "--unstable-worker-options", "--allow-ffi", "--allow-read", "--allow-write", "--allow-net", "--allow-env", "--allow-sys", "/app/main.ts"]
 			}
 		}
-		// The airlock and the mail bridge: one image, two commands, each scoped
-		// by the cluster target that runs it, and the bindings-only
-		// configuration the airlock's daprd copies from it (dapr.yaml).
-		// The handler's cage is compute's realm, so the compute files it
-		// imports sit at ../compute beside it, where the source names them.
-		"airlock-image": _image & {
-			let _airlock = ["deno.json", "deno.lock", "main.ts", "airlock.ts", "handler.ts", "cage.ts", "reentry.ts", "inward.ts", "mail.ts", "dapr.yaml"]
-			let _compute = ["compartment.ts", "realm.ts", "crypto.ts", "endowments.ts", "language.ts", "workers.ts"]
+		"activepieces-image": (activepieces.#Target & {source: "services/activepieces"}).target
+		// The handler cage imports compute's realm through its sibling directory.
+		"airlock-image": _image & (deno.#cache & {entrypoints: "main.ts cage.ts tsbifrost.ts"}).out & {
+			let _airlock = ["deno.json", "deno.lock", "main.ts", "airlock.ts", "handler.ts", "cage.ts", "reentry.ts", "blobs.ts", "pdf.ts", "tsbifrost.ts", "ai-models.ts", "white-background.ts", "package.json", "dapr.yaml"]
+			let _compute = ["compartment.ts", "realm.ts", "crypto.ts", "cheerio.ts", "endowments.ts", "language.ts", "workers.ts", "query-stages.ts"]
 			srcs: globs: list.Concat([[for f in _airlock {"services/airlock/\(f)"}], [for f in _compute {"services/compute/\(f)"}]])
+			cmd: "deno-install": (deno.#containerCmd & {
+				priority: -2
+				do:       "deno install --frozen"
+			}).out
 			dockerfile: {
 				from: name: _deno
 				workdir: "/app/airlock"
@@ -275,7 +319,6 @@ _mecha: bayt.#project & _where & {
 					{srcs: [for f in _airlock {"services/airlock/\(f)"}], dst: "/app/airlock/"},
 					{srcs: [for f in _compute {"services/compute/\(f)"}], dst: "/app/compute/"},
 				]
-				epilogue: ["RUN deno cache --frozen main.ts cage.ts mail.ts"]
 			}
 		}
 		"clock-image": _image & {
@@ -319,7 +362,7 @@ _mecha: bayt.#project & _where & {
 			}
 			compose: {
 				depends_on: {
-					"\(_mecha.name)-redis":    {condition: "service_healthy"}
+					"\(_mecha.name)-redis": {condition: "service_healthy"}
 					"\(_mecha.name)-redpanda": {condition: "service_healthy"}
 				}
 				restart: "on-failure"
@@ -346,7 +389,7 @@ _mecha: bayt.#project & _where & {
 				depends_on: {
 					"\(_mecha.name)-redpanda": {condition: "service_healthy"}
 					"\(_mecha.name)-database": {condition: "service_started"}
-					"\(_mecha.name)-redis":    {condition: "service_started"}
+					"\(_mecha.name)-redis": {condition: "service_started"}
 				}
 				ports: ["5115"]
 				networks: default: aliases: ["arroyo"]
@@ -354,9 +397,10 @@ _mecha: bayt.#project & _where & {
 				develop: watch: [{action: "sync+restart", path: "../services/arroyo/queries/", target: "/queries/"}]
 			}
 		}
-		// The AI gateway's seat (github.com/maximhq/bifrost), a placeholder
-		// that holds the port.
-		"bifrost": _run & {
+		// The seat of the AI gateway, a placeholder that holds its port: the
+		// cluster runs tsbifrost (services/airlock/tsbifrost.ts) for an app that
+		// uses AI.
+		"tsbifrost": _run & {
 			dockerfile: {
 				from: name: bayt.lock.images.busybox
 				cmd: ["sleep", "infinity"]
@@ -400,9 +444,9 @@ _mecha: bayt.#project & _where & {
 			compose: {
 				manual: true
 				depends_on: {
-					"\(_mecha.name)-crud":     {condition: "service_healthy"}
-					"\(_mecha.name)-caddy":    {condition: "service_healthy"}
-					"\(_mecha.name)-auth":     {condition: "service_started"}
+					"\(_mecha.name)-crud": {condition: "service_healthy"}
+					"\(_mecha.name)-caddy": {condition: "service_healthy"}
+					"\(_mecha.name)-auth": {condition: "service_started"}
 					"\(_mecha.name)-electric": {condition: "service_healthy"}
 				}
 			}
@@ -414,8 +458,8 @@ _mecha: bayt.#project & _where & {
 			compose: {
 				manual: true
 				depends_on: {
-					"\(_mecha.name)-conduit":   {condition: "service_healthy"}
-					"\(_mecha.name)-redis":     {condition: "service_healthy"}
+					"\(_mecha.name)-conduit": {condition: "service_healthy"}
+					"\(_mecha.name)-redis": {condition: "service_healthy"}
 					"\(_mecha.name)-transform": {condition: "service_started"}
 				}
 				environment: CRUD_URL: "http://crud:3000"
@@ -443,10 +487,10 @@ _mecha: bayt.#project & _where & {
 			compose: {
 				manual: true
 				depends_on: {
-					"\(_mecha.name)-arroyo":       {condition: "service_healthy"}
+					"\(_mecha.name)-arroyo": {condition: "service_healthy"}
 					"\(_mecha.name)-kafka-fanout": {condition: "service_started"}
-					"\(_mecha.name)-conduit":      {condition: "service_healthy"}
-					"\(_mecha.name)-transform":    {condition: "service_started"}
+					"\(_mecha.name)-conduit": {condition: "service_healthy"}
+					"\(_mecha.name)-transform": {condition: "service_started"}
 				}
 			}
 		}
@@ -470,7 +514,7 @@ _mecha: bayt.#project & _where & {
 				manual: true
 				depends_on: {
 					"\(_mecha.name)-rclone-s3": {condition: "service_healthy"}
-					"\(_mecha.name)-imgproxy":  {condition: "service_healthy"}
+					"\(_mecha.name)-imgproxy": {condition: "service_healthy"}
 				}
 			}
 		}

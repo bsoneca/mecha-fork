@@ -33,13 +33,16 @@ put both in one order. These steps are mecha's own, and their digits are taken:
   ledger**, where the cluster declares an effect
   ([the airlock](../services/airlock/README.md#in-a-cluster)). The image
   stages them outside the initdb directory and the `database` target places
-  them there, on the first digits after the steps a caller opens with
-  (pronto's 000-010, the machines last). An interpreter resolves
+  them there, by default on the first digits after the steps a caller opens
+  with (pronto's 000-010, the machines last). A caller whose own steps hold
+  those digits names others in `state.steps`, the queue's before the ledger's;
+  the names keep their suffixes, and a page or edge release places them where
+  `.pronto/cluster.json` says. An interpreter resolves
   `graphile_worker.add_job` and the ledger only when it runs, and every
-  caller step that can write a row is numbered above them, so a row written
-  into an invoking state, held seed included, finds both. A caller step on
-  011 or 012 is refused where an effect is declared, as two steps sharing
-  digits always are. The ledger lives in the `airlock` schema, which only its
+  caller step that can write a row into an invoking state is numbered above
+  them, so such a row, held seed included, finds both. A caller step on their
+  digits is refused where an effect is declared, as two steps sharing digits
+  always are. The ledger lives in the `airlock` schema, which only its
   owner may use: a grant over `public`, the form a caller's grants take,
   reaches nothing there whichever side of these steps it runs on, and the
   revoke in `012_airlock.sql` removes what default privileges gave the schema
@@ -72,10 +75,19 @@ recreates the container empty, and every service waiting on the database's
 health restarts with it.
 
 `surface.schema` publishes `{target: "database", initdb:
-"/docker-entrypoint-initdb.d"}`, and for a cluster given pgroll migrations
+"/docker-entrypoint-initdb.d"}`, and for a cluster given pgroll migrations or
+SQL reconciliation
 `pgroll: {target: "migrate", dir: "/pgroll", baseline: "00_initdb"}`, so
 anything that applies, inspects or reproduces the schema reads those services
 and directories instead of copying the layout.
+
+`state.reconcile` holds named idempotent SQL for release-time rules such as
+public write permissions. It enables the same `migrate` target as `state.pgroll`;
+readers wait for that target to succeed. The image puts these statements in
+`/pgroll/<name>.sql`, beside the ledger's JSON migrations. The runner applies
+pending JSON migrations first, then each SQL file in a transaction on every
+release, retaining the same pgroll baseline and history across restatements. This is native release
+reconciliation, not an exception to the edge tier's immutable script ledger.
 
 ## mecha's own tables, from protobuf
 
@@ -139,17 +151,22 @@ so a migration that fails stops them all rather than leaving them to serve the
 schema it did not reach. A cluster given none has no `migrate` target, and one
 without a database refuses them.
 
-Clusters with external effects also run `airlock-upgrade` after pgroll and before
+Clusters with external effects also run `airlock-upgrade` before pgroll,
 schema readers or the worker start. It renames a retained ledger's `request`
 column to `input` and refreshes `state.effectInterpreters` in one transaction, retaining
-pending claims and outcomes. Pronto supplies the current invoking machines' SQL;
+pending claims and outcomes. Trigger refresh runs only when the legacy column
+exists, so restarts preserve subsequent app migrations. Pronto supplies the current invoking machines' SQL;
 a native cluster supplies its current claim triggers. The upgrade is repeatable,
 and a failure rolls back both the column change and trigger refresh. Stop the
 previous application and worker before upgrading a retained volume; old worker
 binaries must not run against the new ledger contract.
 
-Each migration is written into the migrate image from the value, as a heredoc
-in its Dockerfile, so the image holds exactly what `cue vet` accepted. The
+Pronto emits each vetted migration as JSON under `services/database/pgroll`.
+It sets the cluster's `state.pgrollDir` to that directory, and the migrate
+image copies the named files. Keeping the payload in files prevents large
+engine migrations from exceeding BuildKit's request limit. A cluster supplied
+only `state.pgroll` embeds its values in Dockerfile heredocs; when `pgrollDir`
+is supplied, its `<name>.json` files must contain those same vetted values. The
 runner, [`services/migrate/migrate.sh`](../services/migrate/migrate.sh), runs
 `pgroll init`, records the schema initdb built as the baseline `00_initdb` once,
 whether the volume is fresh or predates the runner, then runs

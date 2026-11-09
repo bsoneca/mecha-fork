@@ -4,6 +4,10 @@ include:
   required: false
 - path: ./compose.build.yaml
   required: false
+- path: ./compose.extensions-build.yaml
+  required: false
+- path: ./compose.extensions-image.yaml
+  required: false
 - path: ./compose.database-image.yaml
   required: false
 - path: ./compose.mesh-image.yaml
@@ -16,6 +20,8 @@ include:
   required: false
 - path: ./compose.compute-image.yaml
   required: false
+- path: ./compose.activepieces-image.yaml
+  required: false
 - path: ./compose.airlock-image.yaml
   required: false
 - path: ./compose.clock-image.yaml
@@ -26,7 +32,7 @@ include:
   required: false
 - path: ./compose.arroyo.yaml
   required: false
-- path: ./compose.bifrost.yaml
+- path: ./compose.tsbifrost.yaml
   required: false
 - path: ./compose.nubox.yaml
   required: false

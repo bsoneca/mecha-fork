@@ -5,7 +5,7 @@
 // WebAuthn challenge travels in a short-lived HS256 `state` JWT instead of
 // server-side sessions. app_user is a program entity created by the database
 // migrations; this service only self-migrates webauthn_credential and
-// identity_link.
+// identity_link, in its own schema (schema.ts).
 import {
   generateAuthenticationOptions,
   generateRegistrationOptions,
@@ -14,7 +14,9 @@ import {
 } from "@simplewebauthn/server";
 import postgres from "postgres";
 import {
+  isSession,
   isSubsetWhere,
+  PUBLIC_WHERE,
   SHAPE_FIXED_PARAMS,
   shapeWhere,
   signJwt as sign,
@@ -26,6 +28,7 @@ import {
 } from "./jwt.ts";
 import { type Links, oidc, type Profile, providersFrom } from "./oidc.ts";
 import { androidOrigins } from "./origins.ts";
+import { prepareAuthTables, sealAuthTables } from "./schema.ts";
 export { shapeWhere };
 
 function required(name: string): string {
@@ -102,67 +105,28 @@ const STATE_TTL_S = 300;
 export const sql = postgres(DATABASE_URL, { connection: { statement_timeout: STATEMENT_TIMEOUT_MS } });
 
 export async function migrate(): Promise<void> {
-  await sql`CREATE TABLE IF NOT EXISTS webauthn_credential (
-    id text primary key,
-    user_id uuid not null references app_user(id) on delete cascade,
-    public_key bytea not null,
-    counter bigint not null default 0
-  )`;
-  // Read by this service alone, on its own connection; no app role reaches
-  // it, and the audit is told so rather than left to report it.
-  await sql`INSERT INTO mecha.rls_exempt VALUES
-    ('public.webauthn_credential', 'the auth service''s own table: read by it alone, on its own connection')
-    ON CONFLICT DO NOTHING`;
+  // One instance at a time: replicas starting together (a rollout) would race
+  // each step below. Where the tables live and why: schema.ts.
   await sql.begin(async (tx) => {
-    await tx`CREATE TABLE IF NOT EXISTS identity_link (
-      provider text not null,
-      issuer text not null,
-      sub text not null,
-      user_id uuid not null unique references app_user(id) on delete cascade,
-      created_at timestamptz not null default now(),
-      primary key (provider, issuer, sub)
-    )`;
-    await tx`ALTER TABLE identity_link ADD COLUMN IF NOT EXISTS issuer text,
+    await tx`SELECT pg_advisory_xact_lock(hashtext('mecha auth: migrate'))`;
+    await tx.unsafe(prepareAuthTables(["webauthn_credential", "identity_link"]));
+    await tx`ALTER TABLE mecha_auth.identity_link ADD COLUMN IF NOT EXISTS issuer text,
       ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text,
       ADD COLUMN IF NOT EXISTS email text`;
     // A legacy provider label may have named any issuer. Its owner must supply
     // that issuer before these accounts can safely accept another sign-in.
-    const [legacy] = await tx`SELECT EXISTS (SELECT 1 FROM identity_link WHERE issuer IS NULL) AS unassigned`;
+    const [legacy] = await tx`SELECT EXISTS (SELECT 1 FROM mecha_auth.identity_link WHERE issuer IS NULL) AS unassigned`;
     if (legacy.unassigned) throw new Error("identity_link has unassigned issuers: add and populate its issuer column from the original identity provider before starting auth");
-    await tx`ALTER TABLE identity_link ALTER COLUMN issuer SET NOT NULL`;
+    await tx`ALTER TABLE mecha_auth.identity_link ALTER COLUMN issuer SET NOT NULL`;
     await tx`DO $$ BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_constraint c
         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
-        WHERE c.conrelid = 'identity_link'::regclass AND c.contype = 'p' AND a.attname = 'issuer') THEN
-        ALTER TABLE identity_link DROP CONSTRAINT identity_link_pkey;
-        ALTER TABLE identity_link ADD PRIMARY KEY (provider, issuer, sub);
+        WHERE c.conrelid = 'mecha_auth.identity_link'::regclass AND c.contype = 'p' AND a.attname = 'issuer') THEN
+        ALTER TABLE mecha_auth.identity_link DROP CONSTRAINT identity_link_pkey;
+        ALTER TABLE mecha_auth.identity_link ADD PRIMARY KEY (provider, issuer, sub);
       END IF;
     END $$`;
-  });
-  await sql`INSERT INTO mecha.rls_exempt VALUES
-    ('public.identity_link', 'the auth service''s own table: read by it alone, on its own connection')
-    ON CONFLICT DO NOTHING`;
-  // Both tables say who may sign in as whom, and an app's grants (its default privileges, or a
-  // migration granting every public table on each replay) would hand them to app_user, service and
-  // anon through the CRUD API: a session could read every link and passkey, or attach its own to
-  // another account. As the edge cluster closes them (packages/mecha-edge/src/cluster.ts): row
-  // security, with a policy for this service's own role alone, so a grant made later still reaches no
-  // row, and no app role keeps a grant.
-  // One instance at a time: two starting together (a rollout) would race the policy's drop and create.
-  // The service must own both tables, as it does where it created them.
-  await sql.begin(async (tx) => {
-    await tx`select pg_advisory_xact_lock(hashtext('mecha auth: close the auth tables'))`;
-    for (const table of ["webauthn_credential", "identity_link"]) {
-      await tx.unsafe(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
-      await tx.unsafe(`DROP POLICY IF EXISTS auth_service ON ${table}`);
-      await tx.unsafe(`DO $$ BEGIN EXECUTE format('CREATE POLICY auth_service ON ${table} TO %I USING (true) WITH CHECK (true)', current_user); END $$`);
-      await tx.unsafe(`REVOKE ALL ON ${table} FROM PUBLIC`);
-      await tx.unsafe(`DO $$ DECLARE r text; BEGIN
-        FOR r IN SELECT rolname FROM pg_roles WHERE rolname IN ('app_user', 'service', 'anon') AND rolname <> current_user LOOP
-          EXECUTE format('REVOKE ALL ON ${table} FROM %I', r);
-        END LOOP;
-      END $$`);
-    }
+    await tx.unsafe(sealAuthTables(["webauthn_credential", "identity_link"]));
   });
 }
 
@@ -390,7 +354,9 @@ const subsetError = (param: string, message: string) =>
 // that decides reach is compared.
 async function shapeVerify(req: Request): Promise<Response> {
   const claims = await bearerClaims(req);
-  if (!claims || claims.typ !== "shape") return jsonError(401, "invalid shape token");
+  // A session stands for its own public shapes (jwt.ts's PUBLIC_WHERE); any
+  // other `where` is a minted token's.
+  if (!claims || (claims.typ !== "shape" && !isSession(claims))) return jsonError(401, "invalid shape token");
 
   if (req.headers.get("x-forwarded-method") !== "GET") return jsonError(403, "method not allowed");
   const forwarded = req.headers.get("x-forwarded-uri");
@@ -431,8 +397,13 @@ async function shapeVerify(req: Request): Promise<Response> {
   const get = (key: string) => params.get(key)?.[0] ?? null;
   // A missing parameter is not a matching one. `??` would let an absent `where`
   // read as authorized against a claim that named a predicate.
-  if (get("table") !== claims.table) return jsonError(403, "table not authorized");
-  if (get("where") !== claims.where) return jsonError(403, "where not authorized");
+  if (claims.typ === "shape") {
+    if (get("table") !== claims.table) return jsonError(403, "table not authorized");
+    if (get("where") !== claims.where) return jsonError(403, "where not authorized");
+  } else {
+    if (!validTable(get("table"))) return jsonError(403, "table not authorized");
+    if (get("where") !== PUBLIC_WHERE) return jsonError(403, "where not authorized");
+  }
   if (subsetParams(get("subset__params")) === undefined) return subsetError("params", "subset__params is not an object of positions to strings");
   const subsetWhere = get("subset__where");
   if (subsetWhere !== null && !isSubsetWhere(subsetWhere)) return subsetError("where", "subset__where is not a predicate a subset may state");
@@ -543,9 +514,9 @@ async function registerVerify(req: Request): Promise<Response> {
   if (st.promote === true) {
     // The guest becomes an account once: a guest token that outlives its
     // promotion is still a guest's, and adds no second way in.
-    const added = await sql`insert into webauthn_credential (id, user_id, public_key, counter)
+    const added = await sql`insert into mecha_auth.webauthn_credential (id, user_id, public_key, counter)
       select ${credentialID}, ${userId}, ${credentialPublicKey}, ${counter}
-      where not exists (select 1 from webauthn_credential where user_id = ${userId})`;
+      where not exists (select 1 from mecha_auth.webauthn_credential where user_id = ${userId})`;
     if (added.count === 0) return jsonError(409, "already an account");
     const token = await issueUserToken(userId, st.handle as string);
     return json(200, { token, user: { id: userId, handle: st.handle } });
@@ -557,7 +528,7 @@ async function registerVerify(req: Request): Promise<Response> {
     try {
       await sql.begin(async (tx) => {
         await tx`insert into app_user (id, handle) values (${userId}, ${handle})`;
-        await tx`insert into webauthn_credential (id, user_id, public_key, counter)
+        await tx`insert into mecha_auth.webauthn_credential (id, user_id, public_key, counter)
           values (${credentialID}, ${userId}, ${credentialPublicKey}, ${counter})`;
       });
       inserted = true;
@@ -597,7 +568,7 @@ async function loginVerify(req: Request): Promise<Response> {
   // The credential identifies the user (resident key).
   const creds = await sql`
     select c.id, c.public_key, c.counter, c.user_id, u.handle
-    from webauthn_credential c join app_user u on u.id = c.user_id
+    from mecha_auth.webauthn_credential c join app_user u on u.id = c.user_id
     where c.id = ${response.id}`;
   if (creds.length === 0) {
     return jsonError(401, "authentication verification failed");
@@ -624,7 +595,7 @@ async function loginVerify(req: Request): Promise<Response> {
   if (!verification.verified) {
     return jsonError(401, "authentication verification failed");
   }
-  await sql`update webauthn_credential
+  await sql`update mecha_auth.webauthn_credential
     set counter = ${verification.authenticationInfo.newCounter}
     where id = ${cred.id as string}`;
   const userId = cred.user_id as string;
@@ -681,7 +652,7 @@ export const links: Links = {
       // One sign-in at a time per subject, so two tabs signing in at once make
       // one person, not two.
       await tx`select pg_advisory_xact_lock(hashtext(${JSON.stringify([p.provider, p.issuer, p.sub])}))`;
-      const [link] = await tx`update identity_link set name = ${p.name}, picture = ${p.picture}, email = ${p.email}
+      const [link] = await tx`update mecha_auth.identity_link set name = ${p.name}, picture = ${p.picture}, email = ${p.email}
         where provider = ${p.provider} and issuer = ${p.issuer} and sub = ${p.sub} returning user_id`;
       if (link) {
         const [u] = await tx`select handle from app_user where id = ${link.user_id}`;
@@ -697,7 +668,7 @@ export const links: Links = {
           if ((e as { code?: string }).code === "23505") continue;
           throw e;
         }
-        await tx`insert into identity_link (provider, issuer, sub, user_id, name, picture, email)
+        await tx`insert into mecha_auth.identity_link (provider, issuer, sub, user_id, name, picture, email)
           values (${p.provider}, ${p.issuer}, ${p.sub}, ${id}, ${p.name}, ${p.picture}, ${p.email})`;
         return { id, handle };
       }
@@ -706,7 +677,7 @@ export const links: Links = {
   },
   async handleOf(provider: string, issuer: string, id: string) {
     const [u] = await sql`select u.handle from app_user u
-      where u.id = ${id} and exists (select 1 from identity_link l where l.user_id = u.id and l.provider = ${provider} and l.issuer = ${issuer})`;
+      where u.id = ${id} and exists (select 1 from mecha_auth.identity_link l where l.user_id = u.id and l.provider = ${provider} and l.issuer = ${issuer})`;
     return u ? (u.handle as string) : null;
   },
 };
@@ -760,6 +731,6 @@ export async function handler(req: Request): Promise<Response> {
 
 if (import.meta.main) {
   await migrate();
-  // A host launch moves the port (cluster.cue); a container keeps 9999.
-  Deno.serve({ port: Number(Deno.env.get("AUTH_PORT") ?? 9999) }, handler);
+  // A host launch moves the port (cluster.cue: AUTH_PORT); a container keeps 9999.
+  Deno.serve({ hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("AUTH_PORT") || Deno.env.get("PORT") || 9999) }, handler);
 }

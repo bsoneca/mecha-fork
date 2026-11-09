@@ -9,6 +9,7 @@
 
 # Subsystems
 
+* [[compute|Durable computations and portable values]] - reference: Cortex microbatching, explicit SQL stages and lossless native query/publication boundaries.
 * [Change capture and delivery](change-capture.md) - concept: How a committed row reaches the pipelines through Conduit, Dapr, the bus and rpk, what each hop retries, and what absorbs a duplicate.
 * [Streaming joins](streaming-joins.md) - concept: The stream tier — Arroyo over the change feed, writing a derived table back through CRUD — what runs, and what a join across entities needs.
 * [The proxy](proxy.md) - concept: Caddy as the cluster's one door — its routes, HTTP/2 over a locally trusted certificate, the plain listener that serves only the healthcheck, and the deployment's origin it spells.
@@ -20,7 +21,8 @@
 
 # Decisions
 
-* [An authorized blob plane](decisions/2026-10-08-authorized-blob-plane.md) - decision, unbuilt: Closes the blob plane at the proxy, publishes images only through signed imgproxy URLs computed in SQL, and lets row policy own attachment, so an app needs no media service of its own.
+* [An authorized blob plane](decisions/2026-10-08-authorized-blob-plane.md) - decision, partially built: Closes the blob plane at the proxy, publishes images only through signed imgproxy URLs computed in SQL, and lets row policy own attachment, so an app needs no media service of its own.
+* [Content-addressed blobs](decisions/2026-11-05-content-addressed-blobs.md) - decision, provisional: A blob key may name its bytes by their SHA-256, and the airlock reads only such keys, checking the bytes against the key, so a handler's repeated run reads what the first one read or stops. Built for the print order's artwork alone; write-time checks and sharing a key across orders are left to improve.
 
 # Service and package contracts
 
@@ -31,5 +33,12 @@
 * [ticker](../services/ticker/README.md) - reference: The periodic wake's contract — clock, poke, tick, outcome — how an app declares a schedule, and why a tick needs no durability.
 * [The edge cluster](../packages/mecha-edge/README.md) - reference: mecha's cluster in one Cloudflare Durable Object over PGlite: signed guest sessions, row policy per request, Electric's shape protocol held open, and the Worker that routes to the object.
 * [PGlite for workerd](../packages/pglite-workerd/README.md) - reference: @electric-sql/pglite 0.5.8 built so a Durable Object loads it as built, its data directory kept page by page in the object's SQLite, and the resumable, verified load that puts a directory there.
-* [airlock](../services/airlock/README.md) - reference: The one way out of a cluster — the ledger a guard claims, the Graphile job its worker hears at the commit, the handler's cage and its sink reached only through a Dapr binding, what a run does after a crash, and the bindings-only daprd a cluster places it behind.
+* [[../services/durex/docs/index|Durex]] - reference: Durable Cortex execution, persisted invocations, retries, recovery, atomic completion and the explicit upgrade from internal Airlock work.
+* [airlock](../services/airlock/README.md) - reference: External integrations — the ledger a guard claims, the Graphile job its worker hears at the commit, the handler's cage and its sink reached only through a Dapr binding, what a run does after a crash, and the bindings-only daprd a cluster places it behind.
 * [@mecha/lake](../packages/lake/README.md) - reference: The browser-side consumer of a published DuckLake.
+
+* [[../services/activepieces/README|Activepieces runner]] — app-selected standard pieces, scoped actions and process isolation; optional [[../pieces/mail/README|mail piece]].
+
+# Archive
+
+* [The edge airlock's dispatcher Worker](archive/2026-11-06-edge-airlock-dispatcher.md) - decision, built: Runs Cloudflare effects in a queue-consuming Worker apart from the Durable Object holding the database, which claims, leases and settles them, so rendering and commits never wait on an effect's network.

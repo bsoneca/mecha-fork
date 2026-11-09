@@ -20,6 +20,10 @@ export type Effect = {
   onDone: string;
   onError: string;
   row: string[];
+  /** The fields the ledger key is made of: the instance's primary key and
+   * whatever else names one invocation of it, so a row back in its invoking
+   * state for another invocation is that one's. */
+  key: string[];
   idempotent: boolean;
   reentry?: "reconcile" | "unknown" | "repeat";
   attempts: number;
@@ -31,6 +35,15 @@ export type Effect = {
   credential?: { header: string; scheme?: string; secret: string };
   /** What the handler may use past the language (compute's language.ts). */
   endowments?: string[];
+  /** The media type of a sink that takes no JSON, whose handler sends its
+   * body already encoded, as a string. */
+  contentType?: string;
+  /** The origin the edge's airlock calls; the compose airlock's daprd holds its own. */
+  edgeOrigin?: string;
+  /** The bridge the sink is: the release targets its container runs on, and
+   * whether the local stack runs a simulator in its place. Anywhere else no
+   * call is made and the effect fails. */
+  bridge?: { name: string; targets: string[]; simulated: boolean };
 };
 
 export type Step = "issue" | "reconcile" | "unknown";
@@ -57,11 +70,29 @@ export type Outcome = {
   reconciled: boolean;
 };
 
+/** How long one call outside may take: a sink call, or storing one blob. */
+export const CALL_TIMEOUT_MS = 45_000;
+
 export function outcome(effect: Effect, answer: Answer | "unknown", reconciled: boolean): Outcome {
   if (answer === "unknown") return { target: effect.onError, kind: "unknown", data: null, reconciled };
   if ("done" in answer) return { target: effect.onDone, kind: "done", data: answer.done, reconciled };
   if ("failed" in answer) return { target: effect.onError, kind: "failed", data: answer.failed, reconciled };
   throw new Error("an absent answer is no outcome: the sink has no record, so the effect is issued");
+}
+
+/** The target the local stack's airlock stands on: launch's and the checks'. */
+export const LOCAL = "local";
+
+/** The outcome of an effect whose bridge is not deployed on `target`, or
+ * null where it is: a permanent failure, settled without a handler or sink
+ * call, so it spends no run and leaves no dead letter. On the local stack a
+ * bridge is deployed as its simulator; on a release target, where it names
+ * that target. */
+export function undeployed(effect: Effect, target: string | undefined): Outcome | null {
+  if (effect.bridge === undefined) return null;
+  if (target === undefined) throw new Error(`the bridge ${effect.bridge.name} names its targets, and this airlock is told none`);
+  if (target === LOCAL ? effect.bridge.simulated : effect.bridge.targets.includes(target)) return null;
+  return { target: effect.onError, kind: "failed", data: { bridge: effect.bridge.name, target, reason: "not deployed" }, reconciled: false };
 }
 
 /** A name the shell quotes into SQL: what the manifest may hold, and nothing
@@ -72,10 +103,62 @@ const TOKEN = /^[A-Za-z][A-Za-z0-9-]*$/;
 // Daprd forwards a metadata key as a header only when its first letter is
 // uppercase; and a credential never takes a header the host or HTTP sets.
 const HEADER = /^[A-Z][A-Za-z0-9-]*$/;
-const RESERVED_HEADERS = new Set(["idempotency-key", "content-type", "content-length", "accept", "host", "transfer-encoding", "traceparent", "tracestate", "baggage"]);
+const RESERVED_HEADERS = new Set(["idempotency-key", "content-type", "content-length", "accept", "host", "transfer-encoding", "traceparent", "tracestate", "baggage", "dapr-app-id"]);
 const SECRET = /^[A-Z][A-Z0-9_]*$/;
-/** The effect's name is also its Dapr binding's. */
+const MEDIA_TYPE = /^[a-z]+\/[a-z0-9][a-z0-9.+-]*$/;
+const HEADER_VALUE = /^[\x21-\x7e]([\x20-\x7e]*[\x21-\x7e])?$/;
+
+/** The headers a handler sets on one sink call, checked: names daprd forwards,
+ * none HTTP or the host sets (the idempotency key, the effect's credential),
+ * and visible ASCII values. Both airlocks take them, so one handler sets them
+ * in either. */
+export function sinkHeaders(headers: unknown, host: string[] = []): Record<string, string> {
+  if (headers === undefined) return {};
+  if (typeof headers !== "object" || headers === null || Array.isArray(headers)) {
+    throw new TypeError(`sink headers must be an object of strings, got ${JSON.stringify(headers)}`);
+  }
+  for (const [name, value] of Object.entries(headers)) {
+    const taken = RESERVED_HEADERS.has(name.toLowerCase()) || host.some((h) => h.toLowerCase() === name.toLowerCase());
+    if (!HEADER.test(name) || taken) {
+      throw new TypeError(`sink header ${JSON.stringify(name)}: a name daprd forwards (uppercase first) that neither HTTP nor the host sets`);
+    }
+    if (typeof value !== "string" || !HEADER_VALUE.test(value)) {
+      throw new TypeError(`sink header ${name}: the value is visible ASCII, got ${JSON.stringify(value)}`);
+    }
+  }
+  return headers as Record<string, string>;
+}
+/** The effect's name is also its Dapr HTTPEndpoint's. */
 const ENDPOINT = /^[a-z][a-z0-9-]*$/;
+
+/** The body of one sink call: JSON unless the effect declares otherwise, when
+ * only the handler knows the encoding. Bytes in a JSON body are sent as
+ * base64, the only way JSON carries them. Both airlocks ask here. */
+export function encodedBody(contentType: string | undefined, body: unknown): string {
+  if (contentType === undefined) {
+    return typeof body === "string" ? body : JSON.stringify(body, (_, v) => v instanceof Uint8Array ? base64Of(v) : v);
+  }
+  if (typeof body !== "string") throw new TypeError(`sink body: a ${contentType} effect sends an encoded string, got ${typeof body}`);
+  return body;
+}
+
+// In slices: spreading a picture's bytes into one call overflows the stack.
+export function base64Of(bytes: Uint8Array): string {
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(text);
+}
+
+/** The ledger key a row's current fields make, as the guard's claim spells it
+ * (pronto's emit.cue #ledgerKeySql): one field as it is, several as a JSON
+ * array, so a ':' in a value cannot make two instances read as one. A settle
+ * moves only the row whose key is still the ledger's, never one that entered
+ * the invoking state again for another invocation. */
+export function ledgerKeySql(name: string, effect: Effect): string {
+  if (!ENDPOINT.test(name)) throw new Error(`effect ${JSON.stringify(name)} is not a DNS label`);
+  const fields = effect.key.map((f) => `"${f.replaceAll('"', '""')}"::text`);
+  return fields.length === 1 ? `('${name}:' || ${fields[0]})` : `('${name}:' || jsonb_build_array(${fields.join(", ")})::text)`;
+}
 
 /** effects.json, checked: the airlock dies on a manifest it would misread. */
 export function parseManifest(text: string): Record<string, Effect> {
@@ -92,6 +175,7 @@ export function parseManifest(text: string): Record<string, Effect> {
     for (const k of ["table", "field"] as const) if (!IDENTIFIER.test(e[k])) bad(`${k} ${JSON.stringify(e[k])} is not an identifier`);
     for (const k of ["state", "onDone", "onError", "handler"] as const) if (typeof e[k] !== "string" || e[k] === "") bad(`no ${k}`);
     if (!Array.isArray(e.row) || e.row.length === 0 || !e.row.every((c) => IDENTIFIER.test(c))) bad("row is not a list of identifiers");
+    if (!Array.isArray(e.key) || e.key.length === 0 || !e.key.every((c) => IDENTIFIER.test(c))) bad("key is not a list of identifiers");
     if (typeof e.idempotent !== "boolean") bad("idempotent is not a boolean");
     if (e.idempotent && e.reentry !== undefined) bad("an idempotent sink declares no reentry");
     if (!e.idempotent) {
@@ -100,8 +184,20 @@ export function parseManifest(text: string): Record<string, Effect> {
     }
     if (!Number.isInteger(e.attempts) || e.attempts < 1) bad("attempts is not a positive integer");
     if (e.endowments !== undefined) endowable(e.endowments, `effects.json: effect ${name}`);
+    if (e.bridge !== undefined) {
+      const b = e.bridge;
+      if (
+        typeof b !== "object" || b === null || !ENDPOINT.test(b.name) || typeof b.simulated !== "boolean" ||
+        !Array.isArray(b.targets) || !b.targets.every((t) => typeof t === "string" && ENDPOINT.test(t) && t !== LOCAL)
+      ) {
+        bad("bridge is not {name, targets, simulated}: DNS labels, release targets only, and a boolean");
+      }
+    }
     if (e.secrets !== undefined && (!Array.isArray(e.secrets) || !e.secrets.every((s) => typeof s === "string" && SECRET.test(s)))) {
       bad("secrets is not a list of environment variables' names");
+    }
+    if (e.contentType !== undefined && (typeof e.contentType !== "string" || !MEDIA_TYPE.test(e.contentType) || e.contentType === "application/json")) {
+      bad("contentType is not a media type other than JSON, which is the default");
     }
     if (e.credential !== undefined) {
       const c = e.credential;

@@ -1,9 +1,15 @@
 # airlock
 
-The one way out of a cluster. A machine state *invokes* an external effect; the
+Airlock handles external integrations. It is the one way out of a cluster:
+a machine state *invokes* an effect; the
 airlock performs it against the effect's sink and returns the answer as the
 machine's next event. Like an airlock, it never has both doors open: the claim
 commits before the call.
+
+Its direction follows Camel's integration boundary: declared destinations,
+transport adapters and routing. The built contract below provides restricted
+effect handlers and sinks. [[../durex/docs/index|Durex]] owns internal durable
+execution, retries and transactional completion for Cortex machines.
 
 Why the design has this shape, what it rejected and what it measured, is
 pronto's [external effects](../../../../plugins/pronto/docs/decisions/2026-10-03-external-effects.md).
@@ -31,9 +37,8 @@ This file is the contract.
   handler the airlock would refuse fails before it is deployed.
 - [dapr.yaml](dapr.yaml): the airlock daprd's configuration, the bindings API
   and nothing else.
-- [mail.ts](mail.ts): mecha's mail bridge, and [inward.ts](inward.ts), the
-  address check it makes of the server it connected.
-- [graphile.sql](graphile.sql), written by [graphile_sql.ts](graphile_sql.ts)
+- [[../activepieces/README|Activepieces runner]]: standard pieces in application container hatches.
+- [[../durex/graphile.sql|Graphile's shared schema]], written by [[../durex/graphile_sql.ts|its generator]]
   (`task generate:graphile`): Graphile Worker's schema as one initdb step.
 
 ```sh
@@ -41,8 +46,8 @@ task test:airlock        # from libraries/mecha: the pure suites
 task integrate:airlock   # postgres, Graphile, the cluster's daprd and a sink; needs Docker
 ```
 
-`tests/airlock_test.ts` generates a bayt project holding a cluster with two
-effects and boots the plane bayt lowers for it, below.
+pronto's `mecha-airlock.integration.test.ts` generates a bayt project holding
+a cluster with two effects and boots the plane bayt lowers for it, below.
 
 ## Contract
 
@@ -86,26 +91,73 @@ export async function reconcile(input, sink) {
 
 - `input` is XState's word: the effect's `input`, frozen. `sink.key` is the ledger key, also sent as every request's
   `Idempotency-Key`.
-- `sink.fetch(path, {method, body})` takes an absolute path in plain characters: no
+- `sink.fetch(path, {method, body, headers})` takes an absolute path in plain characters: no
   `%` before the query, no empty or dot segment. It answers `{status, body}`, the body
-  parsed when the sink answers JSON.
-- The host sends the request as a call of the effect's output binding on daprd,
-  `/v1.0/bindings/<effect>`, with the path, the `Idempotency-Key` and the content type
-  as the binding's metadata, so the host alone sets headers. The binding's `url` is
-  the declared origin, and daprd answers the sink's status in `Metadata.statuscode`
-  (the binding is declared with `errorIfNot2XX` off). A credential the sink reads from a
+  parsed when the sink answers JSON. `headers` are the handler's own, such as
+  tsbifrost's `X-Bf-Passthrough-Extra-Params`: names daprd forwards (uppercase first),
+  never one HTTP or the host sets, and visible ASCII values (`sinkHeaders` in
+  `reentry.ts`, which the edge airlock applies too).
+- The host sends the request as an invocation of the effect's HTTPEndpoint on daprd,
+  `/v1.0/invoke/<effect>/method/<path>`, with the handler's headers, the `Idempotency-Key`
+  and the content type as its own. The endpoint's `baseUrl` is the declared origin, and
+  daprd hands the body, the headers and the sink's status through unchanged, so a refusal
+  is an answer. A credential the sink reads from a
   header is the effect's `credential: {header, scheme?, secret}`: the airlock reads the
   variable once and adds the header to every call, and the handler never holds it. A
   client certificate is not declared yet.
+- A sink that takes no JSON declares `contentType`, and its handler sends the body already
+  encoded, as a string, which arrives as it was sent.
+- daprd's own failure is also a 500, told from a sink's by `errorCode: ERR_DIRECT_INVOKE`. An
+  open breaker called nothing, so it ends the run, gives the ledger's count back and leaves the
+  queue's backoff to bring the job again; it spends no attempt. Any other daprd failure may
+  have reached the sink and counts as a throw. A breaker met after a call in the same run has
+  reached the sink is a throw too.
 - The third argument holds the values of the environment variables the effect declares
   in `secrets`, read by the host at startup and written nowhere, not the manifest and
   not the ledger; the cluster refuses to start the airlock without them.
 - Past the language a handler reaches only what its effect declares in `endowments`
   (`../compute/language.ts`'s `ENDOWABLE`), as an omnishell module declares `Intl`: a
   handler that signs declares `Crypto`, WebCrypto's operations that are deterministic by
-  their specification (`../compute/crypto.ts`), and `TextEncoder`. An endowment it uses
-  without declaring throws where it is used.
+  their specification (`../compute/crypto.ts`), and `TextEncoder`; one that writes a PDF
+  declares `Pdf` ([pdf.ts](pdf.ts)). An endowment it uses without declaring throws where
+  it is used.
 - A throw, or no answer within 60 seconds, is no answer.
+- Bytes are answered as `{"$blob": {base64, type}}` anywhere in the answer (`blobs.ts`),
+  or as `{"$blob": {bytes, type}}` with a `Uint8Array` a handler made itself, since the
+  cage has no `btoa`: PNG, JPEG or WebP, or a PDF, which only the raw route serves. Before the outcome settles, the host stores each in the cluster's
+  blob plane under its content key, `effects/<sha256 hex>.<extension>`, which a later
+  effect reads with `sink.blob` once a row carries it, and the outcome carries the URL the plane
+  serves it at: `/img/insecure/plain/s3://mecha-objects/<key>` through imgproxy in
+  compose, written over the airlock daprd's `blobs` binding (dapr's S3 binding on
+  rclone-s3); the same URL on the Worker's R2 bucket at the edge. Bytes never
+  reach the ledger or a row: inline, a level's pictures outgrew the edge's in-memory
+  database. A cluster with no blob plane refuses the answer.
+- Bytes are read with `sink.blob(key)`, and only by a content key,
+  `[effects/]<sha256 hex>[-<suffix>].<extension>` ([the record](../../docs/decisions/2026-11-05-content-addressed-blobs.md)):
+  the host reads the plane (the same binding's `get`, R2 at the edge) and fails the run
+  when the bytes do not hash to the key, so the input carries keys and a repeated run
+  reads what the first one read. Bytes a handler puts in a JSON body are sent as base64.
+- `sink.origin` is the release's origin, for a sink that links or calls back: the door's
+  `ORIGIN` in a container cluster, `https://<domain>` at the edge. It never follows the host
+  a request came by, so every run of a release names the same one; a release without one
+  fails the run that reads it.
+
+## A bridge not deployed
+
+An effect whose sink is a bridge carries where the bridge runs in `effects.json`
+(`bridge: {name, targets, simulated}`): the release targets its container is
+deployed on, and whether the local stack runs a simulator in its place. The
+airlock knows its own target: `AIRLOCK_TARGET` in a cluster, which compose sets to
+`local`, and `cloudflare` at the edge. An airlock told none refuses to start
+where any bridge names its targets. Locally a bridge is deployed as its
+simulator; on a release target, where it names that target: as a process of
+the docker appliance, or as a Cloudflare Container of the edge's dispatcher
+Worker, called through its binding
+([container bridges](../../../../plugins/pronto/docs/container-bridges.md#targets)).
+Where it is not, a claimed effect settles at once, before its run is counted:
+outcome `failed`, data `{bridge, target, reason: "not deployed"}`, target
+`onError`. Neither handler nor sink is called, the ledger's `entered` stays 0
+and no dead letter follows (`undeployed` in [reentry.ts](reentry.ts)).
 
 ## After a crash
 
@@ -146,44 +198,62 @@ ceiling, so the queue never refuses a run the ledger still counts.
 
 A cluster places the airlock only where the program declares an effect
 (`state.effects` in [cluster.cue](../../cluster.cue)), as it places the ticker
-only where one declares a schedule. It brings two services, a bridge per
-declared bridge, the ticker and clock, two initdb steps, and crud verifying
+only where one declares a schedule. It brings two services, the ticker and
+clock, two initdb steps, and crud verifying
 the service token the ticker writes with:
 
 | | |
 |---|---|
 | `airlock` | This service, FROM mecha's `airlock-image`, with the program's `effects.json` and handlers copied to `/airlock` and watched. Its own `--allow-net` is the database, its daprd and port 9997, the healthcheck's and the ticker's wake (`GET /healthz`). |
-| `airlock-mesh` | Its daprd, holding one HTTP output binding per effect and nothing else: no Redis component and no resiliency policy, so a call is made once and `entered` counts every attempt. It runs under [dapr.yaml](dapr.yaml), the bindings API alone over HTTP and gRPC, and goes out on `airlock-egress`, a network nothing else joins. |
-| `bridge-<name>` | One per declared bridge (`state.bridges`): [mail.ts](mail.ts), mecha's mail bridge, taking HTTP from the daprd on `airlock-out` and speaking SMTP to its one declared server. Its `--allow-net` is its port and that server; its environment is the server, `tls` and the `Message-ID` domain, and the credentials' variables where declared. The daprd reaches it by name in plain HTTP, its effect's binding `url` being `http://bridge-<name>:8080`. |
+| `airlock-mesh` | Its daprd, holding one HTTPEndpoint per effect, the wall, and a breaker per endpoint (`#AirlockResiliency`). Declaring a policy turns off daprd's built-in retries, so a call is made once and `entered` counts every attempt; a sink's 4xx counts toward the trip, which no policy can filter. It runs under [dapr.yaml](dapr.yaml) and goes out on `airlock-egress`, a network nothing else joins. |
+| Bridge container | `state.bridges` names an existing container target and its HTTP port (default 8080). The daprd waits on that target and calls `http://<container>:<port>`. Runtime lowering attaches the target to `airlock-out` and `bridge-<name>-egress`; it grants no default network, database credential or callback permission. |
 | `011_graphile_worker.sql`, `012_airlock.sql` | Graphile's schema; then the ticker's schedule table with its `airlock` row, the tables above and `airlock_wake`, staged in the database image. They take the first digits after the steps a caller opens with, so every caller step that can write a row, held seed included, runs after them and finds the table its interpreter re-arms ([the order](../../docs/schema.md#how-a-schema-reaches-the-database)). A cluster that also declares a schedule runs the schedule table's text again at 020, where every statement holds. |
 
-**The wall is the allowlist.** The airlock stands on the internal `airlock`
+**The wall keeps mistakes in.** Its purpose is that declared destinations are the
+only ones reached by accident; it guards against mistakes in trusted code and is
+not a security boundary. The airlock stands on the internal `airlock`
 network with the database and its daprd, so it reaches the world
 only through that daprd, and on `airlock-wake` with the ticker alone, whose
-wake reaches its health port and nothing of its daprd. The daprd offers the bindings API alone, over HTTP
-and over the gRPC it always serves: service invocation, which would forward a
-full URL to any origin, does not exist on it, nor do state, pubsub, secrets,
-metadata or shutdown. It goes out on `airlock-egress`, which nothing else
+wake reaches its health port and nothing of its daprd. daprd forwards an
+invocation whose target is a full URL, with no setting to turn that off, so a
+`routerchecker` rule (`#AirlockWall`) passes only `/v1.0/invoke/<a declared
+effect>/method/...`, the blob plane's binding and daprd's health, and `api.allowed`
+removes every other Dapr API. It does not stop a deliberate `dapr-app-id` header on
+an allowed path, which was measured reaching an undeclared host, and gRPC proxying
+under that metadata was not settled. It goes out on `airlock-egress`, which nothing else
 joins, and stands nowhere on the default network, where every other service
-is, so no other service can call its bindings and perform an effect with no
-claim. Its bindings are the program's
-declarations, so the only traffic it can originate is a call of a declared
-binding. An origin is spelt as an https DNS name of two labels or more, which
+is, so no other service can call it and perform an effect with no
+claim. Its endpoints are the program's
+declarations, so what it reaches by accident is a declared endpoint. An origin is spelt as an https DNS name of two labels or more, which
 refuses `database` and an address; a declared name that resolves inward is not
-refused, since the daprd dials what its binding names, nor is a redirect a
-declared sink answers, which the HTTP binding follows; those are the residual
+refused, since the daprd dials what its endpoint names, nor is a redirect a
+declared sink answers, which daprd follows; those are the residual
 pronto's record states. bayt writes no network, so a consumer
 declares the cluster's `surface.networks` in its compose model; pronto writes
 them to `compose.networks.yaml`, which every closure and the root include.
 
-**A bridge carries its own wall.** It stands on the internal `airlock-out`,
-where only the airlock's daprd reaches it, and goes out on
-`bridge-<name>-egress`, which nothing else joins, and it reaches out only as
-far as its process's `--allow-net`: its port and its
-declared server. It checks the address it connected before a byte crosses and
-refuses an inward one, and the server must be spelt as a DNS name of two labels
-or more and a port. Past it, as past any sink, nothing is the platform's to
-promise.
+**A bridge is a container role.** The application supplies the target through
+its container hatch. The role adds the internal `airlock-out` network shared
+with the daprd and other bridges, plus `bridge-<name>-egress`. An explicitly
+configured hatch network is preserved; an undeclared default network is not
+added. The role does not confine the process or enforce its outbound domains.
+A missing, removed or unbuilt target fails runtime lowering.
+
+**One container holds them all in pronto's docker appliance.** The airlock, its
+daprd and each docker bridge run there as processes on one loopback address
+under their compose names, so the walls above are not there: the daprd's
+bindings-only API and the airlock's `--allow-net` remain, and a bridge's own
+destination policy carries the rest
+([[../../../../plugins/pronto/docs/release-targets#docker|the docker target]]).
+
+Mecha's `#ActivepiecesContainer` supplies the generic action runner. Pronto
+instantiates it from a container hatch's `activepieces` definition and scopes
+each bridge to one action alias. Applications select local or pinned catalogue
+pieces and own their fixed inputs, contracts and credential references. See
+[[../../../../plugins/pronto/docs/activepieces-hatches|Activepieces hatches]].
+The optional [[../../pieces/mail/README|mail piece]] implements SMTP; no mail
+transport knowledge is built into the runner. Past a bridge, as past any sink,
+external delivery remains subject to the effect's reentry policy.
 
 **The wake is the ticker's.** Inside a running cluster the airlock is
 reactive: it hears every enqueue at its commit. For a cluster scaled to zero,
@@ -205,7 +275,11 @@ Graphile's row stays as the record. Each key is its own attempt, so one the
 sweep cannot settle is reported and tried again at the next.
 
 **The move, delivered again, finds the row the program's.** An outcome's move
-is repeated after a crash past the outcome; a row no longer in the invoking
-state was moved by the earlier delivery and then by the program, wherever that
-took it, deletion included, and the delivery is done. Only a row still in the
-state refuses: its move was refused.
+is repeated after a crash past the outcome, and it moves only the invocation
+its ledger key names: a row whose key fields, as the guard spells the key
+(`ledgerKeySql` in [reentry.ts](reentry.ts)), still make that key. A row no
+longer in the invoking state, or back in it for another invocation, was moved
+by the earlier delivery and then by the program, wherever that took it,
+deletion included, and the delivery is done. Only a row still in the state
+under this key refuses: its move was refused. The manifest carries each
+effect's `key` fields for this.

@@ -14,6 +14,8 @@ import {
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
 import { androidOrigin } from "./origins.ts";
 import { admittedOrigin, ceremonyOrigin, handler, issueUserToken, links, migrate, signJwt, sql, verifyJwt } from "./main.ts";
+import { PUBLIC_WHERE } from "./jwt.ts";
+import { PUBLIC_WHERE as CLIENT_PUBLIC_WHERE } from "../../packages/client/src/public-where.ts";
 
 await sql`CREATE TABLE IF NOT EXISTS app_user (
   id uuid primary key,
@@ -100,8 +102,8 @@ await sql`INSERT INTO mecha.shape_key VALUES
   ('public.gk_line', 'doc_id', 'public.gk_doc', 'id')
   ON CONFLICT DO NOTHING`;
 await migrate();
-await sql`delete from webauthn_credential`;
-await sql`delete from identity_link`;
+await sql`delete from mecha_auth.webauthn_credential`;
+await sql`delete from mecha_auth.identity_link`;
 await sql`delete from app_user`;
 
 function post(path: string, body: unknown, token?: string): Request {
@@ -707,14 +709,22 @@ Deno.test({
 });
 
 Deno.test({
-  name: "a user token is not a shape token, and vice versa",
+  name: "a session opens a table's public rows and nothing wider; a shape token is no session",
   ...opts,
   async fn() {
-    const { res, userToken } = await mint("article");
-    const { token, where } = await res.json();
-    const uri = `/v1/shape?table=article&where=${encodeURIComponent(where)}`;
-    // The session token says nothing about a shape.
-    assertEquals((await handler(shapeReq(userToken, uri))).status, 401);
+    const { res, userToken, uid } = await mint("article");
+    const { token } = await res.json();
+    const shape = (table: string, where: string) =>
+      handler(shapeReq(userToken, `/v1/shape?table=${table}&where=${encodeURIComponent(where)}`));
+    // Every subject's scopes open with public:, so the session reaches no row
+    // a minted token would not, and a screen mounts without a mint per table.
+    assertEquals(PUBLIC_WHERE, CLIENT_PUBLIC_WHERE);
+    assertEquals((await shape("article", PUBLIC_WHERE)).status, 200);
+    assertEquals((await shape("scoped_article", PUBLIC_WHERE)).status, 200);
+    // Its own rows still need the mint, which reads the subject's scopes.
+    assertEquals((await shape("scoped_article", `scope_id IN ('public:','user:${uid}')`)).status, 403);
+    assertEquals((await shape("article", "true")).status, 403);
+    assertEquals((await shape("article; drop table article", PUBLIC_WHERE)).status, 403);
     // And the shape token cannot stand in for a session.
     const mintWithShape = await handler(
       new Request("http://auth:9999/auth/shape", {
@@ -1069,13 +1079,13 @@ Deno.test({
       assertEquals(new Set(racers.map((u) => u.id)).size, 1, sub);
     }
     const users = [await links.userFor(alice)];
-    const [link] = await sql`select user_id from identity_link where provider = 'google' and sub = 'g-alice'`;
+    const [link] = await sql`select user_id from mecha_auth.identity_link where provider = 'google' and sub = 'g-alice'`;
     assertEquals(link.user_id, users[0].id);
     await links.userFor({ ...alice, name: "Alice B." });
-    assertEquals((await sql`select name from identity_link where sub = 'g-alice'`)[0].name, "Alice B.");
-    assertEquals((await sql`select email from identity_link where sub = 'g-alice'`)[0].email, "alice@mail.test");
+    assertEquals((await sql`select name from mecha_auth.identity_link where sub = 'g-alice'`)[0].name, "Alice B.");
+    assertEquals((await sql`select email from mecha_auth.identity_link where sub = 'g-alice'`)[0].email, "alice@mail.test");
     await links.userFor({ ...alice, email: null });
-    assertEquals((await sql`select email from identity_link where sub = 'g-alice'`)[0].email, null, "the provider no longer vouches for one");
+    assertEquals((await sql`select email from mecha_auth.identity_link where sub = 'g-alice'`)[0].email, null, "the provider no longer vouches for one");
     assertEquals(await links.handleOf("google", alice.issuer, users[0].id), users[0].handle);
   },
 });
@@ -1087,7 +1097,7 @@ Deno.test({
     const guest = (await (await handler(post("/auth/guest", {}))).json()).user;
     assertEquals(await links.handleOf("google", alice.issuer, guest.id), null);
     const u = await links.userFor({ ...alice, sub: "g-revoked" });
-    await sql`delete from identity_link where sub = 'g-revoked'`;
+    await sql`delete from mecha_auth.identity_link where sub = 'g-revoked'`;
     assertEquals(await links.handleOf("google", alice.issuer, u.id), null);
   },
 });
@@ -1096,8 +1106,9 @@ Deno.test({
   name: "legacy links require their original issuer before migration can admit sign-in",
   ...opts,
   fn: async () => {
-    // The shape its auth service made, with a row signed in through the broker.
-    await sql`drop table identity_link`;
+    // The shape its auth service made, in public, with a row signed in through the broker.
+    await sql`drop view public.identity_link`;
+    await sql`drop table mecha_auth.identity_link`;
     await sql`create table identity_link (
       provider text not null, sub text not null,
       user_id uuid not null unique references app_user(id) on delete cascade,
@@ -1116,6 +1127,87 @@ Deno.test({
   },
 });
 
+// An app grants every table in public, BYPASSRLS roles included, and the CRUD
+// API serves public: the links and passkeys decide who signs in as whom, so
+// no app grant reaches them.
+Deno.test({
+  name: "no app grant reaches the links or the passkeys",
+  ...opts,
+  fn: async () => {
+    const owner = await links.userFor({ ...alice, sub: "g-closed" });
+    const rollback = new Error("rolled back");
+    const tried = await sql.begin(async (tx) => {
+      await tx`DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_probe') THEN CREATE ROLE service_probe NOLOGIN BYPASSRLS; END IF;
+      END $$`;
+      await tx`GRANT USAGE ON SCHEMA public TO app_user, service_probe`;
+      await tx`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user, service_probe`;
+      await tx`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user, service_probe`;
+      const seen: Record<string, string> = {};
+      for (const role of ["app_user", "service_probe"]) {
+        for (const query of ["select * from mecha_auth.identity_link", "select * from mecha_auth.webauthn_credential",
+          `insert into mecha_auth.webauthn_credential (id, user_id, public_key) values ('stolen', '${owner.id}', '\\x00')`,
+          "select * from identity_link", "select * from webauthn_credential"]) {
+          await tx`SAVEPOINT probe`;
+          await tx.unsafe(`SET LOCAL ROLE ${role}`);
+          seen[`${role}: ${query}`] = await tx.unsafe(query).then(() => "answered", (e: Error) => e.message);
+          await tx`ROLLBACK TO SAVEPOINT probe`;
+        }
+      }
+      throw Object.assign(rollback, { seen });
+    }).catch((e) => e === rollback ? (e as Error & { seen: Record<string, string> }).seen : Promise.reject(e));
+    for (const [probe, outcome] of Object.entries(tried)) {
+      if (probe.includes("mecha_auth.")) assertEquals(outcome, "permission denied for schema mecha_auth", probe);
+      else assert(outcome.startsWith("permission denied for "), `${probe}: ${outcome}`);
+    }
+    const left = await sql`select c.relname, c.relkind, c.reloptions from pg_class c join pg_namespace n on n.oid = c.relnamespace
+      where n.nspname = 'public' and c.relname in ('identity_link', 'webauthn_credential') order by 1`;
+    assertEquals(left.map((r) => [r.relname, r.relkind, r.reloptions]), [
+      ["identity_link", "v", ["security_invoker=true"]],
+      ["webauthn_credential", "v", ["security_invoker=true"]],
+    ]);
+    assertEquals((await links.userFor({ ...alice, sub: "g-closed", name: "Still Alice" })).id, owner.id);
+  },
+});
+
+// A release before mecha_auth made both tables in public, where an app's
+// grants reached them; they move with their rows and without those grants,
+// and an earlier release still running reads and writes through the views
+// left behind, while one starting again fails rather than making empty tables.
+Deno.test({
+  name: "tables an earlier release made in public move with their rows and none of public's grants",
+  ...opts,
+  fn: async () => {
+    const owner = await links.userFor({ ...alice, sub: "g-moved" });
+    await sql`insert into mecha_auth.webauthn_credential (id, user_id, public_key) values ('moved', ${owner.id}, '\\x01')`;
+    for (const table of ["webauthn_credential", "identity_link"]) {
+      await sql.unsafe(`drop view public.${table}`);
+      await sql.unsafe(`alter table mecha_auth.${table} set schema public`);
+      await sql.unsafe(`grant select, insert, update, delete on public.${table} to app_user`);
+    }
+    await sql`DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'column_probe') THEN CREATE ROLE column_probe NOLOGIN; END IF;
+    END $$`;
+    await sql`grant select (user_id) on public.webauthn_credential to column_probe`;
+    await sql`grant usage on schema mecha_auth to app_user`;
+    await migrate();
+    const [schema] = await sql`select has_schema_privilege('app_user', 'mecha_auth', 'USAGE') as usable`;
+    assertEquals(schema.usable, false);
+    const [column] = await sql`select has_column_privilege('column_probe', 'mecha_auth.webauthn_credential', 'user_id', 'select') as granted`;
+    assertEquals(column.granted, false);
+    for (const table of ["webauthn_credential", "identity_link"]) {
+      const [acl] = await sql`select has_table_privilege('app_user', ${"mecha_auth." + table}, 'select, insert, update, delete') as granted`;
+      assertEquals(acl.granted, false, table);
+
+    }
+    assertEquals((await sql`select user_id from mecha_auth.webauthn_credential where id = 'moved'`)[0].user_id, owner.id);
+    assertEquals((await links.userFor({ ...alice, sub: "g-moved" })).id, owner.id);
+    await sql`insert into webauthn_credential (id, user_id, public_key) values ('through-view', ${owner.id}, '\\x02')`;
+    assertEquals((await sql`select count(*)::int as n from mecha_auth.webauthn_credential where id = 'through-view'`)[0].n, 1);
+    await assertRejects(() => sql`ALTER TABLE identity_link ADD COLUMN IF NOT EXISTS issuer text`, Error, "cannot be performed on relation");
+  },
+});
+
 Deno.test("a provider named without its client is refused at startup", async () => {
   const { success, stderr } = await new Deno.Command(Deno.execPath(), {
     args: ["run", "-A", "--frozen", fileURLToPath(new URL("./main.ts", import.meta.url))],
@@ -1125,41 +1217,6 @@ Deno.test("a provider named without its client is refused at startup", async () 
   }).output();
   assert(!success);
   assertStringIncludes(new TextDecoder().decode(stderr), "OIDC_GOOGLE_CLIENT_ID is required");
-});
-
-Deno.test({
-  name: "no app role reaches the links or the passkeys, even granted them after the migration, and sign-in still works",
-  ...opts,
-  fn: async () => {
-    const u = await links.userFor({ provider: "google", issuer: "https://accounts.google.com", sub: "g-closed", name: "Closed", picture: null, email: null });
-    await sql`insert into webauthn_credential (id, user_id, public_key) values ('cred-closed', ${u.id}, '\\x00') on conflict do nothing`;
-    const as = async (q: string): Promise<string> => {
-      const c = await sql.reserve();
-      try {
-        await c.unsafe("SET ROLE app_user");
-        const rows = await c.unsafe(q);
-        return `rows:${rows.length}`;
-      } catch (e) {
-        return String((e as Error).message);
-      } finally {
-        await c.unsafe("RESET ROLE");
-        c.release();
-      }
-    };
-    for (const t of ["identity_link", "webauthn_credential"]) {
-      assertStringIncludes(await as(`select * from ${t}`), "permission denied", `${t} is granted to no app role`);
-    }
-    // What an app's migration does on each replay: every public table granted to its roles.
-    await sql`GRANT SELECT, INSERT, UPDATE, DELETE ON identity_link, webauthn_credential TO app_user`;
-    assertEquals(await as("select * from identity_link"), "rows:0", "a link reaches no session");
-    assertEquals(await as("select * from webauthn_credential"), "rows:0", "nor a passkey");
-    assertStringIncludes(await as(`insert into webauthn_credential (id, user_id, public_key) values ('cred-stolen', '${u.id}', '\\x00') returning id`), "row-level security");
-    assertEquals(await as(`update identity_link set name = 'taken' where sub = 'g-closed' returning sub`), "rows:0");
-    await migrate();
-    assertStringIncludes(await as("select * from identity_link"), "permission denied", "the next start takes the grant back");
-    assertEquals((await links.userFor({ provider: "google", issuer: "https://accounts.google.com", sub: "g-closed", name: "Closed Again", picture: null, email: null })).id, u.id);
-    assertEquals((await sql`select name from identity_link where sub = 'g-closed'`)[0].name, "Closed Again");
-  },
 });
 
 // Last, and it has to be: Deno runs tests in source order, and this closes the

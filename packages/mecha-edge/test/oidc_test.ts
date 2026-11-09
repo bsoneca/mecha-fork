@@ -182,7 +182,7 @@ Deno.test({ name: "links an earlier edge made without their issuer take their pr
     assert.deepEqual(links, [{ issuer: idp.issuer }])
     const { rows } = await db.query<{ k: string[] }>(`SELECT array_agg(a.attname ORDER BY a.attname) AS k FROM pg_constraint c
       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
-      WHERE c.conrelid = 'identity_link'::regclass AND c.contype = 'p'`)
+      WHERE c.conrelid = 'mecha_auth.identity_link'::regclass AND c.contype = 'p'`)
     assert.deepEqual(rows[0].k, ['issuer', 'provider', 'sub'])
   } finally {
     await db.close()

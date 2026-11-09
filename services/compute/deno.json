@@ -1,10 +1,19 @@
 {
   "imports": {
+    "@babel/parser": "npm:@babel/parser@7.28.6",
+    "@babel/traverse": "npm:@babel/traverse@7.28.6",
+    "@babel/generator": "npm:@babel/generator@7.29.8",
     "@mecha/compute/": "./",
-    "@duckdb/node-api": "npm:@duckdb/node-api@1.5.6-r.1",
-    "@endo/module-source": "npm:@endo/module-source@1.4.0",
-    "@std/assert": "jsr:@std/assert@1.0.8",
-    "ses": "npm:ses@1.15.0"
+    "@mecha/client/types": "./portable-contract.ts",
+    "@pdfme/pdf-lib": "npm:@pdfme/pdf-lib@6.2.8",
+    "@std/assert": "jsr:@std/assert@1.0.8"
   },
-  "lock": true
+  "lock": true,
+  "lint": {
+    "rules": {
+      "exclude": [
+        "no-import-prefix"
+      ]
+    }
+  }
 }

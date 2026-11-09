@@ -17,6 +17,18 @@ services:
       service: libraries_mecha-build
     profiles:
     - build
+  extensions-build:
+    extends:
+      file: ./compose.extensions-build.yaml
+      service: libraries_mecha-extensions-build
+    profiles:
+    - extensions-build
+  extensions-image:
+    extends:
+      file: ./compose.extensions-image.yaml
+      service: libraries_mecha-extensions-image
+    profiles:
+    - extensions-image
   database-image:
     extends:
       file: ./compose.database-image.yaml
@@ -53,6 +65,12 @@ services:
       service: libraries_mecha-compute-image
     profiles:
     - compute-image
+  activepieces-image:
+    extends:
+      file: ./compose.activepieces-image.yaml
+      service: libraries_mecha-activepieces-image
+    profiles:
+    - activepieces-image
   airlock-image:
     extends:
       file: ./compose.airlock-image.yaml
@@ -86,12 +104,12 @@ services:
     profiles:
     - arroyo
     scale: 1
-  bifrost:
+  tsbifrost:
     extends:
-      file: ./compose.bifrost.yaml
-      service: libraries_mecha-bifrost
+      file: ./compose.tsbifrost.yaml
+      service: libraries_mecha-tsbifrost
     profiles:
-    - bifrost
+    - tsbifrost
     scale: 1
   nubox:
     extends:
