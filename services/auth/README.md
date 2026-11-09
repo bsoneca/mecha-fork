@@ -33,6 +33,17 @@ The alternative was server-side sessions. It was refused because the WebAuthn
 challenge is the only state a ceremony needs, and a short-lived `state` JWT
 carries it without giving the service anything to lose on restart.
 
+## Passkeys from an Android app
+
+A passkey an Android app makes through Credential Manager carries no page origin:
+its client data names the app's signing certificate,
+`android:apk-key-hash:<SHA-256, base64url, unpadded>`. Android admits the app to
+the web's relying party only where the door's Digital Asset Links name it.
+`WEBAUTHN_ANDROID_ORIGINS` lists the app's release certificates' SHA-256
+fingerprints, as `keytool -list` prints them, comma-separated (`origins.ts`).
+Both ceremonies admit each one beside `WEBAUTHN_ORIGIN`. A fingerprint that is
+not 32 bytes stops the service at startup. Unset, the door admits no app.
+
 ## Provider sign-in
 
 A provider `signIn` names (`oidc.ts`) signs a person in by OpenID Connect's
