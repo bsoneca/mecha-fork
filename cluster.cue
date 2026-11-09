@@ -323,6 +323,14 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		if len(signIn) > 0 {
 			auth: true
 		}
+		// The program's Android builds whose passkeys the door admits, by the
+		// SHA-256 fingerprints of the certificates that sign them
+		// (services/auth/origins.ts). The deployment's WEBAUTHN_ANDROID_ORIGINS
+		// wins. An app's passkeys presuppose `auth`.
+		android: [...string & =~"^[0-9A-F]{2}(:[0-9A-F]{2}){31}$"]
+		if len(android) > 0 {
+			auth: true
+		}
 
 		// The change feed: conduit reading the WAL onto the bus (redis, behind
 		// the mesh-events sidecar) and transform running the pipelines off it.
@@ -833,9 +841,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							// The door's port is the host's pick; auth reads this
 							// default as whichever port the request came through.
 							WEBAUTHN_ORIGIN: "${WEBAUTHN_ORIGIN:-https://localhost:*}"
-							// The app's Android builds by their signing certificates'
-							// SHA-256 fingerprints (services/auth/origins.ts); none by default.
-							WEBAUTHN_ANDROID_ORIGINS: "${WEBAUTHN_ANDROID_ORIGINS:-}"
+							// The app's Android builds by their signing certificates
+							// (capabilities.android); none by default.
+							WEBAUTHN_ANDROID_ORIGINS: "${WEBAUTHN_ANDROID_ORIGINS:-\(strings.Join(X.capabilities.android, ","))}"
 							OIDC_PROVIDERS:  strings.Join([for p, _ in X.capabilities.signIn {p}], ",")
 							for p, d in X.capabilities.signIn {
 								let k = "OIDC_\(strings.ToUpper(p))_CLIENT_ID"

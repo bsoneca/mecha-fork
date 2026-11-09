@@ -614,6 +614,19 @@ Deno.test("a sign-in provider turns auth on and reaches it as a required client,
   assert.equal((await exported({}, "capabilities", { signIn: { "My-Space": { issuer: "https://id.example.com" } } })).ok, false);
 });
 
+// The app's Android builds' certificates reach the auth service as the default
+// of WEBAUTHN_ANDROID_ORIGINS, which a deployment may still set.
+Deno.test("an app's Android certificates turn auth on and default its Android origins", async () => {
+  const fp = "FA:C6:17:45:DC:09:03:78:6F:B9:ED:E6:2A:96:2B:39:9F:73:48:F0:BB:6F:89:9B:83:32:66:75:91:03:3B:9C";
+  const env = await exported({}, "surface.targets.auth.compose.environment", { android: [fp, fp.replace("FA", "00")] });
+  assert.equal(env.ok, true, env.stderr);
+  assert.equal(env.value.WEBAUTHN_ANDROID_ORIGINS, `\${WEBAUTHN_ANDROID_ORIGINS:-${fp},${fp.replace("FA", "00")}}`);
+  const none = await exported({}, "surface.targets.auth.compose.environment", { auth: true });
+  assert.equal(none.value.WEBAUTHN_ANDROID_ORIGINS, "${WEBAUTHN_ANDROID_ORIGINS:-}");
+  assert.equal((await exported({}, "capabilities", { android: [fp], auth: false })).ok, false);
+  assert.equal((await exported({}, "capabilities", { android: ["fa:c6"] })).ok, false);
+});
+
 // A provider the service has no preset for is the issuer the program names in
 // its place (an identity broker's phone sign-in), beside Google.
 Deno.test("a provider with no preset signs in through the issuer the program names", async () => {
