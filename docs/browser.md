@@ -18,7 +18,7 @@ the change path does is best-effort.
 
 - **`createCluster`** ([`cluster.ts`](../packages/mecha-browser/cluster.ts)) is
   the whole cluster behind one fetch handler, a `Request` in and a `Response`
-  out. It answers `/auth/guest`, `/auth/shape`, `/auth/whoami`, `/crud/*` and
+  out. It answers `/auth/guest`, `/auth/shape`, `/auth/whoami`, `/auth/door`, `/crud/*` and
   `/electric/v1/shape`, the routes a server cluster's auth service, PostgREST
   and Electric answer. The embedder routes those paths of its fetch to `handle`
   and supplies the PGlite instance. The bare imports are pinned in

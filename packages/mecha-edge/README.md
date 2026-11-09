@@ -22,6 +22,7 @@ class, given PGlite's assets and the tables that carry shapes:
 |---|---|---|
 | `POST /auth/guest` | a new `app_user` row and its session token | nothing |
 | `GET /auth/whoami` | the session's subject | a session |
+| `GET /auth/door` | `204`, with `X-Pronto-Account` for a verified session and without it for none: the door's `forward_auth`, which a `401` would break | nothing |
 | `POST /auth/register/*`, `POST /auth/login/*` | the auth service's passkey ceremonies: a new account, a guest's promotion, a sign-in | a guest's session to promote one |
 | `/auth/oidc/*` | provider sign-in, the auth service's own routes ([its README](../../services/auth/README.md#provider-sign-in)) | a provider `OIDC_PROVIDERS` names |
 | `POST /auth/shape` | a shape token naming the table and the `where` the client must send | a session |

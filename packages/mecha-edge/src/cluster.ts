@@ -7,7 +7,7 @@
 // auth service's oidc.ts), over this connection: nothing here migrates but
 // webauthn_credential and identity_link, which the auth service makes for
 // itself too.
-// Routes: /auth/guest, /auth/whoami, /auth/shape, /auth/register/start,
+// Routes: /auth/guest, /auth/whoami, /auth/door, /auth/shape, /auth/register/start,
 // /auth/register/verify, /auth/login/start, /auth/login/verify, /auth/oidc/*,
 // /crud/*, /electric/v1/shape.
 import type { PGlite } from '@electric-sql/pglite'
@@ -286,6 +286,14 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     const claims = await session(req)
     if (!claims) return json(401, { error: 'invalid token' })
     return json(200, { id: claims.sub, handle: claims.handle })
+  }
+
+  /** The door's forward_auth: always 2xx, naming the account only for a verified session (services/auth/main.ts). */
+  async function door(req: Request): Promise<Response> {
+    const claims = await session(req)
+    const headers = new Headers()
+    if (typeof claims?.sub === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(claims.sub)) headers.set('x-pronto-account', claims.sub)
+    return new Response(null, { status: 204, headers })
   }
 
   async function readState(body: Record<string, unknown>, purpose: string): Promise<Record<string, unknown> | null> {
@@ -611,6 +619,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
       if (signedIn !== null) return await signedIn
       if (req.method === 'POST' && path === '/auth/guest') return await guest()
       if (req.method === 'GET' && path === '/auth/whoami') return await whoami(req)
+      if (req.method === 'GET' && path === '/auth/door') return await door(req)
       if (req.method === 'POST' && path === '/auth/shape') return await shapeToken(req)
       if (req.method === 'POST' && path === '/auth/register/start') return await registerStart(req)
       if (req.method === 'POST' && path === '/auth/register/verify') return await registerVerify(req)

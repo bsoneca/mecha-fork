@@ -44,6 +44,19 @@ Deno.test('request views boot without shapes while physical server sources still
   }
 })
 
+Deno.test('the door route answers 204 naming the page\'s one user', async () => {
+  const db = await PGlite.create()
+  try {
+    const cluster = await createCluster({ db, sql: [rls, schema, 'CREATE ROLE app_user;'], tables: ['flag'], log: console.error, fail: (e) => { throw e } })
+    const session = await (await cluster.handle(new Request('http://cluster.local/auth/guest', { method: 'POST' }))).json() as { user: { id: string } }
+    const door = await cluster.handle(new Request('http://cluster.local/auth/door'))
+    assert.equal(door.status, 204)
+    assert.equal(door.headers.get('x-pronto-account'), session.user.id)
+  } finally {
+    await db.close()
+  }
+})
+
 Deno.test('a live view still fails the shape primary-key contract', async () => {
   const db = await PGlite.create()
   try {

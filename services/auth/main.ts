@@ -658,6 +658,20 @@ async function whoami(req: Request): Promise<Response> {
   return json(200, { id: claims.sub, handle: claims.handle });
 }
 
+// What the door asks before it proxies a request whose answer depends on who is
+// asking (Caddy's forward_auth): the session's account in X-Pronto-Account. It
+// always answers 2xx, which forward_auth would hand back to the page as the
+// answer, so a signed-out visitor, or a bad or foreign token, gets the same 204
+// without the header: the door then sends its own "no account" value, never the
+// page's. whoami's 401 would break the page for everyone signed out.
+async function door(req: Request): Promise<Response> {
+  const subject = await subjectOf(req);
+  const sub = subject !== "refused" && subject.claims ? subject.claims.sub : null;
+  const headers = new Headers();
+  if (typeof sub === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(sub)) headers.set("x-pronto-account", sub);
+  return new Response(null, { status: 204, headers });
+}
+
 export const links: Links = {
   userFor(p: Profile) {
     return sql.begin(async (tx) => {
@@ -724,6 +738,9 @@ export async function handler(req: Request): Promise<Response> {
     }
     if (req.method === "GET" && path === "/auth/whoami") {
       return await whoami(req);
+    }
+    if (req.method === "GET" && path === "/auth/door") {
+      return await door(req);
     }
     if (req.method === "POST" && path === "/auth/shape") {
       return await shapeToken(req);
