@@ -25,6 +25,7 @@ import {
   verifyJwt as verify,
 } from "./jwt.ts";
 import { type Links, oidc, type Profile, providersFrom } from "./oidc.ts";
+import { androidOrigins } from "./origins.ts";
 export { shapeWhere };
 
 function required(name: string): string {
@@ -75,6 +76,8 @@ export function admittedOrigin(rpId: string, origin: string): string {
 
 const RP_ID = required("WEBAUTHN_RP_ID");
 const ORIGIN = admittedOrigin(RP_ID, required("WEBAUTHN_ORIGIN"));
+// The app's Android builds, by their signing certificates (origins.ts): admitted beside the web origin.
+const ANDROID_ORIGINS = androidOrigins(Deno.env.get("WEBAUTHN_ANDROID_ORIGINS"));
 const OIDC_PROVIDERS = providersFrom((name) => Deno.env.get(name));
 
 /**
@@ -524,7 +527,7 @@ async function registerVerify(req: Request): Promise<Response> {
       // deno-lint-ignore no-explicit-any
       response: body.response as any,
       expectedChallenge: st.challenge as string,
-      expectedOrigin: ceremonyOrigin(ORIGIN, req.headers.get("host")),
+      expectedOrigin: [ceremonyOrigin(ORIGIN, req.headers.get("host")), ...ANDROID_ORIGINS],
       expectedRPID: RP_ID,
       requireUserVerification: false,
     });
@@ -606,7 +609,7 @@ async function loginVerify(req: Request): Promise<Response> {
       // deno-lint-ignore no-explicit-any
       response: body.response as any,
       expectedChallenge: st.challenge as string,
-      expectedOrigin: ceremonyOrigin(ORIGIN, req.headers.get("host")),
+      expectedOrigin: [ceremonyOrigin(ORIGIN, req.headers.get("host")), ...ANDROID_ORIGINS],
       expectedRPID: RP_ID,
       requireUserVerification: false,
       authenticator: {

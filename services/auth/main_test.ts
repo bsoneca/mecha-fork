@@ -2,6 +2,7 @@
 // environment main.ts reads as the dev cluster sets it (cluster.cue). app_user is owned elsewhere (see main.ts); tests
 // create a minimal stand-in before running the service's own migration
 // against it.
+import { ANDROID_FINGERPRINT } from "./main_test_env.ts";
 import { fileURLToPath } from "node:url";
 import {
   assert,
@@ -11,6 +12,7 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1.0.13";
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
+import { androidOrigin } from "./origins.ts";
 import { admittedOrigin, ceremonyOrigin, handler, issueUserToken, links, migrate, signJwt, sql, verifyJwt } from "./main.ts";
 
 await sql`CREATE TABLE IF NOT EXISTS app_user (
@@ -952,6 +954,45 @@ Deno.test({
       assertEquals(res.status, 401, `${origin} at ${door}`);
     }
   },
+});
+
+Deno.test({
+  name: "a passkey made by the app's Android build registers and signs in; another app's is refused",
+  ...opts,
+  async fn() {
+    // Credential Manager names no page: the client data carries the app's signing certificate.
+    const door = "localhost:54321";
+    const app = androidOrigin(ANDROID_FINGERPRINT);
+    const key = await passkey();
+    const reg = await (await handler(atDoor("/auth/register/start", {}, door))).json();
+    const made = await handler(atDoor("/auth/register/verify", { state: reg.state, response: key.register(reg.challenge, app) }, door));
+    assertEquals(made.status, 200, await made.clone().text());
+    const user = (await made.json()).user;
+    const login = await (await handler(atDoor("/auth/login/start", {}, door))).json();
+    const signed = await handler(
+      atDoor("/auth/login/verify", { state: login.state, response: await key.login(login.challenge, app) }, door),
+    );
+    assertEquals(signed.status, 200, await signed.clone().text());
+    assertEquals((await signed.json()).user, user);
+
+    const other = androidOrigin("00".repeat(32));
+    const again = await (await handler(atDoor("/auth/register/start", {}, door))).json();
+    const refused = await handler(
+      atDoor("/auth/register/verify", { state: again.state, response: (await passkey()).register(again.challenge, other) }, door),
+    );
+    assertEquals(refused.status, 401);
+  },
+});
+
+Deno.test("a malformed Android fingerprint is refused at startup", async () => {
+  const { success, stderr } = await new Deno.Command(Deno.execPath(), {
+    args: ["run", "-A", "--frozen", fileURLToPath(new URL("./main.ts", import.meta.url))],
+    env: { WEBAUTHN_RP_ID: "localhost", WEBAUTHN_ORIGIN: "https://localhost:*", WEBAUTHN_ANDROID_ORIGINS: "AB:CD" },
+    stdout: "null",
+    stderr: "piped",
+  }).output();
+  assert(!success);
+  assertStringIncludes(new TextDecoder().decode(stderr), "is not a SHA-256 certificate fingerprint");
 });
 
 Deno.test("the dev door admits only the localhost relying party, at startup", async () => {

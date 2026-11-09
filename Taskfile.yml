@@ -67,10 +67,10 @@ tasks:
       - mise x -- deno test --allow-all host_test.ts
 
   test:auth:
-    desc: "OIDC authorization, issuer isolation and browser sessions"
+    desc: "OIDC authorization, issuer isolation, browser sessions and Android origins"
     dir: services/auth
     cmds:
-      - mise x -- deno test --frozen oidc_test.ts
+      - mise x -- deno test --frozen oidc_test.ts origins_test.ts
 
   test:browser:
     desc: "browser PostgREST reads under their request scopes"
