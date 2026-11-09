@@ -42,7 +42,8 @@ the web's relying party only where the door's Digital Asset Links name it.
 `WEBAUTHN_ANDROID_ORIGINS` lists the app's release certificates' SHA-256
 fingerprints, as `keytool -list` prints them, comma-separated (`origins.ts`).
 Both ceremonies admit each one beside `WEBAUTHN_ORIGIN`. A fingerprint that is
-not 32 bytes stops the service at startup. Unset, the door admits no app.
+not 32 bytes stops the service at startup. Unset, the door admits no app. A
+program declares them as `capabilities.android`, the variable's default.
 
 ## Provider sign-in
 
