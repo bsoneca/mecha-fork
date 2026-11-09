@@ -19,6 +19,8 @@ package cluster
 	id:           =~"^[a-z][a-z0-9_]{0,30}$"
 	initial:      string
 	description?: string
+	meta?:        {...}
+	invoke?:      #XStateInvoke | [...#XStateInvoke]
 	// Taken in every state, as XState lets an event a state leaves unhandled
 	// reach the machine. A state does not take the same event: XState would
 	// fall back to the machine's transition when the state's guard refuses,
@@ -48,6 +50,7 @@ package cluster
 })
 
 #XStateTransition: close({
+	reenter?:     bool
 	target?:      string
 	guard?:       string
 	actions?:     string | [...string]
@@ -58,23 +61,40 @@ package cluster
 
 // A value's shape, checked at every step: what XState's `types` states for
 // context, input and events, as data the database and the browser both check.
-#Shape: {
-	type:      "string"
-	maxLength: int & >=0 & <=65536
-	values?: [...string]
-} | {
-	type: "integer"
-	min:  int & >=-9007199254740991
-	max:  int & <=9007199254740991 & >=min
-} | {
-	type: "boolean"
-} | {
-	type:     "array"
-	maxItems: int & >=0 & <=1024
-	items:    #Shape
-} | {
-	type: "object"
-	fields: [string]: #Shape
+#Shape: S={
+	type: "string" | "integer" | "boolean" | "array" | "object"
+	if S.type == "string" {
+		close({
+			type:      "string"
+			maxLength: int & >=0 & <=65536
+			values?: [...string]
+		})
+	}
+	if S.type == "integer" {
+		close({
+			type: "integer"
+			min:  int & >=-9007199254740991
+			max:  int & <=9007199254740991 & >=S.min
+		})
+	}
+	if S.type == "boolean" {
+		close({
+			type: "boolean"
+		})
+	}
+	if S.type == "array" {
+		close({
+			type:     "array"
+			maxItems: int & >=0 & <=1024
+			items:    #Shape
+		})
+	}
+	if S.type == "object" {
+		close({
+			type: "object"
+			fields: [string]: #Shape
+		})
+	}
 }
 
 // What a rule may read beside the context it steps: who sent the event, the

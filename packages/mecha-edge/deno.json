@@ -2,12 +2,19 @@
   "nodeModulesDir": "auto",
   "imports": {
     "@electric-sql/pglite": "npm:@electric-sql/pglite@0.5.8",
+    "@electric-sql/pglite-icu-full": "npm:@electric-sql/pglite-icu-full@0.0.2",
     "@simplewebauthn/server": "npm:@simplewebauthn/server@10.0.1",
+    "graphile-worker": "npm:graphile-worker@0.18.0",
     "croner": "npm:croner@10.0.1",
     "@mecha/postgrest-js": "../postgrest-js/src/index.ts",
     "../postgrest-js/src/rest-handler.js": "../postgrest-js/src/rest-handler.ts",
     "../postgrest-js/src/rest-read.js": "../postgrest-js/src/rest-read.ts",
-    "../postgrest-js/src/validate.js": "../postgrest-js/src/validate.ts"
+    "../postgrest-js/src/validate.js": "../postgrest-js/src/validate.ts",
+    "fast-png": "npm:fast-png@6.4.0",
+    "jpeg-js": "npm:jpeg-js@0.4.4",
+    "@electric-sql/pglite-pg_ivm": "npm:@electric-sql/pglite-pg_ivm@0.0.9",
+    "@mecha/incremental-views": "../incremental-views/runtime.ts",
+    "@cloudflare/containers": "npm:@cloudflare/containers@0.3.7"
   },
   "compilerOptions": {
     "types": [

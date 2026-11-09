@@ -18,11 +18,14 @@ import {
   verifyRegistrationResponse,
 } from '@simplewebauthn/server'
 import { createRestHandler, planRead, ReadQueryError, type ReadSchema } from '@mecha/postgrest-js'
-import { shapeWhere, signJwt, verifyJwt } from '../../../services/auth/jwt.ts'
+import { isSession, PUBLIC_WHERE, shapeWhere, signJwt, verifyJwt } from '../../../services/auth/jwt.ts'
 import { type Links, oidc, type Profile, type Provider } from '../../../services/auth/oidc.ts'
+import { prepareAuthTables, sealAuthTables } from '../../../services/auth/schema.ts'
 import { createDrains, type Drain, type Drains } from '../../mecha-browser/drains.ts'
 import { createShapes } from '../../mecha-browser/shapes.ts'
 import { publicSnapshot, PublicSnapshotCapacity, type PublicSnapshot } from './public-snapshot.ts'
+import { createSnapshotCoordinator, NOTIFY_CHANNEL, type BatchMachine, type Computation, type Output, type Snapshot, type SnapshotCoordinator, type SnapshotIdentity } from '../../compute-snapshot/src/index.ts'
+import { lanes } from './lanes.ts'
 
 export interface EdgeClusterConfig {
   db: PGlite
@@ -38,6 +41,7 @@ export interface EdgeClusterConfig {
   drains?: Drain[]
   /** The earliest retry of a failed drain moved (drains.ts). */
   retry?: () => void
+  compute?: { computations: Computation[]; machine: BatchMachine; retainSnapshot?(identity: SnapshotIdentity): Promise<void>; execute?(snapshot: Snapshot): Promise<Output>; changed(): void }
   rpId?: string
   origin?: string
   /** The providers a person may sign in through (oidc.ts's providersFrom),
@@ -50,6 +54,8 @@ export interface EdgeCluster {
   /** A /crud/* request as the service role, for the object's own clock:
    * what the ticker writes on the container tier. Never routed. */
   service: (req: Request) => Promise<Response>
+  /** Runs `fn` on the cluster's serialized PGlite queue after shape triggers
+   * are installed. */
   serialize: <T>(fn: () => Promise<T>, priority?: 'high' | 'low') => Promise<T>
   publicSnapshot<T>(generation: string, use: (snapshot: PublicSnapshot) => Promise<T>, priority?: 'high' | 'low'): Promise<T>
   /** The drains, installed and called once on first use: never by a boot
@@ -57,6 +63,8 @@ export interface EdgeCluster {
   drains: () => Promise<Drains>
   /** The drains once installed, or null. */
   installed: () => Drains | null
+  compute(): Promise<SnapshotCoordinator | null>
+  read<T>(use: () => Promise<T>): Promise<T>
 }
 
 // The auth service's lifetimes (services/auth/main.ts).
@@ -83,33 +91,12 @@ const now = () => Math.floor(Date.now() / 1000)
 
 export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeCluster> {
   const { db, secret, log } = cfg
-  // PGlite is one connection: interactive renders and API reads/writes take
-  // the high lane ahead of background shape tokens, subset snapshots, and
-  // prefetches, with 1 low turn after every 4 consecutive high turns.
-  let running = false
-  let highStreak = 0
-  const high: Array<() => void> = []
-  const low: Array<() => void> = []
-  function pump() {
-    if (running) return
-    const takeLow = low.length > 0 && (high.length === 0 || highStreak >= 4)
-    const next = takeLow ? low.shift() : high.shift()
-    if (!next) return
-    highStreak = takeLow ? 0 : highStreak + 1
-    running = true
-    next()
-  }
-  function serialize<T>(fn: () => Promise<T>, priority: 'high' | 'low' = 'high'): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      ;(priority === 'high' ? high : low).push(() => {
-        Promise.resolve().then(fn).then(resolve, reject).finally(() => {
-          running = false
-          pump()
-        })
-      })
-      pump()
-    })
-  }
+  const lane = lanes()
+  // Interactive API work takes the api lane, a shape's reach among it: a screen mounts only once
+  // its shapes answer, and in the low lane that waited behind every render and background drain.
+  // Subset snapshots and prefetches take the low one.
+  const serialize = <T>(fn: () => Promise<T>, priority: 'high' | 'low' = 'high'): Promise<T> =>
+    lane(fn, priority === 'high' ? 'api' : 'low')
   const serializeLow = <T>(fn: () => Promise<T>): Promise<T> => serialize(fn, 'low')
   let shapes: Awaited<ReturnType<typeof createShapes>>
   let shapesReady: Promise<void> | undefined
@@ -157,30 +144,27 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     for (const row of rows) publicCache.set(row.name, row.p)
   }
   let authTablesReady: Promise<void> | undefined
+  // The passkeys live in mecha_auth, as the host auth service keeps them
+  // (services/auth/schema.ts); the REST handler serves public alone.
   const createAuthTables = async () => {
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS webauthn_credential (
-        id text primary key,
-        user_id uuid not null references app_user(id) on delete cascade,
-        public_key bytea not null,
-        counter bigint not null default 0
-      );
-      ALTER TABLE webauthn_credential ENABLE ROW LEVEL SECURITY;
-      REVOKE ALL ON webauthn_credential FROM PUBLIC;
-      DO $$
-      DECLARE
-        r text;
-      BEGIN
-        FOR r IN SELECT rolname FROM pg_roles WHERE rolname IN ('app_user', 'service', 'anon') LOOP
-          EXECUTE format('REVOKE ALL ON webauthn_credential FROM %I', r);
-        END LOOP;
-      END $$;
-    `)
+    await db.transaction(async (tx) => {
+      await tx.exec(prepareAuthTables(['webauthn_credential']))
+      await tx.exec(sealAuthTables(['webauthn_credential']))
+    })
   }
   const ensureAuthTables = () => authTablesReady ??= serialize(createAuthTables).catch((e) => {
     authTablesReady = undefined
     throw e
   })
+  // Before the cluster answers anything: an earlier release's table in public
+  // moves, and the grants are taken back, where the cluster keeps passkeys.
+  // One that has none makes its tables at the first ceremony.
+  {
+    const { rows: [held] } = await db.query<{ passkeys: boolean }>(
+      `SELECT to_regclass('public.webauthn_credential') IS NOT NULL OR to_regnamespace('mecha_auth') IS NOT NULL AS passkeys`,
+    )
+    if (held.passkeys) await ensureAuthTables()
+  }
 
   // As the auth service makes it (services/auth/main.ts's migrate), once,
   // before the first provider sign-in reads it: a provider's subject, under
@@ -192,48 +176,29 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
   // refused, and nothing changed, until its owner adds it. Passkeys go on.
   let linksReady: Promise<void> | undefined
   const ensureLinks = () => linksReady ??= serialize(() => db.transaction(async (tx) => {
-    await tx.exec(`
-      CREATE TABLE IF NOT EXISTS identity_link (
-        provider text not null,
-        issuer text not null,
-        sub text not null,
-        user_id uuid not null unique references app_user(id) on delete cascade,
-        created_at timestamptz not null default now(),
-        name text,
-        picture text,
-        email text,
-        primary key (provider, issuer, sub)
-      );
-      ALTER TABLE identity_link ADD COLUMN IF NOT EXISTS issuer text,
-        ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text,
-        ADD COLUMN IF NOT EXISTS email text;
-    `)
+    // In mecha_auth beside the passkeys (services/auth/schema.ts), moved from
+    // public where an earlier edge made it there.
+    await tx.exec(prepareAuthTables(['identity_link']))
+    await tx.exec(`ALTER TABLE mecha_auth.identity_link ADD COLUMN IF NOT EXISTS issuer text,
+      ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text,
+      ADD COLUMN IF NOT EXISTS email text`)
     for (const [name, p] of Object.entries(cfg.providers ?? {})) {
-      await tx.query('UPDATE identity_link SET issuer = $2 WHERE provider = $1 AND issuer IS NULL', [name, p.issuer])
+      await tx.query('UPDATE mecha_auth.identity_link SET issuer = $2 WHERE provider = $1 AND issuer IS NULL', [name, p.issuer])
     }
-    const [legacy] = (await tx.query<{ unassigned: boolean }>('SELECT EXISTS (SELECT 1 FROM identity_link WHERE issuer IS NULL) AS unassigned')).rows
+    const [legacy] = (await tx.query<{ unassigned: boolean }>('SELECT EXISTS (SELECT 1 FROM mecha_auth.identity_link WHERE issuer IS NULL) AS unassigned')).rows
     if (legacy.unassigned) throw new Error('identity_link has unassigned issuers: add and populate its issuer column from the original identity provider before signing in through one')
     await tx.exec(`
-      ALTER TABLE identity_link ALTER COLUMN issuer SET NOT NULL;
+      ALTER TABLE mecha_auth.identity_link ALTER COLUMN issuer SET NOT NULL;
       DO $$ BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_constraint c
           JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
-          WHERE c.conrelid = 'identity_link'::regclass AND c.contype = 'p' AND a.attname = 'issuer') THEN
-          ALTER TABLE identity_link DROP CONSTRAINT identity_link_pkey;
-          ALTER TABLE identity_link ADD PRIMARY KEY (provider, issuer, sub);
+          WHERE c.conrelid = 'mecha_auth.identity_link'::regclass AND c.contype = 'p' AND a.attname = 'issuer') THEN
+          ALTER TABLE mecha_auth.identity_link DROP CONSTRAINT identity_link_pkey;
+          ALTER TABLE mecha_auth.identity_link ADD PRIMARY KEY (provider, issuer, sub);
         END IF;
       END $$;
-      ALTER TABLE identity_link ENABLE ROW LEVEL SECURITY;
-      REVOKE ALL ON identity_link FROM PUBLIC;
-      DO $$
-      DECLARE
-        r text;
-      BEGIN
-        FOR r IN SELECT rolname FROM pg_roles WHERE rolname IN ('app_user', 'service', 'anon') LOOP
-          EXECUTE format('REVOKE ALL ON identity_link FROM %I', r);
-        END LOOP;
-      END $$;
     `)
+    await tx.exec(sealAuthTables(['identity_link']))
   })).catch((e) => {
     linksReady = undefined
     throw e
@@ -254,6 +219,14 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
       drainsReady = undefined
       throw e
     })
+  let computeReady: Promise<SnapshotCoordinator | null> | undefined
+  const compute = () => computeReady ??= (async () => {
+    if (!cfg.compute?.computations.length) return null
+    await ensureShapes()
+    const coordinator = await createSnapshotCoordinator({ db, serialize: serializeLow, ...cfg.compute })
+    await db.listen(NOTIFY_CHANNEL, () => cfg.compute!.changed())
+    return coordinator
+  })().catch(error => { computeReady = undefined; throw error })
   const publicOnly = async (table: string) => {
     const hit = publicCache.get(table)
     if (hit !== undefined) return hit
@@ -271,7 +244,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
   /** A session's claims, or null: a shape token is no session. */
   async function session(req: Request): Promise<Claims | null> {
     const claims = await bearer(req)
-    return claims && claims.role === 'app_user' && typeof claims.sub === 'string' ? claims : null
+    return isSession(claims) ? claims : null
   }
 
   async function guest(): Promise<Response> {
@@ -361,9 +334,9 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     if (st.promote === true) {
       const added = await serialize(() =>
         db.query(
-          `INSERT INTO webauthn_credential (id, user_id, public_key, counter)
+          `INSERT INTO mecha_auth.webauthn_credential (id, user_id, public_key, counter)
            SELECT $1, $2, $3, $4
-           WHERE NOT EXISTS (SELECT 1 FROM webauthn_credential WHERE user_id = $2)`,
+           WHERE NOT EXISTS (SELECT 1 FROM mecha_auth.webauthn_credential WHERE user_id = $2)`,
           [credentialID, userId, credentialPublicKey, counter],
         ),
       )
@@ -380,7 +353,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
           try {
             await db.query('INSERT INTO app_user (id, handle) VALUES ($1, $2)', [userId, handle])
             await db.query(
-              'INSERT INTO webauthn_credential (id, user_id, public_key, counter) VALUES ($1, $2, $3, $4)',
+              'INSERT INTO mecha_auth.webauthn_credential (id, user_id, public_key, counter) VALUES ($1, $2, $3, $4)',
               [credentialID, userId, credentialPublicKey, counter],
             )
             await db.query('COMMIT')
@@ -430,7 +403,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     const { rows: creds } = await serialize(() =>
       db.query<{ id: string; public_key: Uint8Array; counter: number | bigint; user_id: string; handle: string }>(
         `SELECT c.id, c.public_key, c.counter, c.user_id, u.handle
-         FROM webauthn_credential c JOIN app_user u ON u.id = c.user_id
+         FROM mecha_auth.webauthn_credential c JOIN app_user u ON u.id = c.user_id
          WHERE c.id = $1`,
         [response.id],
       ),
@@ -459,7 +432,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     }
     if (!verification.verified) return json(401, { error: 'authentication verification failed' })
     await serialize(() =>
-      db.query('UPDATE webauthn_credential SET counter = $1 WHERE id = $2', [
+      db.query('UPDATE mecha_auth.webauthn_credential SET counter = $1 WHERE id = $2', [
         verification.authenticationInfo.newCounter,
         cred.id,
       ]),
@@ -476,7 +449,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
       await ensureLinks()
       return serialize(() => db.transaction(async (tx) => {
         const [link] = (await tx.query<{ user_id: string }>(
-          'UPDATE identity_link SET name = $4, picture = $5, email = $6 WHERE provider = $1 AND issuer = $2 AND sub = $3 RETURNING user_id',
+          'UPDATE mecha_auth.identity_link SET name = $4, picture = $5, email = $6 WHERE provider = $1 AND issuer = $2 AND sub = $3 RETURNING user_id',
           [p.provider, p.issuer, p.sub, p.name, p.picture, p.email],
         )).rows
         if (link) {
@@ -496,7 +469,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
             continue
           }
           await tx.query(
-            'INSERT INTO identity_link (provider, issuer, sub, user_id, name, picture, email) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+            'INSERT INTO mecha_auth.identity_link (provider, issuer, sub, user_id, name, picture, email) VALUES ($1, $2, $3, $4, $5, $6, $7)',
             [p.provider, p.issuer, p.sub, id, p.name, p.picture, p.email],
           )
           return { id, handle }
@@ -508,7 +481,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
       await ensureLinks()
       const [u] = (await serialize(() => db.query<{ handle: string }>(
         `SELECT u.handle FROM app_user u
-          WHERE u.id = $1 AND EXISTS (SELECT 1 FROM identity_link l WHERE l.user_id = u.id AND l.provider = $2 AND l.issuer = $3)`,
+          WHERE u.id = $1 AND EXISTS (SELECT 1 FROM mecha_auth.identity_link l WHERE l.user_id = u.id AND l.provider = $2 AND l.issuer = $3)`,
         [id, provider, issuer],
       ))).rows
       return u ? u.handle : null
@@ -537,7 +510,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     const table = body.table
     const scopes = publicCache.get(table) === true
       ? ['public:']
-      : await serialize(async () => (await publicOnly(table)) ? ['public:'] : await scopesOf(claims.sub as string), 'low')
+      : await serialize(async () => (await publicOnly(table)) ? ['public:'] : await scopesOf(claims.sub as string))
     const where = shapeWhere(scopes)
     const token = await signJwt(secret, { typ: 'shape', table, where, sub: claims.sub, exp: now() + SHAPE_TOKEN_TTL_S })
     return json(200, { token, table, where, expires_in: SHAPE_TOKEN_TTL_S })
@@ -548,14 +521,21 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
   // subject's scopes now, read where the log is filtered.
   async function shape(req: Request): Promise<Response> {
     const claims = await bearer(req)
-    if (!claims || claims.typ !== 'shape' || typeof claims.sub !== 'string') return json(401, { error: 'invalid shape token' })
     const p = new URL(req.url).searchParams
+    // A session stands for its own public shapes, as the auth service's gate admits them.
+    if (isSession(claims)) {
+      const table = p.get('table')
+      if (!table || !shapes.has(table)) return json(403, { error: 'table not authorized' })
+      if (p.get('where') !== PUBLIC_WHERE) return json(403, { error: 'where not authorized' })
+      return shapes.serve(req, () => Promise.resolve(['public:']))
+    }
+    if (!claims || claims.typ !== 'shape' || typeof claims.sub !== 'string') return json(401, { error: 'invalid shape token' })
     if (p.get('table') !== claims.table) return json(403, { error: 'table not authorized' })
     if (p.get('where') !== claims.where) return json(403, { error: 'where not authorized' })
     const table = claims.table as string
     const reachOf = () => publicCache.get(table) === true
       ? Promise.resolve(['public:'])
-      : serialize(async () => (await publicOnly(table)) ? ['public:'] : await scopesOf(claims.sub as string), 'low')
+      : serialize(async () => (await publicOnly(table)) ? ['public:'] : await scopesOf(claims.sub as string))
     return shapes.serve(req, reachOf)
   }
 
@@ -602,6 +582,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
 
   async function service(req: Request): Promise<Response> {
     await ensureShapes()
+    await compute()
     await drains()
     const u = new URL(req.url)
     u.pathname = u.pathname.replace(/^\/crud/, '')
@@ -614,6 +595,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     const path = new URL(req.url).pathname
     try {
       await ensureShapes()
+      await compute()
       await drains()
       const signedIn = providerSignIn(req)
       if (signedIn !== null) return await signedIn
@@ -638,9 +620,14 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
   return {
     handle,
     service,
+    async serialize<T>(fn: () => Promise<T>, priority: 'high' | 'low' = 'high'): Promise<T> {
+      await ensureShapes()
+      return await serialize(fn, priority)
+    },
     drains,
-    serialize,
     installed: () => installed,
+    compute,
+    read: serializeLow,
     async publicSnapshot(generation, use, priority = 'high') {
       // Admit per lane before joining the database queue so queued low-priority
       // prefetches cannot starve interactive renders, and each lane stays bounded.
@@ -648,7 +635,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
       pendingSnapshots[priority]++
       try {
         await drains()
-        return await serialize(() => publicSnapshot(db, generation, use, cfg.schema), priority)
+        return await lane(() => publicSnapshot(db, generation, use, cfg.schema), priority === 'high' ? 'render' : 'low')
       }
       finally { pendingSnapshots[priority]-- }
     },

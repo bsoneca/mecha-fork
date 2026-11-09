@@ -7,7 +7,8 @@
 
 import pg from "pg";
 import { hold, start } from "./airlock.ts";
-import { admitAll, bindingsTransport } from "./handler.ts";
+import { daprBlobs } from "./blobs.ts";
+import { admitAll, meshTransport } from "./handler.ts";
 
 function required(name: string): string {
   const value = Deno.env.get(name);
@@ -20,6 +21,8 @@ if (import.meta.main) {
   const mesh = required("MESH_URL");
   const dir = required("AIRLOCK_DIR");
   const { effects, handlers } = await admitAll(`${dir}/effects.json`, dir);
+  // Where a bridge names its targets, the release names this one.
+  const target = Object.values(effects).some((e) => e.bridge !== undefined) ? required("AIRLOCK_TARGET") : undefined;
   // Read once here and handed to the handler at each call; written nowhere, not
   // the manifest and not the ledger.
   const secrets = Object.fromEntries(
@@ -40,8 +43,13 @@ if (import.meta.main) {
   );
   const db = new pg.Pool({ connectionString });
   const { key } = await hold(connectionString);
-  const runner = await start({ connectionString, db, effects, handlers, transport: bindingsTransport(mesh), secrets, headers }, key);
-  Deno.serve({ port: 9997, onListen() {} }, (req) => new Response(null, { status: new URL(req.url).pathname === "/healthz" ? 204 : 404 }));
+  // Set where the cluster has a blob plane: the URL a stored key is served at.
+  const blobUrl = Deno.env.get("BLOB_URL");
+  const blobs = blobUrl === undefined ? undefined : daprBlobs(mesh, blobUrl);
+  // A release with no origin yet runs every effect that does not link back.
+  const origin = Deno.env.get("ORIGIN");
+  const runner = await start({ connectionString, db, effects, handlers, transport: meshTransport(mesh), secrets, headers, blobs, origin, target }, key);
+  Deno.serve({ hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("PORT") || 9997), onListen() {} }, (req) => new Response(null, { status: new URL(req.url).pathname === "/healthz" ? 204 : 404 }));
   await runner.promise;
   // On a signal Graphile returns its jobs and ends the process itself; a
   // worker that stops otherwise has nothing left to run.

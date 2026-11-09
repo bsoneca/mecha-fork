@@ -139,7 +139,7 @@ if (import.meta.main) {
   if (!(CALL_TIMEOUT_MS > 0)) throw new Error(`CALL_TIMEOUT_MS is ${Deno.env.get("CALL_TIMEOUT_MS")}, not milliseconds`);
   // 9998 in its container; a host launch moves it (cluster.cue's ticker).
   Deno.serve(
-    { port: Number(Deno.env.get("PORT") ?? 9998) },
+    { hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("PORT") || 9998) },
     handler(
       httpCrud(CRUD_URL, SERVICE_JWT, CALL_TIMEOUT_MS),
       httpPoke(wakeUrls(WAKE_URLS)),

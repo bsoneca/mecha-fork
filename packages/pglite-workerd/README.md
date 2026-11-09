@@ -73,7 +73,27 @@ selects lossless zlib level-1 compression for a new directory. Blocks that would
 grow are stored raw, with an encoding byte. Block sizes are powers of two from
 8 to 128 KiB. `fs_format` persists the choice; reopening without options uses
 that format, and conflicting options fail. Existing directories without format
-metadata retain raw 8 KiB storage. Changing format requires a fresh import.
+metadata retain raw 8 KiB storage. Changing block size requires a fresh import.
+
+`DataDirectory.beginCompression(generation, target)` admits only an unopened,
+complete, unpinned raw 8 KiB directory and a deflate 8 KiB target.
+`advanceCompression(generation)` converts up to 256 stored blocks per call
+(at most 2048 when explicitly requested), preserving file metadata, holes,
+logical bytes and the directory generation. Each SQLite transaction commits
+the converted blocks and their cursor together. A retry resumes at that cursor;
+the final transaction installs the target format and removes the maintenance
+marker. Completed begin/advance requests can be replayed.
+
+During conversion, `fs_format` carries an unsupported version so older workers
+also refuse to open mixed encodings. Imports, snapshots and resets are refused.
+`storageReady` is false during conversion or when an existing directory differs
+from the requested format; the owner must gate requests before booting PGlite.
+Deploying that gate into a fresh isolate for the existing object permits maintenance
+without opening Postgres. An already opened directory is refused, even if its database was
+subsequently closed. `storageStatus()` reports the format, progress, generation
+and SQLite database size for an authenticated maintenance controller. Conversion
+does not alter PostgreSQL files logically or require a checkpoint: PostgreSQL
+performs its normal WAL recovery on reopening.
 Inflation is bounded by the declared block size and damaged streams fail.
 
 Decoded compressed blocks use a 4 MiB LRU budget, including their encoded copies.
@@ -81,10 +101,50 @@ Every lookup still reads authoritative SQLite bytes and compares them before
 reusing decoded data. Writes, rollback and ID reuse therefore cannot expose a
 stale decoded block; this cache saves inflation, not SQLite row reads.
 
-Larger blocks reduce SQLite allocation overhead but amplify isolated page reads
-and writes: updating one 8 KiB page can decompress and recompress 128 KiB.
+Partial writes persist the existing raw block encoding immediately. SQLite tracks
+recompression work durably; writes keep at most 32 blocks temporarily raw,
+bounding their extra storage to 4 MiB.
+Evicting the oldest pending block recompresses it; PGlite query synchronization,
+initial filesystem synchronization and import boundaries drain the remainder.
+A restart or SQLite rollback preserves both bytes and pending work, without a
+dirty JavaScript buffer. Older code can still read every block.
+
+Larger blocks reduce SQLite allocation overhead but amplify isolated page reads.
+Sequential 8 KiB page writes share one compression of their 128 KiB block.
 Compression preserves PostgreSQL indexes, transactions and query semantics;
 it does not require moving tables to another database engine.
+
+`DataDirectory.freeze(id)` creates a physical snapshot by copying file metadata,
+not file contents. The caller holds its database serializer through transaction
+completion and `freeze`; the method rejects an open PostgreSQL transaction and
+synchronizes the owned filesystem before the cut. Repeating an active ID returns
+the original manifest before synchronization. PostgreSQL WAL and control files
+are included, so an imported reader performs ordinary crash recovery.
+
+SQLite triggers retain a block's first preimage for each active snapshot in the
+same statement as its live mutation. Missing-block tombstones preserve sparse
+holes; frozen file metadata and pinned inode IDs preserve truncation, unlink and
+rename. Compression updates also retain preimages so exported encoded bytes stay
+stable. SQL rollback rolls back both the mutation and its preimage. Active
+snapshots consume storage proportional to changed blocks; they do not retain
+those blocks in JavaScript memory.
+
+`physical-snapshot.ts` defines the transport types. `snapshotNodes(id, after)`
+exports immutable metadata by path; `snapshotBlocks(id, path, after)` exports
+encoded blocks by index, with at most 128 records and 256 KiB per page. A target
+uses `beginSnapshotImport`, the two page import methods, and
+`finishSnapshotImport`. Durable cursors and byte comparisons support replay;
+opening is refused until the complete metadata and every file have arrived.
+The target records the source generation but receives its own directory
+generation. Encoded blocks keep the existing raw/deflate format.
+
+`releaseSnapshot(id)` removes preimages and metadata, retaining an ID tombstone
+until reset so a retry cannot recapture changed bytes under an old identity.
+Release source pins once the independent reader durably owns the image.
+**Release all snapshots before downgrading code or resetting the directory.**
+New code refuses reset with active snapshots and rejects missing preservation
+triggers. Older writers retain the triggers but can fail when reusing a pinned
+inode; an older reset can drop them. Downgrade with active snapshots is unsupported.
 
 [`DataDirectory`](src/data-directory.ts) owns it in an object. `initdb`
 cannot run there, so a directory built on disk — by npm's PGlite, the same
@@ -110,22 +170,23 @@ directory is live data, and a load without `reset` leaves it alone.
 [`restore.ts`](restore.ts) builds such a directory from a plain `pg_dump`,
 for a database too big to rebuild from its migrations (an archive): the roles
 its grants and policies name first, since a dump carries none, then the dump,
-its `COPY` blocks fed to PGlite a batch of rows at a time. It closes the
-directory trimmed (`closeTrimmed`): the WAL segments a checkpoint pre-allocates
-past the insert position, a GiB after a restore, are dropped rather than
-shipped. A dump that
-carries the `pgroll` schema carries the database's ledger, and
-[`migrate.ts`](migrate.ts) applies the cluster's pgroll migrations it lacks,
-as the cluster's migrate step (`services/migrate/migrate.sh`) would: in name
-order, refusing one that sorts before the latest applied, each recorded as
-`pgroll start --complete` records it. pgroll does not run in PGlite, so only
-migrations of raw SQL apply, their `up` past the tier fence.
-[`scripts.ts`](scripts.ts) is the other ledger, the docker appliance's
-`_pronto_migrations` with a digest per script: what a directory being built
-applied, by name, and what a release later hands a directory the object
-kept — its files and its pgroll set as raw SQL — applied in name order past
-the tier fence, seeds never; a recorded script with other text, or a
-directory without the ledger, is refused by name.
+its `COPY` blocks fed to PGlite a batch of rows at a time, then the ledger of
+what the database applied. It closes the directory trimmed (`closeTrimmed`):
+the WAL segments a checkpoint pre-allocates past the insert position, a GiB
+after a restore, are dropped rather than shipped.
+[`scripts.ts`](scripts.ts) keeps that ledger, the docker appliance's
+`_pronto_migrations` with a digest per script. A directory being built records
+what it applied; an archive records the files of the release that built its
+database, as the restore is given them (`--scripts`, the release's
+`migrations.json`), since a dump says nothing of the files its database ran,
+and the pgroll migrations its own `pgroll` ledger holds as done, by the text
+each ran, refusing a release whose set names other migrations than those.
+A release later hands a directory the object kept, or `pgdata.ts --from` an
+archive, its files and its pgroll set as raw SQL in the order a directory
+applies them, files then pgroll; the ones the ledger lacks are applied in
+that order past the tier fence, seeds never, and a recorded script with other
+text, or a directory without the ledger, is refused by name. pgroll does not
+run in PGlite, so only migrations of raw SQL apply.
 
 ## Measured
 
@@ -141,11 +202,11 @@ The opt-in compression probe loaded a newer 7,341,424,680-byte archive into
 1,951,252,480 bytes of actual Cloudflare SQLite storage: 73.4% smaller, with
 56,995 block rows. All 2,937 source chunks verified before PostgreSQL opened.
 Players, Flamengo rating history and table counts matched the original archive
-on initial, warm and post-abort reads. [[spikes/compression-results.json]] records
+on initial, warm and post-abort reads. The compression probe recorded
 the original measurements. That build's warm players query used 3,212 ms CPU and
 3,941 ms object wall time; warm Flamengo rating history used 5 ms each.
 
-The matched follow-up in [[spikes/query-memory-results.json]] found that 1 MiB
+The matched query-memory follow-up found that 1 MiB
 `work_mem` spilled 900 temporary pages. The current 8 MiB setting removed those
 spills for this query. Two warm round trips took 481–570 ms with raw storage and
 650 ms with compressed storage and the decoded-block cache. Results matched the
@@ -169,19 +230,27 @@ writes, truncation, reopening and legacy formats; committed data and rolled-back
 updates are checked after a process restart without an explicit checkpoint.
 [`test/restore_test.ts`](test/restore_test.ts)
 restores a dump Postgres 18 (in Docker) took of a table with a policy, an ICU
-collation and a trigger; [`test/migrate_test.ts`](test/migrate_test.ts) gives
-a directory restored from a database pgroll migrated (mecha's pinned image)
-the set with one migration more.
+collation and a trigger; [`test/archive_test.ts`](test/archive_test.ts)
+restores one of a database pgroll migrated (mecha's pinned image) with its
+release's scripts and gives it the set with one migration more.
+
+[[wrangler-tools.ts]] resolves Node and Wrangler with `mise which --tool` from
+the package's pinned configuration. Sayt supplies its bootstrapped mise through
+`SAYT_MISE_BIN`; direct Deno test commands must set that variable to the same
+executable. Resolution never uses a global mise or Node. The
+[[test/wrangler-tools_test.ts]] regression executes both tools from an unrelated
+working directory with conflicting tools on `PATH`; a fresh mise data directory also
+checks the npm backend's current installation layout.
 
 ## Compression probe
 
-[[spikes/compression-wrangler.jsonc]] deploys an isolated, authenticated archive
+The probe's wrangler configuration deploys an isolated, authenticated archive
 copy using compressed 128 KiB blocks. Set its `PROBE_TOKEN` secret before use.
-[[spikes/compression-load.ts]] takes the probe origin, a closed data directory,
+The probe's loader takes the probe origin, a closed data directory,
 and a private token file. It compresses upload chunks in transit and uses the
 normal resumable import and complete-directory hash verification.
 
-[[spikes/compression-check.ts]] has two modes: `reference <pgdata-copy> <json>`
+The probe's checker has two modes: `reference <pgdata-copy> <json>`
 records public player and rating queries from a disposable local archive copy;
 `remote <origin> <json> <token-file>` compares them with the deployed database
 cold, warm, and after an object abort. The probe exposes storage allocation;
