@@ -265,6 +265,26 @@ Deno.test({
 });
 
 Deno.test({
+  name: "door always answers 2xx, naming the account only for a verified session",
+  ...opts,
+  fn: async () => {
+    const door = async (headers: Record<string, string> = {}) => {
+      const res = await handler(new Request("http://auth:9999/auth/door", { headers }));
+      assertEquals(res.status, 204);
+      await res.body?.cancel();
+      return res.headers.get("x-pronto-account");
+    };
+    const id = crypto.randomUUID();
+    assertEquals(await door({ authorization: `Bearer ${await issueUserToken(id, "alice")}` }), id);
+    assertEquals(await door(), null, "no session");
+    assertEquals(await door({ authorization: "Bearer not-a-token" }), null, "an invalid token");
+    const shape = await signJwt({ typ: "shape", table: "article", where: "true", sub: id, exp: Math.floor(Date.now() / 1000) + 60 });
+    assertEquals(await door({ authorization: `Bearer ${shape}` }), null, "a shape token is no session");
+    assertEquals(await door({ "x-pronto-account": id }), null, "a header the page sent names no one");
+  },
+});
+
+Deno.test({
   name: "guest mints a fresh app_user per call with a valid token",
   ...opts,
   fn: async () => {
