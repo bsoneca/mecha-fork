@@ -115,7 +115,7 @@ now (a page waiting for a checkout URL) goes through a **door** ([door.ts](door.
 with a binding of its name on the airlock's daprd as an effect has. Only the services named in
 `callers` reach port 9998, over a network or NetworkPolicy nothing else joins.
 
-A caller POSTs `/door/<name>` with `{key, method, path, body?, contentType?, headers?}`:
+A caller POSTs `/door/<name>` with `{key, method, path, body?, contentType?, headers?, sinkKey?}`:
 the path as a handler's `sink.fetch` takes it, a body in JSON or, under another
 `contentType`, a string sent as it is, and only the headers the door declares. The
 airlock then:
@@ -125,7 +125,8 @@ airlock then:
    another request is refused (400);
 2. commits **`entered + 1`**;
 3. **calls** the sink through the door's binding, adding the credential it read at
-   startup and the ledger key as the `Idempotency-Key`;
+   startup and the ledger key as the `Idempotency-Key` (or the caller's `sinkKey`, the
+   key it also sends the sink another way, so a call retried that way is one call there);
 4. commits a sink answer below 500 as the **outcome** and answers `200 {status, body,
    replayed}`.
 

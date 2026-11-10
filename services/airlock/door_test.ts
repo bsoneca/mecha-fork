@@ -75,6 +75,18 @@ Deno.test("a call claims, enters, calls with the credential, then records the ou
   assertEquals(sent[0].init, { method: "POST", body: checkout.body, contentType: checkout.contentType, headers: { "Stripe-Version": "2024-06-20" } });
 });
 
+Deno.test("a caller's own sinkKey is the sink's Idempotency-Key, frozen with the request", async () => {
+  const log: string[] = [];
+  const ledger = memory(log);
+  const { sent, transport } = sink(log, () => ({ status: 200, body: { id: "cus_1" } }));
+  const own = { ...checkout, sinkKey: "customer https://a.example ana" };
+  await pass("stripe", request(stripe, own), ledger, transport, KEY);
+  assertEquals(sent[0].key, "customer https://a.example ana", "the caller's key, not the ledger's");
+  assertEquals(log[0], "claim stripe:checkout-42", "the ledger keeps its own");
+  await assertRejects(() => pass("stripe", request(stripe, { ...own, sinkKey: "another" }), ledger, transport, KEY), Refused, "another request");
+  for (const bad of ["", "x".repeat(256), "tab\there", 7]) assertThrows(() => request(stripe, { ...checkout, sinkKey: bad }), Refused, "sinkKey");
+});
+
 Deno.test("the credential never reaches the caller, and a caller cannot set it", async () => {
   const log: string[] = [];
   const { transport } = sink(log, () => ({ status: 200, body: { ok: true } }));
