@@ -635,8 +635,10 @@ async function whoami(req: Request): Promise<Response> {
   return json(200, { id: claims.sub, handle: claims.handle });
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 export const links: Links = {
-  userFor(p: Profile) {
+  userFor(p: Profile, adopt?: string) {
     return sql.begin(async (tx) => {
       // One sign-in at a time per subject, so two tabs signing in at once make
       // one person, not two.
@@ -646,6 +648,20 @@ export const links: Links = {
       if (link) {
         const [u] = await tx`select handle from app_user where id = ${link.user_id}`;
         return { id: link.user_id as string, handle: u.handle as string };
+      }
+      // A new subject that came from a guest's browser takes the guest in once: the guest's id, handle and every
+      // row it wrote stay, as a passkey promotes one. Only a guest is taken (no passkey, no other provider is
+      // its own), and the lock makes two subjects racing for one guest end with one winner.
+      if (adopt !== undefined && UUID.test(adopt)) {
+        await tx`select pg_advisory_xact_lock(hashtext(${"adopt:" + adopt}))`;
+        const [g] = await tx`select u.handle from app_user u where u.id = ${adopt}
+          and not exists (select 1 from webauthn_credential c where c.user_id = u.id)
+          and not exists (select 1 from identity_link l where l.user_id = u.id)`;
+        if (g) {
+          await tx`insert into identity_link (provider, issuer, sub, user_id, name, picture)
+            values (${p.provider}, ${p.issuer}, ${p.sub}, ${adopt}, ${p.name}, ${p.picture})`;
+          return { id: adopt, handle: g.handle as string };
+        }
       }
       const id = crypto.randomUUID();
       // Generated handles can collide; regenerate and retry — never a user error.
@@ -677,6 +693,13 @@ const providerSignIn = oidc({
   providers: OIDC_PROVIDERS,
   links,
   issue: (user) => issueUserToken(user.id, user.handle),
+  // The guest a bearer names, for POST /auth/oidc/adopt: a guest token only, never an account's.
+  guestOf: async (req) => {
+    const c = await bearerClaims(req);
+    return c !== null && c.role === "app_user" && c.guest === true && typeof c.sub === "string" && typeof c.handle === "string"
+      ? { id: c.sub, handle: c.handle }
+      : null;
+  },
 });
 
 export async function handler(req: Request): Promise<Response> {

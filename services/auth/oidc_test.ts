@@ -8,6 +8,7 @@
 import { assert, assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1.0.13";
 import { encodeBase64Url, signJwt } from "./jwt.ts";
 import {
+  GUEST_COOKIE,
   HINT_COOKIE,
   discovery,
   type Links,
@@ -96,11 +97,14 @@ async function provider(p: { issuer: string; reachedAt?: string; alg: Alg; clien
   };
 }
 
-function memory(): Links & { users: Map<string, User & { name: string | null }> } {
+function memory(): Links & { users: Map<string, User & { name: string | null }>; adopted: (string | undefined)[] } {
   const users = new Map<string, User & { name: string | null }>();
+  const adopted: (string | undefined)[] = [];
   return {
     users,
-    userFor(p) {
+    adopted,
+    userFor(p, adopt) {
+      adopted.push(adopt);
       const key = `${p.provider}:${p.issuer}:${p.sub}`;
       const u = users.get(key) ?? { id: crypto.randomUUID(), handle: `h-${users.size}`, name: p.name };
       u.name = p.name;
@@ -140,6 +144,11 @@ async function setup(env = GOOGLE, links = memory()) {
     providers,
     links,
     issue: (u) => signJwt(SECRET, { role: "app_user", sub: u.id, handle: u.handle, guest: false, exp: now() + 60 }),
+    // A bearer "guest:<id>" names a guest, "user:<id>" an account: what main.ts reads from the token's claims.
+    guestOf: (req) => {
+      const m = /^Bearer guest:([0-9a-f-]+)$/.exec(req.headers.get("authorization") ?? "");
+      return Promise.resolve(m === null ? null : { id: m[1], handle: "guesty" });
+    },
     fetcher: idp.fetcher as typeof fetch,
   });
   const serve = async (req: Request) => {
@@ -407,4 +416,55 @@ Deno.test("disabling a provider also refuses its browser session", async () => {
   const cookie = jar(await signIn(s))[SESSION_COOKIE];
   const disabled = oidc({ secret: SECRET, origin: () => ORIGIN, providers: {}, links: s.links, issue: () => Promise.resolve("unused") });
   assertEquals((await disabled(exchange(cookie))!).status, 401);
+});
+
+const GUEST_ID = "11111111-2222-4333-8444-555555555555";
+const adoptReq = (bearer: string | null, origin: string | null = ORIGIN) =>
+  new Request(`${ORIGIN}/auth/oidc/adopt`, {
+    method: "POST",
+    headers: { ...(bearer === null ? {} : { authorization: bearer }), ...(origin === null ? {} : { origin }) },
+  });
+const callbackWith = (q: Record<string, string>, verifier: string, guest: string | null) =>
+  new Request(`${ORIGIN}/auth/oidc/google/callback?${new URLSearchParams(q)}`, {
+    headers: { cookie: `${STATE_COOKIE}=${verifier}${guest === null ? "" : `; ${GUEST_COOKIE}=${guest}`}` },
+  });
+
+Deno.test("a guest's browser asks to be kept: a cookie it cannot forge reaches the callback, which hands the guest to the link and clears it", async () => {
+  const s = await setup();
+  const asked = await s.serve(adoptReq(`Bearer guest:${GUEST_ID}`));
+  assertEquals(asked.status, 204);
+  const cookie = asked.headers.getSetCookie()[0];
+  assert(cookie.startsWith(`${GUEST_COOKIE}=`) && cookie.includes("Path=/auth/oidc;") && cookie.includes("HttpOnly") && cookie.includes("SameSite=Lax") && cookie.includes("Secure"), cookie);
+  const guest = jar(asked)[GUEST_COOKIE];
+  assertEquals(guest.split(".").length, 3, "a signed token, not the bare id");
+  const { to, state, verifier } = await begin(s.serve);
+  const done = await s.serve(callbackWith({ code: s.idp.authorize(to), state }, verifier, guest));
+  assertEquals(done.status, 303);
+  assertEquals(s.links.adopted, [GUEST_ID]);
+  assertEquals(jar(done)[GUEST_COOKIE], "", "the cookie is spent");
+});
+
+Deno.test("a sign-in without the guest's cookie adopts nobody, and an account's token or another origin cannot ask", async () => {
+  const s = await setup();
+  await signIn(s);
+  assertEquals(s.links.adopted, [undefined]);
+  assertEquals((await s.serve(adoptReq(null))).status, 401, "no token");
+  assertEquals((await s.serve(adoptReq("Bearer user:" + GUEST_ID))).status, 401, "an account is no guest");
+  assertEquals((await s.serve(adoptReq(`Bearer guest:${GUEST_ID}`, "https://evil.test"))).status, 403);
+});
+
+Deno.test("a guest cookie that is forged, expired or for another purpose is ignored by the callback", async () => {
+  const s = await setup();
+  const others = [
+    await signJwt("another-secret-that-is-at-least-32-chars", { purpose: "oidc-guest", sub: GUEST_ID, exp: now() + 60 }),
+    await signJwt(SECRET, { purpose: "oidc-guest", sub: GUEST_ID, exp: now() - 5 }),
+    await signJwt(SECRET, { purpose: "oidc-session", sub: GUEST_ID, exp: now() + 60 }),
+    "not-a-token",
+  ];
+  for (const bad of others) {
+    const { to, state, verifier } = await begin(s.serve);
+    const done = await s.serve(callbackWith({ code: s.idp.authorize(to), state }, verifier, bad));
+    assertEquals(done.status, 303);
+  }
+  assertEquals(s.links.adopted, [undefined, undefined, undefined, undefined]);
 });

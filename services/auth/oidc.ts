@@ -21,6 +21,8 @@ import { decodeBase64Url, encodeBase64Url, signJwt, verifyJwt } from "./jwt.ts";
 export const PREFIX = "/auth/oidc";
 export const SESSION_COOKIE = "mecha_oidc";
 export const STATE_COOKIE = "mecha_oidc_state";
+/** The guest a sign-in will adopt (see `adopt`): set by POST /auth/oidc/adopt, spent by the next callback. */
+export const GUEST_COOKIE = "mecha_oidc_guest";
 export const HINT_COOKIE = "mecha_oidc_hint";
 const STATE_TTL_S = 600;
 const COOKIE_TTL_S = 30 * 24 * 3600;
@@ -144,8 +146,11 @@ export type User = { id: string; handle: string };
 /** What the service needs of Postgres. */
 export interface Links {
   /** The user linked to this subject, made with its link when there is none;
-   * the link's name and picture refreshed either way. */
-  userFor(p: Profile): Promise<User>;
+   * the link's name and picture refreshed either way. `adopt` is a guest's id:
+   * when the subject has no link yet, the link is made to that guest (its id,
+   * handle and every row it wrote are kept) instead of to a new user, once, and
+   * only if it is still a guest (nothing links to it, no passkey is its own). */
+  userFor(p: Profile, adopt?: string): Promise<User>;
   /** The user's handle while a link of `provider` still names them. */
   handleOf(provider: string, issuer: string, id: string): Promise<string | null>;
 }
@@ -157,6 +162,9 @@ export type Config = {
   providers: Record<string, Provider>;
   links: Links;
   issue: (user: User) => Promise<string>;
+  /** The guest a request's bearer token names, or null: what POST /auth/oidc/adopt
+   * is allowed to carry into the next sign-in. Without it nothing is adopted. */
+  guestOf?: (req: Request) => Promise<User | null>;
   fetcher?: typeof fetch;
 };
 
@@ -254,6 +262,20 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
   const stateCookie = (origin: string, name: string, value: string, age: number) =>
     `${STATE_COOKIE}=${value}; Path=${PREFIX}/${name}/callback; HttpOnly; SameSite=Lax${secure(origin)}; Max-Age=${age}`;
 
+  // The guest this browser signs in as: a short-lived, signed cookie the callback reads, so the guest's token never
+  // travels in a URL. It reaches the callback (a top-level GET from the provider) under Lax.
+  const guestCookie = (origin: string, value: string, age: number) =>
+    `${GUEST_COOKIE}=${value}; Path=${PREFIX}; HttpOnly; SameSite=Lax${secure(origin)}; Max-Age=${age}`;
+  async function adopt(req: Request): Promise<Response> {
+    const origin = req.headers.get("origin");
+    if (origin !== null && origin !== cfg.origin(req)) return refuse(403, "another origin");
+    const guest = cfg.guestOf === undefined ? null : await cfg.guestOf(req);
+    if (guest === null) return refuse(401, "not a guest");
+    const door = cfg.origin(req);
+    const token = await signJwt(cfg.secret, { purpose: "oidc-guest", sub: guest.id, exp: now() + STATE_TTL_S });
+    return new Response(null, { status: 204, headers: { "set-cookie": guestCookie(door, token, STATE_TTL_S), "cache-control": "no-store" } });
+  }
+
   async function start(req: Request, name: string): Promise<Response> {
     const p = cfg.providers[name];
     const origin = cfg.origin(req);
@@ -312,12 +334,17 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     if (typeof idToken !== "string") return refuse(401, "no id token");
     const profile = await verifyIdToken(name, idToken, (kid) => keys(ends.jwks, kid), { issuer: p.issuer, issuers: p.issuers, client, nonce: state.nonce });
     if (profile === null) return refuse(401, "id token refused");
-    const user = await cfg.links.userFor(profile);
+    // The guest this browser asked to keep, when its cookie is ours and unexpired: spent here either way.
+    const rawGuest = cookieOf(req, GUEST_COOKIE);
+    const guestClaims = rawGuest === null ? null : await verifyJwt(cfg.secret, rawGuest);
+    const adoptId = guestClaims !== null && guestClaims.purpose === "oidc-guest" && typeof guestClaims.sub === "string" ? guestClaims.sub : undefined;
+    const user = await cfg.links.userFor(profile, adoptId);
     const session = await signJwt(cfg.secret, { purpose: "oidc-session", provider: name, issuer: p.issuer, sub: user.id, exp: now() + COOKIE_TTL_S });
     return redirect(safeReturn(typeof state.ret === "string" ? state.ret : null), [
       `${SESSION_COOKIE}=${session}; Path=${PREFIX}; HttpOnly; SameSite=Lax${secure(origin)}; Max-Age=${COOKIE_TTL_S}`,
       `${HINT_COOKIE}=${name}; Path=/; SameSite=Lax${secure(origin)}; Max-Age=${COOKIE_TTL_S}`,
       stateCookie(origin, name, "", 0),
+      guestCookie(origin, "", 0),
     ]);
   }
 
@@ -357,6 +384,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
   return (req) => {
     const path = new URL(req.url).pathname;
     if (req.method === "POST" && path === `${PREFIX}/session`) return session(req);
+    if (req.method === "POST" && path === `${PREFIX}/adopt`) return adopt(req);
     if (req.method === "POST" && path === `${PREFIX}/signout`) return Promise.resolve(signout(req));
     const m = /^\/auth\/oidc\/([a-z][a-z0-9]*)\/(start|callback)$/.exec(path);
     if (m === null || !Object.hasOwn(cfg.providers, m[1]) || req.method !== "GET") return null;
