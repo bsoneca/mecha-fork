@@ -68,14 +68,14 @@ export function outcome(effect: Effect, answer: Answer | "unknown", reconciled: 
  * the quoting would have to escape. */
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** What a secret is named by: an environment variable. */
-const TOKEN = /^[A-Za-z][A-Za-z0-9-]*$/;
+export const TOKEN = /^[A-Za-z][A-Za-z0-9-]*$/;
 // Daprd forwards a metadata key as a header only when its first letter is
 // uppercase; and a credential never takes a header the host or HTTP sets.
-const HEADER = /^[A-Z][A-Za-z0-9-]*$/;
-const RESERVED_HEADERS = new Set(["idempotency-key", "content-type", "content-length", "accept", "host", "transfer-encoding", "traceparent", "tracestate", "baggage"]);
-const SECRET = /^[A-Z][A-Z0-9_]*$/;
+export const HEADER = /^[A-Z][A-Za-z0-9-]*$/;
+export const RESERVED_HEADERS = new Set(["idempotency-key", "content-type", "content-length", "accept", "host", "transfer-encoding", "traceparent", "tracestate", "baggage"]);
+export const SECRET = /^[A-Z][A-Z0-9_]*$/;
 /** The effect's name is also its Dapr binding's. */
-const ENDPOINT = /^[a-z][a-z0-9-]*$/;
+export const ENDPOINT = /^[a-z][a-z0-9-]*$/;
 
 /** effects.json, checked: the airlock dies on a manifest it would misread. */
 export function parseManifest(text: string): Record<string, Effect> {
