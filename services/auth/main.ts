@@ -36,11 +36,7 @@ const DATABASE_URL = required("DATABASE_URL");
 // auth runs as the owner, which no role setting bounds: its connection carries
 // the clients' statement bound itself.
 const STATEMENT_TIMEOUT_MS = Number(required("AUTH_STATEMENT_TIMEOUT_MS"));
-if (!(STATEMENT_TIMEOUT_MS > 0)) {
-  throw new Error(
-    `AUTH_STATEMENT_TIMEOUT_MS is ${STATEMENT_TIMEOUT_MS}, not milliseconds`,
-  );
-}
+if (!(STATEMENT_TIMEOUT_MS > 0)) throw new Error(`AUTH_STATEMENT_TIMEOUT_MS is ${STATEMENT_TIMEOUT_MS}, not milliseconds`);
 const JWT_SECRET = required("PGRST_JWT_SECRET");
 /** The dev cluster's door: localhost, on whatever port the host published. */
 const DEV_DOOR = "https://localhost:*";
@@ -65,14 +61,10 @@ export function admittedOrigin(rpId: string, origin: string): string {
   // in a secure context: https, or http on localhost.
   const url = new URL(origin);
   if (url.origin !== origin) {
-    throw new Error(
-      `WEBAUTHN_ORIGIN ${origin} is not an origin, which no ceremony's equals; set it to ${url.origin}`,
-    );
+    throw new Error(`WEBAUTHN_ORIGIN ${origin} is not an origin, which no ceremony's equals; set it to ${url.origin}`);
   }
   if (url.protocol !== "https:" && url.hostname !== "localhost") {
-    throw new Error(
-      `WEBAUTHN_ORIGIN ${origin} is not https, where no browser makes a ceremony`,
-    );
+    throw new Error(`WEBAUTHN_ORIGIN ${origin} is not https, where no browser makes a ceremony`);
   }
   if (url.hostname === rpId || url.hostname.endsWith(`.${rpId}`)) return origin;
   throw new Error(
@@ -92,14 +84,9 @@ const OIDC_PROVIDERS = providersFrom((name) => Deno.env.get(name));
  * it forwards; a Host other than localhost leaves DEV_DOOR itself, which no
  * page's origin equals.
  */
-export function ceremonyOrigin(
-  configured: string,
-  host: string | null,
-): string {
+export function ceremonyOrigin(configured: string, host: string | null): string {
   if (configured !== DEV_DOOR) return configured;
-  return host !== null && /^localhost(:\d+)?$/.test(host)
-    ? `https://${host}`
-    : configured;
+  return host !== null && /^localhost(:\d+)?$/.test(host) ? `https://${host}` : configured;
 }
 
 const USER_TOKEN_TTL_S = 7 * 24 * 3600;
@@ -109,9 +96,7 @@ const USER_TOKEN_TTL_S = 7 * 24 * 3600;
 const SHAPE_TOKEN_TTL_S = 900;
 const STATE_TTL_S = 300;
 
-export const sql = postgres(DATABASE_URL, {
-  connection: { statement_timeout: STATEMENT_TIMEOUT_MS },
-});
+export const sql = postgres(DATABASE_URL, { connection: { statement_timeout: STATEMENT_TIMEOUT_MS } });
 
 export async function migrate(): Promise<void> {
   await sql`CREATE TABLE IF NOT EXISTS webauthn_credential (
@@ -138,13 +123,8 @@ export async function migrate(): Promise<void> {
       ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text`;
     // A legacy provider label may have named any issuer. Its owner must supply
     // that issuer before these accounts can safely accept another sign-in.
-    const [legacy] =
-      await tx`SELECT EXISTS (SELECT 1 FROM identity_link WHERE issuer IS NULL) AS unassigned`;
-    if (legacy.unassigned) {
-      throw new Error(
-        "identity_link has unassigned issuers: add and populate its issuer column from the original identity provider before starting auth",
-      );
-    }
+    const [legacy] = await tx`SELECT EXISTS (SELECT 1 FROM identity_link WHERE issuer IS NULL) AS unassigned`;
+    if (legacy.unassigned) throw new Error("identity_link has unassigned issuers: add and populate its issuer column from the original identity provider before starting auth");
     await tx`ALTER TABLE identity_link ALTER COLUMN issuer SET NOT NULL`;
     await tx`DO $$ BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_constraint c
@@ -164,17 +144,12 @@ export async function migrate(): Promise<void> {
 
 const enc = new TextEncoder();
 
-export const signJwt = (claims: Record<string, unknown>) =>
-  sign(JWT_SECRET, claims);
+export const signJwt = (claims: Record<string, unknown>) => sign(JWT_SECRET, claims);
 export const verifyJwt = (token: string) => verify(JWT_SECRET, token);
 
 // A guest's token says so, so a policy can keep writes to the people who
 // signed in (`request.jwt.claims ->> 'guest'`).
-export function issueUserToken(
-  id: string,
-  handle: string,
-  guest = false,
-): Promise<string> {
+export function issueUserToken(id: string, handle: string, guest = false): Promise<string> {
   return signJwt({
     role: "app_user",
     sub: id,
@@ -191,6 +166,7 @@ export function issueUserToken(
 // here over `forward_auth` and this service decides; the predicate itself is
 // jwt.ts's shapeWhere.
 
+
 /**
  * Whether the floor reaches this table and proves every row public.
  *
@@ -200,20 +176,14 @@ export function issueUserToken(
  * the floor, and until its scope derivation exists it has no business on a sync
  * path that is supposed to be scoped.
  */
-async function tableScope(
-  table: string,
-): Promise<{ floored: boolean; publicOnly: boolean }> {
+async function tableScope(table: string): Promise<{ floored: boolean; publicOnly: boolean }> {
   // The floor's own precondition (has_scope in rls.sql); to_regclass is NULL
   // for a table that does not exist, and NULL has no scope.
-  const rows = await sql`SELECT public.has_scope(to_regclass(${
-    "public." + table
-  })) AS floored,
+  const rows = await sql`SELECT public.has_scope(to_regclass(${"public." + table})) AS floored,
     EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
       JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
       JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-      WHERE a.attrelid = to_regclass(${
-    "public." + table
-  }) AND a.attname = 'scope_id'
+      WHERE a.attrelid = to_regclass(${"public." + table}) AND a.attname = 'scope_id'
         AND a.attnotnull AND NOT a.attisdropped AND a.attgenerated = 's'
         AND c.relkind = 'r'
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = a.attrelid)
@@ -240,28 +210,17 @@ export function rowWhere(column: string, value: string): string {
 // subject may read: mecha.shape_reach, asked as the subject. Role and claims
 // are set here the way PostgREST sets them on a request, and rls.sql says why
 // the switch has to be the caller's.
-async function rowReach(
-  uid: string,
-  table: string,
-  column: string,
-  value: string,
-): Promise<boolean> {
+async function rowReach(uid: string, table: string, column: string, value: string): Promise<boolean> {
   return await sql.begin(async (tx) => {
     await tx`SET LOCAL ROLE app_user`;
-    await tx`SELECT set_config('request.jwt.claims', ${
-      JSON.stringify({ sub: uid, role: "app_user" })
-    }, true)`;
+    await tx`SELECT set_config('request.jwt.claims', ${JSON.stringify({ sub: uid, role: "app_user" })}, true)`;
     await tx`SELECT public.app_pre_request()`;
-    const rows = await tx`SELECT mecha.shape_reach(${
-      "public." + table
-    }, ${column}, ${value}) AS ok`;
+    const rows = await tx`SELECT mecha.shape_reach(${"public." + table}, ${column}, ${value}) AS ok`;
     return rows[0].ok as boolean;
   });
 }
 
-async function bearerClaims(
-  req: Request,
-): Promise<Record<string, unknown> | null> {
+async function bearerClaims(req: Request): Promise<Record<string, unknown> | null> {
   const auth = req.headers.get("authorization");
   if (!auth || !auth.startsWith("Bearer ")) return null;
   return await verifyJwt(auth.slice("Bearer ".length));
@@ -281,9 +240,7 @@ async function subjectOf(req: Request): Promise<Subject> {
 // carries no reach beyond it.
 async function shapeToken(req: Request): Promise<Response> {
   const subject = await subjectOf(req);
-  if (subject === "refused" || subject.claims === null) {
-    return jsonError(401, "invalid token");
-  }
+  if (subject === "refused" || subject.claims === null) return jsonError(401, "invalid token");
   const sub = subject.claims.sub as string;
   const body = await readBody(req);
   if (!body || !validTable(body.table)) return jsonError(400, "table required");
@@ -307,10 +264,7 @@ async function shapeToken(req: Request): Promise<Response> {
     }
     where = rowWhere(key.column, key.value);
   } else {
-    const [scope, scopes] = await Promise.all([
-      tableScope(body.table),
-      subjectScopes(sub),
-    ]);
+    const [scope, scopes] = await Promise.all([tableScope(body.table), subjectScopes(sub)]);
     if (!scope.floored) {
       return jsonError(
         409,
@@ -320,9 +274,7 @@ async function shapeToken(req: Request): Promise<Response> {
     }
     // Descendants can store a different generated scope than their parent.
     // Only a proven public leaf can omit the subject's irrelevant scopes.
-    where = shapeWhere(
-      scope.publicOnly ? scopes.filter((scope) => scope === "public:") : scopes,
-    );
+    where = shapeWhere(scope.publicOnly ? scopes.filter((scope) => scope === "public:") : scopes);
   }
   const token = await signJwt({
     typ: "shape",
@@ -334,12 +286,7 @@ async function shapeToken(req: Request): Promise<Response> {
   // `where` goes back so the client sends exactly what was authorized: the
   // check below is equality, and a client that rebuilds the string differently
   // is refused for a reason it cannot see.
-  return json(200, {
-    token,
-    table: body.table,
-    where,
-    expires_in: SHAPE_TOKEN_TTL_S,
-  });
+  return json(200, { token, table: body.table, where, expires_in: SHAPE_TOKEN_TTL_S });
 }
 
 // The parameters a shape request may carry besides the two the token names:
@@ -395,12 +342,8 @@ function strictQuery(query: string): Map<string, string[]> | null {
     let key: string;
     let value: string;
     try {
-      key = decodeURIComponent(
-        (eq === -1 ? pair : pair.slice(0, eq)).replaceAll("+", " "),
-      );
-      value = eq === -1
-        ? ""
-        : decodeURIComponent(pair.slice(eq + 1).replaceAll("+", " "));
+      key = decodeURIComponent((eq === -1 ? pair : pair.slice(0, eq)).replaceAll("+", " "));
+      value = eq === -1 ? "" : decodeURIComponent(pair.slice(eq + 1).replaceAll("+", " "));
     } catch {
       return null;
     }
@@ -413,10 +356,7 @@ function strictQuery(query: string): Map<string, string[]> | null {
  * names the parameter: the store takes it for a predicate the program stated
  * wrong, which no retry answers. */
 const subsetError = (param: string, message: string) =>
-  json(400, {
-    message: "Invalid request",
-    errors: { subset: { [param]: [message] } },
-  });
+  json(400, { message: "Invalid request", errors: { subset: { [param]: [message] } } });
 
 // What Caddy asks before proxying to Electric. It answers about the request
 // Caddy actually received, not about one the client describes: the method and
@@ -424,21 +364,15 @@ const subsetError = (param: string, message: string) =>
 // that decides reach is compared.
 async function shapeVerify(req: Request): Promise<Response> {
   const claims = await bearerClaims(req);
-  if (!claims || claims.typ !== "shape") {
-    return jsonError(401, "invalid shape token");
-  }
+  if (!claims || claims.typ !== "shape") return jsonError(401, "invalid shape token");
 
-  if (req.headers.get("x-forwarded-method") !== "GET") {
-    return jsonError(403, "method not allowed");
-  }
+  if (req.headers.get("x-forwarded-method") !== "GET") return jsonError(403, "method not allowed");
   const forwarded = req.headers.get("x-forwarded-uri");
   if (!forwarded) return jsonError(403, "no forwarded uri");
   // The shape route and nothing beside it: the proxy adds the secret to
   // whatever passes, and a token for a shape says nothing about any other
   // route Electric serves.
-  if (!/^\/v1\/shape(\?|$)/.test(forwarded)) {
-    return jsonError(403, "not the shape route");
-  }
+  if (!/^\/v1\/shape(\?|$)/.test(forwarded)) return jsonError(403, "not the shape route");
   // The raw query, not a parsed URL: a request line has no fragment, so `#`
   // is query text here as it is to Electric.
   if (forwarded.includes("#")) return jsonError(403, "fragment in uri");
@@ -449,9 +383,7 @@ async function shapeVerify(req: Request): Promise<Response> {
   // would never reach Electric, and Electric would serve the whole table. A
   // query the two could read differently is refused.
   const params = strictQuery(q === -1 ? "" : forwarded.slice(q + 1));
-  if (params === null) {
-    return jsonError(403, "query Caddy would read differently");
-  }
+  if (params === null) return jsonError(403, "query Caddy would read differently");
 
   // Electric keeps the last copy of a repeated parameter, so a parameter is
   // compared only once it is known to have one value. Every refusal of a
@@ -459,56 +391,29 @@ async function shapeVerify(req: Request): Promise<Response> {
   // the program's error, where it asks again after a 403.
   for (const [key, values] of params) {
     if (values.length !== 1) {
-      return key.startsWith("subset__")
-        ? subsetError(key.slice("subset__".length), `${key} repeated`)
-        : jsonError(403, `${key} repeated`);
+      return key.startsWith("subset__") ? subsetError(key.slice("subset__".length), `${key} repeated`) : jsonError(403, `${key} repeated`);
     }
     if (key in SHAPE_FIXED_PARAMS) {
-      if (values[0] !== SHAPE_FIXED_PARAMS[key]) {
-        return jsonError(403, `${key} must be ${SHAPE_FIXED_PARAMS[key]}`);
-      }
+      if (values[0] !== SHAPE_FIXED_PARAMS[key]) return jsonError(403, `${key} must be ${SHAPE_FIXED_PARAMS[key]}`);
       continue;
     }
-    if (key.startsWith("subset__") && !SUBSET_PARAMS.has(key)) {
-      return subsetError(key.slice("subset__".length), `${key} is not served`);
-    }
-    if (
-      key !== "table" && key !== "where" && !SHAPE_FREE_PARAMS.has(key) &&
-      !SUBSET_PARAMS.has(key)
-    ) {
+    if (key.startsWith("subset__") && !SUBSET_PARAMS.has(key)) return subsetError(key.slice("subset__".length), `${key} is not served`);
+    if (key !== "table" && key !== "where" && !SHAPE_FREE_PARAMS.has(key) && !SUBSET_PARAMS.has(key)) {
       return jsonError(403, `${key} is not a shape parameter`);
     }
   }
   const get = (key: string) => params.get(key)?.[0] ?? null;
   // A missing parameter is not a matching one. `??` would let an absent `where`
   // read as authorized against a claim that named a predicate.
-  if (get("table") !== claims.table) {
-    return jsonError(403, "table not authorized");
-  }
-  if (get("where") !== claims.where) {
-    return jsonError(403, "where not authorized");
-  }
-  if (subsetParams(get("subset__params")) === undefined) {
-    return subsetError(
-      "params",
-      "subset__params is not an object of positions to strings",
-    );
-  }
+  if (get("table") !== claims.table) return jsonError(403, "table not authorized");
+  if (get("where") !== claims.where) return jsonError(403, "where not authorized");
+  if (subsetParams(get("subset__params")) === undefined) return subsetError("params", "subset__params is not an object of positions to strings");
   const subsetWhere = get("subset__where");
-  if (subsetWhere !== null && !isSubsetWhere(subsetWhere)) {
-    return subsetError(
-      "where",
-      "subset__where is not a predicate a subset may state",
-    );
-  }
+  if (subsetWhere !== null && !isSubsetWhere(subsetWhere)) return subsetError("where", "subset__where is not a predicate a subset may state");
   const subsetOrder = get("subset__order_by");
-  if (subsetOrder !== null && !SUBSET_ORDER.test(subsetOrder)) {
-    return subsetError("order_by", "subset__order_by is not a list of columns");
-  }
+  if (subsetOrder !== null && !SUBSET_ORDER.test(subsetOrder)) return subsetError("order_by", "subset__order_by is not a list of columns");
   const subsetLimit = get("subset__limit");
-  if (subsetLimit !== null && !SUBSET_LIMIT.test(subsetLimit)) {
-    return subsetError("limit", "subset__limit is not a count");
-  }
+  if (subsetLimit !== null && !SUBSET_LIMIT.test(subsetLimit)) return subsetError("limit", "subset__limit is not a count");
   return json(200, { ok: true });
 }
 
@@ -544,50 +449,8 @@ async function readState(
   return st;
 }
 
-const ADJECTIVES = [
-  "amber",
-  "brisk",
-  "calm",
-  "dusk",
-  "ember",
-  "fern",
-  "gold",
-  "hazel",
-  "ivory",
-  "jade",
-  "kind",
-  "lunar",
-  "mellow",
-  "noble",
-  "ochre",
-  "pale",
-  "quiet",
-  "rustic",
-  "sage",
-  "tidal",
-];
-const NOUNS = [
-  "fox",
-  "wren",
-  "otter",
-  "pine",
-  "reed",
-  "moth",
-  "lark",
-  "moss",
-  "dune",
-  "cove",
-  "elk",
-  "finch",
-  "heron",
-  "ibis",
-  "kite",
-  "lynx",
-  "newt",
-  "orca",
-  "quail",
-  "seal",
-];
+const ADJECTIVES = ["amber", "brisk", "calm", "dusk", "ember", "fern", "gold", "hazel", "ivory", "jade", "kind", "lunar", "mellow", "noble", "ochre", "pale", "quiet", "rustic", "sage", "tidal"];
+const NOUNS = ["fox", "wren", "otter", "pine", "reed", "moth", "lark", "moss", "dune", "cove", "elk", "finch", "heron", "ibis", "kite", "lynx", "newt", "orca", "quail", "seal"];
 function generateHandle(): string {
   const a = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
   const n = NOUNS[Math.floor(Math.random() * NOUNS.length)];
@@ -602,9 +465,7 @@ async function registerStart(req: Request): Promise<Response> {
   // passkey added to an account on the strength of a bearer token would
   // outlive the token and its sign-out. With no session, a new identity —
   // usernameless by doctrine: no identifier is ever collected.
-  if (claims !== null && claims.guest !== true) {
-    return jsonError(409, "already an account");
-  }
+  if (claims !== null && claims.guest !== true) return jsonError(409, "already an account");
   const promote = claims !== null;
   const handle = claims ? claims.handle as string : generateHandle();
   const userId = claims ? claims.sub as string : crypto.randomUUID();
@@ -656,8 +517,7 @@ async function registerVerify(req: Request): Promise<Response> {
   if (st.promote === true) {
     // The guest becomes an account once: a guest token that outlives its
     // promotion is still a guest's, and adds no second way in.
-    const added =
-      await sql`insert into webauthn_credential (id, user_id, public_key, counter)
+    const added = await sql`insert into webauthn_credential (id, user_id, public_key, counter)
       select ${credentialID}, ${userId}, ${credentialPublicKey}, ${counter}
       where not exists (select 1 from webauthn_credential where user_id = ${userId})`;
     if (added.count === 0) return jsonError(409, "already an account");
@@ -770,9 +630,7 @@ async function guest(_req: Request): Promise<Response> {
 
 async function whoami(req: Request): Promise<Response> {
   const subject = await subjectOf(req);
-  if (subject === "refused" || subject.claims === null) {
-    return jsonError(401, "invalid token");
-  }
+  if (subject === "refused" || subject.claims === null) return jsonError(401, "invalid token");
   const claims = subject.claims;
   return json(200, { id: claims.sub, handle: claims.handle });
 }
@@ -784,24 +642,19 @@ export const links: Links = {
     return sql.begin(async (tx) => {
       // One sign-in at a time per subject, so two tabs signing in at once make
       // one person, not two.
-      await tx`select pg_advisory_xact_lock(hashtext(${
-        JSON.stringify([p.provider, p.issuer, p.sub])
-      }))`;
-      const [link] =
-        await tx`update identity_link set name = ${p.name}, picture = ${p.picture}
+      await tx`select pg_advisory_xact_lock(hashtext(${JSON.stringify([p.provider, p.issuer, p.sub])}))`;
+      const [link] = await tx`update identity_link set name = ${p.name}, picture = ${p.picture}
         where provider = ${p.provider} and issuer = ${p.issuer} and sub = ${p.sub} returning user_id`;
       if (link) {
-        const [u] =
-          await tx`select handle from app_user where id = ${link.user_id}`;
+        const [u] = await tx`select handle from app_user where id = ${link.user_id}`;
         return { id: link.user_id as string, handle: u.handle as string };
       }
-      // A new subject that came from a guest's browser takes the guest in, once: the guest's id, handle and every
+      // A new subject that came from a guest's browser takes the guest in once: the guest's id, handle and every
       // row it wrote stay, as a passkey promotes one. Only a guest is taken (no passkey, no other provider is
       // its own), and the lock makes two subjects racing for one guest end with one winner.
       if (adopt !== undefined && UUID.test(adopt)) {
         await tx`select pg_advisory_xact_lock(hashtext(${"adopt:" + adopt}))`;
-        const [g] =
-          await tx`select u.handle from app_user u where u.id = ${adopt}
+        const [g] = await tx`select u.handle from app_user u where u.id = ${adopt}
           and not exists (select 1 from webauthn_credential c where c.user_id = u.id)
           and not exists (select 1 from identity_link l where l.user_id = u.id)`;
         if (g) {
@@ -815,9 +668,7 @@ export const links: Links = {
       for (let attempt = 0; attempt < 3; attempt++) {
         const handle = generateHandle();
         try {
-          await tx.savepoint((sp) =>
-            sp`insert into app_user (id, handle) values (${id}, ${handle})`
-          );
+          await tx.savepoint((sp) => sp`insert into app_user (id, handle) values (${id}, ${handle})`);
         } catch (e) {
           if ((e as { code?: string }).code === "23505") continue;
           throw e;
@@ -845,8 +696,7 @@ const providerSignIn = oidc({
   // The guest a bearer names, for POST /auth/oidc/adopt: a guest token only, never an account's.
   guestOf: async (req) => {
     const c = await bearerClaims(req);
-    return c !== null && c.role === "app_user" && c.guest === true &&
-        typeof c.sub === "string" && typeof c.handle === "string"
+    return c !== null && c.role === "app_user" && c.guest === true && typeof c.sub === "string" && typeof c.handle === "string"
       ? { id: c.sub, handle: c.handle }
       : null;
   },
