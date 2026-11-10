@@ -1465,7 +1465,7 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 					expose: http: {port: 8081, env: "IMGPROXY_PORT"}
 					entrypoint: {
 						shell:      "nu"
-						do:         "if (which imgproxy | is-not-empty) { with-env { IMGPROXY_BIND: $\"127.0.0.1:($env.IMGPROXY_PORT? | default '8081')\" } { exec imgproxy } } else { exec deno eval \"Deno.serve({hostname:'127.0.0.1',port:Number(Deno.env.get('IMGPROXY_PORT')||8081)},async(req)=>{const u=new URL(req.url);if(u.pathname==='/health')return new Response('ok');const k=(u.pathname.split('s3://')[1]||u.pathname.split('s3:/')[1]||'').split('@')[0];if(k){const r=await fetch(Deno.env.get('IMGPROXY_S3_ENDPOINT')+'/'+k);return new Response(r.body,{status:r.status,headers:r.headers});}return new Response('not found',{status:404});})\" }"
+						do:         "if (which imgproxy | is-not-empty) { with-env { IMGPROXY_BIND: $\"127.0.0.1:($env.IMGPROXY_PORT? | default '8081')\" } { exec imgproxy } } else { exec deno run --allow-all ((^mise where github:bonisoft3/mecha | str trim) | path join 'services/imgproxy/host.ts') }"
 						dockerfile: null
 						env: {
 							IMGPROXY_USE_S3:      "true"
