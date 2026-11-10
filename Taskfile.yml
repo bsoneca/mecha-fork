@@ -119,7 +119,7 @@ tasks:
     desc: "airlock service: re-entry, the manifest, the handler's cage and its one door out, the poke, Graphile's initdb step"
     dir: services/airlock
     cmds:
-      - mise x -- deno test --frozen --unstable-worker-options --allow-read --allow-write --allow-env --allow-sys --allow-run reentry_test.ts handler_test.ts admit_test.ts tsbifrost_test.ts white-background_test.ts blobs_test.ts
+      - mise x -- deno test --frozen --unstable-worker-options --allow-read --allow-write --allow-env --allow-sys --allow-run reentry_test.ts handler_test.ts door_test.ts admit_test.ts tsbifrost_test.ts white-background_test.ts blobs_test.ts
     sources:
       - "*.ts"
       - "*.sql"
@@ -132,6 +132,16 @@ tasks:
       - "../compute/endowments.ts"
       - "../compute/language.ts"
       - "../compute/workers.ts"
+
+  test:airlock:pg:
+    desc: "the airlock door's ledger in Postgres, on this host's own binaries: PG_BIN names the directory holding initdb and pg_ctl; no Docker"
+    dir: services/airlock
+    requires:
+      vars: [PG_BIN]
+    env:
+      PG_BIN: "{{.PG_BIN}}"
+    cmds:
+      - mise x -- deno test --frozen --allow-read --allow-write --allow-env --allow-sys --allow-run --allow-net door_pg_test.ts
 
   generate:graphile:
     desc: "write Graphile Worker's schema as the initdb step services/durex/graphile.sql, from the graphile-worker deno.lock pins"

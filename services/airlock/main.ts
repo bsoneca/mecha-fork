@@ -3,12 +3,14 @@
 // guard enqueues to an outcome (airlock.ts). Port 9997 opens once all of that
 // is up: the cluster's healthcheck, and the ticker's wake, which GETs /healthz
 // so that a cluster scaled to zero brings this process up for what a guard
-// enqueued meanwhile.
+// enqueued meanwhile. Port 9998 (DOOR_PORT) is the doors', where a program
+// declares one (door.ts).
 
 import pg from "pg";
 import { hold, start } from "./airlock.ts";
 import { daprBlobs } from "./blobs.ts";
 import { admitAll, meshTransport } from "./handler.ts";
+import { parseDoors, pgLedger, serveDoors } from "./door.ts";
 
 function required(name: string): string {
   const value = Deno.env.get(name);
@@ -21,6 +23,7 @@ if (import.meta.main) {
   const mesh = required("MESH_URL");
   const dir = required("AIRLOCK_DIR");
   const { effects, handlers } = await admitAll(`${dir}/effects.json`, dir);
+  const doors = parseDoors(await Deno.readTextFile(`${dir}/effects.json`), effects);
   // Where a bridge names its targets, the release names this one.
   const target = Object.values(effects).some((e) => e.bridge !== undefined) ? required("AIRLOCK_TARGET") : undefined;
   // Read once here and handed to the handler at each call; written nowhere, not
@@ -35,12 +38,10 @@ if (import.meta.main) {
     if (!/^[\x21-\x7e]+$/.test(value)) throw new Error(`${name}: a header value is visible ASCII with no space; a mounted file's trailing newline is the usual cause`);
     return value;
   };
-  const headers = Object.fromEntries(
-    Object.entries(effects).map(([name, e]) => [
-      name,
-      e.credential === undefined ? {} : { [e.credential.header]: `${e.credential.scheme === undefined ? "" : e.credential.scheme + " "}${headerValue(e.credential.secret)}` },
-    ]),
-  );
+  const credential = (c: { header: string; scheme?: string; secret: string } | undefined) =>
+    c === undefined ? {} : { [c.header]: `${c.scheme === undefined ? "" : c.scheme + " "}${headerValue(c.secret)}` };
+  const headers = Object.fromEntries(Object.entries(effects).map(([name, e]) => [name, credential(e.credential)]));
+  const doorHeaders = Object.fromEntries(Object.entries(doors).map(([name, d]) => [name, credential(d.credential)]));
   const db = new pg.Pool({ connectionString });
   const { key } = await hold(connectionString);
   // Set where the cluster has a blob plane: the URL a stored key is served at.
@@ -50,6 +51,11 @@ if (import.meta.main) {
   const origin = Deno.env.get("ORIGIN");
   const runner = await start({ connectionString, db, effects, handlers, transport: meshTransport(mesh), secrets, headers, blobs, origin, target }, key);
   Deno.serve({ hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("PORT") || 9997), onListen() {} }, (req) => new Response(null, { status: new URL(req.url).pathname === "/healthz" ? 204 : 404 }));
+  // The doors' port, which only their declared callers reach (door.ts).
+  if (Object.keys(doors).length > 0) {
+    const hostname = ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0";
+    Deno.serve({ hostname, port: Number(Deno.env.get("DOOR_PORT") || 9998), onListen() {} }, serveDoors(doors, pgLedger(db), meshTransport(mesh), doorHeaders));
+  }
   await runner.promise;
   // On a signal Graphile returns its jobs and ends the process itself; a
   // worker that stops otherwise has nothing left to run.

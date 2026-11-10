@@ -51,7 +51,7 @@ a cluster with two effects and boots the plane bayt lowers for it, below.
 
 ## Contract
 
-Nothing calls the airlock. Its worker listens on Graphile's `jobs:insert`, which
+Nothing calls the airlock for an effect, and only a door's declared callers call it for a door ([A door](#a-door)). Its worker listens on Graphile's `jobs:insert`, which
 `add_job` notifies when the interpreter's transaction commits, so an effect starts as its
 transition commits, and a rolled-back transition wakes nothing. A retry follows
 Graphile's backoff. Port 9997 opens once every handler is admitted and the worker
@@ -158,6 +158,33 @@ Where it is not, a claimed effect settles at once, before its run is counted:
 outcome `failed`, data `{bridge, target, reason: "not deployed"}`, target
 `onError`. Neither handler nor sink is called, the ledger's `entered` stays 0
 and no dead letter follows (`undeployed` in [reentry.ts](reentry.ts)).
+
+## A door
+
+An effect answers later, as the machine's next event. A call that needs its answer
+now (a page waiting for a checkout URL) goes through a **door** ([door.ts](door.ts)):
+`effects.json`'s `doors`, each `{idempotent: true, credential?, headers?, callers}`,
+with an HTTPEndpoint of its name on the airlock's daprd as an effect has (not the app's door, its caddy). Only the services named in
+`callers` reach port 9998 (`DOOR_PORT`), over a network or NetworkPolicy nothing else joins.
+
+A caller POSTs `/door/<name>` with `{key, method, path, body?, contentType?, headers?}`:
+the path as a handler's `sink.fetch` takes it, a body in JSON or, under another
+`contentType`, a string sent as it is, and only the headers the door declares. The
+airlock then:
+
+1. **claims** the ledger row `<name>:<key>`, its input frozen; a key that holds an
+   outcome is answered from it (`replayed: true`) with no call, and a key that names
+   another request is refused (400);
+2. commits **`entered + 1`**;
+3. **calls** the sink through the door's HTTPEndpoint, adding the credential it read at
+   startup and the ledger key as the `Idempotency-Key`;
+4. commits a sink answer below 500 as the **outcome** and answers `200 {status, body,
+   replayed}`.
+
+A 5xx, or no answer, is no outcome: the caller is answered 502 and calls again with the
+same key, which is why a door is declared idempotent only. The caller never holds the
+credential, and a door's `headers` may not name it. A door's row holds no instance
+(`row` is `{}`), so nothing moves a machine and Graphile never sees it.
 
 ## After a crash
 
