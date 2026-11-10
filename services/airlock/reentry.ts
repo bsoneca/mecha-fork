@@ -99,14 +99,14 @@ export function undeployed(effect: Effect, target: string | undefined): Outcome 
  * the quoting would have to escape. */
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** What a secret is named by: an environment variable. */
-const TOKEN = /^[A-Za-z][A-Za-z0-9-]*$/;
+export const TOKEN = /^[A-Za-z][A-Za-z0-9-]*$/;
 // Daprd forwards a metadata key as a header only when its first letter is
 // uppercase; and a credential never takes a header the host or HTTP sets.
-const HEADER = /^[A-Z][A-Za-z0-9-]*$/;
-const RESERVED_HEADERS = new Set(["idempotency-key", "content-type", "content-length", "accept", "host", "transfer-encoding", "traceparent", "tracestate", "baggage", "dapr-app-id"]);
-const SECRET = /^[A-Z][A-Z0-9_]*$/;
-const MEDIA_TYPE = /^[a-z]+\/[a-z0-9][a-z0-9.+-]*$/;
-const HEADER_VALUE = /^[\x21-\x7e]([\x20-\x7e]*[\x21-\x7e])?$/;
+export const HEADER = /^[A-Z][A-Za-z0-9-]*$/;
+export const RESERVED_HEADERS = new Set(["idempotency-key", "content-type", "content-length", "accept", "host", "transfer-encoding", "traceparent", "tracestate", "baggage", "dapr-app-id"]);
+export const SECRET = /^[A-Z][A-Z0-9_]*$/;
+export const MEDIA_TYPE = /^[a-z]+\/[a-z0-9][a-z0-9.+-]*$/;
+export const HEADER_VALUE = /^[\x21-\x7e]([\x20-\x7e]*[\x21-\x7e])?$/;
 
 /** The headers a handler sets on one sink call, checked: names daprd forwards,
  * none HTTP or the host sets (the idempotency key, the effect's credential),
@@ -129,7 +129,7 @@ export function sinkHeaders(headers: unknown, host: string[] = []): Record<strin
   return headers as Record<string, string>;
 }
 /** The effect's name is also its Dapr HTTPEndpoint's. */
-const ENDPOINT = /^[a-z][a-z0-9-]*$/;
+export const ENDPOINT = /^[a-z][a-z0-9-]*$/;
 
 /** The body of one sink call: JSON unless the effect declares otherwise, when
  * only the handler knows the encoding. Bytes in a JSON body are sent as
