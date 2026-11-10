@@ -1091,6 +1091,42 @@ Deno.test({
 });
 
 Deno.test({
+  name: "a new subject from a guest's browser takes the guest in once, keeping its id and handle; no one else's guest is taken",
+  ...opts,
+  fn: async () => {
+    const guest = (await (await handler(post("/auth/guest", {}))).json()).user;
+    const taken = await links.userFor({ ...alice, sub: "g-adopts" }, guest.id);
+    assertEquals(taken, { id: guest.id, handle: guest.handle });
+    assertEquals((await sql`select user_id from mecha_auth.identity_link where sub = 'g-adopts'`)[0].user_id, guest.id);
+    // Signing in again is the same person, the guest named or not.
+    assertEquals((await links.userFor({ ...alice, sub: "g-adopts" })).id, guest.id);
+    assertEquals((await links.userFor({ ...alice, sub: "g-adopts" }, crypto.randomUUID())).id, guest.id);
+    // A guest already someone's is not taken by a second subject: that subject is a new user.
+    const second = await links.userFor({ ...alice, sub: "g-adopts-2" }, guest.id);
+    assert(second.id !== guest.id);
+    // A guest with a passkey is an account, not a guest.
+    const promoted = (await (await handler(post("/auth/guest", {}))).json()).user;
+    await sql`insert into mecha_auth.webauthn_credential (id, user_id, public_key, counter) values (${"cred-" + promoted.id}, ${promoted.id}, ${new Uint8Array([1])}, 0)`;
+    assert((await links.userFor({ ...alice, sub: "g-adopts-3" }, promoted.id)).id !== promoted.id);
+    // An id that is no guest at all (unknown, or not an id) is ignored.
+    assert((await links.userFor({ ...alice, sub: "g-adopts-4" }, crypto.randomUUID())).id.length > 0);
+    assert((await links.userFor({ ...alice, sub: "g-adopts-5" }, "not-a-uuid")).id.length > 0);
+  },
+});
+
+Deno.test({
+  name: "two subjects racing for one guest end with one winner",
+  ...opts,
+  fn: async () => {
+    await Promise.all(Array.from({ length: 6 }, () => sql`select pg_sleep(0.05)`));
+    const guest = (await (await handler(post("/auth/guest", {}))).json()).user;
+    const racers = await Promise.all(["g-race-a", "g-race-b", "g-race-c"].map((sub) => links.userFor({ ...alice, sub }, guest.id)));
+    assertEquals(racers.filter((u) => u.id === guest.id).length, 1);
+    assertEquals(new Set(racers.map((u) => u.id)).size, 3);
+  },
+});
+
+Deno.test({
   name: "a session is only a provider's while its link is there",
   ...opts,
   fn: async () => {
