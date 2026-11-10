@@ -59,7 +59,8 @@ a page the door serves:
   endpoint with that verifier, verifies the ID token (RS256 or ES256) against
   the provider's published keys, issuer, client and nonce, and links the
   subject to an `app_user` in `identity_link`, making both the first time. It
-  leaves an HttpOnly `mecha_oidc` cookie on `/auth/oidc` and a readable
+  leaves an HttpOnly `__Host-mecha_oidc` cookie (host-only, `Path=/`; a bare `mecha_oidc` on
+  `/auth/oidc` over plain http, and read from before the prefix unless `OIDC_LEGACY_COOKIE=off`) and a readable
   `mecha_oidc_hint` naming the provider, and returns to `return`, a
   same-origin path.
 - `POST /auth/oidc/session` exchanges the cookie for a **user token**, guest
