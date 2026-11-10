@@ -19,11 +19,13 @@ const NONE = { type: "module", deno: { permissions: "none" } } as const;
  * the sink answers JSON, its text otherwise. */
 export type Response = { status: number; body: unknown };
 
-/** One request to an effect's sink. */
+/** One request to an effect's or a door's sink. A body is sent as JSON unless
+ * `contentType` names another type, in which case it is a string sent as it is
+ * (a door's form-encoded call); `headers` are a door caller's declared ones. */
 export type Transport = (
   endpoint: string,
   path: string,
-  init: { method: string; body?: unknown },
+  init: { method: string; body?: unknown; contentType?: string; headers?: Record<string, string> },
   key: string,
   headers: Record<string, string>,
 ) => Promise<Response>;
@@ -68,11 +70,14 @@ export function bindingsTransport(mesh: string): Transport {
         // Metadata past the binding's own reaches the sink as headers: the
         // ledger key, and the credential the effect declares, which the host
         // alone holds.
+        // A door caller's headers first, so the credential, the path and the key
+        // are always the host's.
         metadata: {
+          ...init.headers,
           ...headers,
           path: sinkPath(path),
           "Idempotency-Key": key,
-          ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
+          ...(init.body === undefined ? {} : { "Content-Type": init.contentType ?? "application/json" }),
         },
       }),
     });
