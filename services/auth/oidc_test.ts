@@ -9,6 +9,7 @@ import { assert, assertEquals, assertRejects, assertThrows } from "jsr:@std/asse
 import { encodeBase64Url, signJwt } from "./jwt.ts";
 import {
   HINT_COOKIE,
+  LEGACY_SESSION_COOKIE,
   discovery,
   type Links,
   oidc,
@@ -23,6 +24,8 @@ import {
 } from "./oidc.ts";
 
 const ORIGIN = "https://app.test";
+// Google's state cookie: one per provider, all at Path=/ under the __Host- prefix.
+const STATE = `${STATE_COOKIE}_google`;
 const SECRET = "a-test-secret-that-is-at-least-32-chars";
 const now = () => Math.floor(Date.now() / 1000);
 const b64 = (s: string) => encodeBase64Url(new TextEncoder().encode(s));
@@ -127,7 +130,7 @@ const BROKERED: Record<string, string> = {
   OIDC_GOOGLE_AUTHORIZE_PARAMS: "provider=google",
 };
 
-async function setup(env = GOOGLE, links = memory()) {
+async function setup(env = GOOGLE, links = memory(), { legacyCookie }: { legacyCookie?: boolean } = {}) {
   const providers = providersFrom((name) => env[name]);
   const issuer = env.OIDC_GOOGLE_ISSUER ?? "https://accounts.google.com";
   const brokered = issuer !== "https://accounts.google.com";
@@ -143,6 +146,7 @@ async function setup(env = GOOGLE, links = memory()) {
     links,
     issue: (u) => signJwt(SECRET, { role: "app_user", sub: u.id, handle: u.handle, guest: false, exp: now() + 60 }),
     fetcher: idp.fetcher as typeof fetch,
+    legacyCookie,
   });
   const serve = async (req: Request) => {
     const res = routes(req);
@@ -159,12 +163,12 @@ async function begin(serve: (r: Request) => Promise<Response>, ret = "/chapter/8
   const res = await serve(new Request(`${ORIGIN}/auth/oidc/google/start?return=${encodeURIComponent(ret)}`));
   assertEquals(res.status, 303);
   const to = new URL(res.headers.get("location")!);
-  return { to, state: to.searchParams.get("state")!, verifier: jar(res)[STATE_COOKIE], cookie: res.headers.getSetCookie()[0] };
+  return { to, state: to.searchParams.get("state")!, verifier: jar(res)[STATE], cookie: res.headers.getSetCookie()[0] };
 }
 
 const callback = (q: Record<string, string>, verifier: string | null) =>
   new Request(`${ORIGIN}/auth/oidc/google/callback?${new URLSearchParams(q)}`, {
-    headers: verifier === null ? {} : { cookie: `${STATE_COOKIE}=${verifier}` },
+    headers: verifier === null ? {} : { cookie: `${STATE}=${verifier}` },
   });
 
 /** A whole sign-in: start, the provider's answer, the callback. */
@@ -173,10 +177,10 @@ async function signIn(s: Awaited<ReturnType<typeof setup>>) {
   return await s.serve(callback({ code: s.idp.authorize(to), state }, verifier));
 }
 
-const exchange = (session: string, origin: string | null = ORIGIN) =>
+const exchange = (session: string, origin: string | null = ORIGIN, name = SESSION_COOKIE) =>
   new Request(`${ORIGIN}/auth/oidc/session`, {
     method: "POST",
-    headers: { cookie: `${SESSION_COOKIE}=${session}`, ...(origin === null ? {} : { origin }) },
+    headers: { cookie: `${name}=${session}`, ...(origin === null ? {} : { origin }) },
   });
 
 Deno.test("Google signs a person in by code and PKCE, and the cookie becomes a non-guest session", async () => {
@@ -191,14 +195,14 @@ Deno.test("Google signs a person in by code and PKCE, and the cookie becomes a n
   assertEquals(to.searchParams.get("code_challenge"), await sha256url(verifier));
   // The provider sees the challenge, never the verifier.
   assert(!to.toString().includes(verifier));
-  assert(cookie.includes("Path=/auth/oidc/google/callback") && cookie.includes("HttpOnly") && cookie.includes("SameSite=Lax") && cookie.includes("Secure"), cookie);
+  assert(cookie.startsWith(`${STATE}=`) && cookie.includes("Path=/;") && cookie.includes("HttpOnly") && cookie.includes("SameSite=Lax") && cookie.includes("Secure"), cookie);
 
   const done = await s.serve(callback({ code: s.idp.authorize(to), state }, verifier));
   assertEquals(done.status, 303);
   assertEquals(done.headers.get("location"), "/chapter/8");
   const back = jar(done);
   assertEquals(back[HINT_COOKIE], "google");
-  assertEquals(back[STATE_COOKIE], "");
+  assertEquals(back[STATE], "");
   assertEquals(s.links.users.get("google:https://accounts.google.com:alice-sub")?.name, "Alice");
 
   const session = await s.serve(exchange(back[SESSION_COOKIE]));
@@ -394,7 +398,7 @@ async function nativeSignIn(s: Awaited<ReturnType<typeof setup>>, ret = "/table/
   const res = await s.serve(new Request(`${ORIGIN}/auth/oidc/google/start?return=${encodeURIComponent(ret)}&native=${await sha256url(secret)}`));
   assertEquals(res.status, 303);
   const to = new URL(res.headers.get("location")!);
-  const done = await s.serve(callback({ code: s.idp.authorize(to), state: to.searchParams.get("state")! }, jar(res)[STATE_COOKIE]));
+  const done = await s.serve(callback({ code: s.idp.authorize(to), state: to.searchParams.get("state")! }, jar(res)[STATE]));
   return { secret, done };
 }
 
@@ -416,7 +420,7 @@ Deno.test("an app signs in through the system browser: its link back carries a c
   assert(back.hash.startsWith("#handoff="), back.hash);
   const handoff = back.hash.slice("#handoff=".length);
   // The system browser keeps no session of the app's: only the spent state.
-  assertEquals(jar(done), { [STATE_COOKIE]: "" });
+  assertEquals(jar(done), { [STATE]: "" });
 
   const id = s.links.users.get("google:https://accounts.google.com:alice-sub")!.id;
   const answer = await s.serve(redeem({ handoff, secret }));
@@ -473,7 +477,7 @@ Deno.test("sign-out clears the session and its hint, and only from this origin",
   assertEquals((await s.serve(new Request(`${ORIGIN}/auth/oidc/signout`, { method: "POST", headers: { origin: "https://evil.test" } }))).status, 403);
   const res = await s.serve(new Request(`${ORIGIN}/auth/oidc/signout`, { method: "POST", headers: { origin: ORIGIN } }));
   assertEquals(res.status, 204);
-  assertEquals(jar(res), { [SESSION_COOKIE]: "", [HINT_COOKIE]: "" });
+  assertEquals(jar(res), { [SESSION_COOKIE]: "", [LEGACY_SESSION_COOKIE]: "", [HINT_COOKIE]: "" });
 });
 
 Deno.test("a provider the deployment did not enable, and every other path, is not a route", async () => {
@@ -531,4 +535,22 @@ Deno.test("disabling a provider also refuses its browser session", async () => {
   const cookie = jar(await signIn(s))[SESSION_COOKIE];
   const disabled = oidc({ secret: SECRET, origin: () => ORIGIN, providers: {}, links: s.links, issue: () => Promise.resolve("unused") });
   assertEquals((await disabled(exchange(cookie))!).status, 401);
+});
+
+Deno.test("over https the session cookie is __Host-: host-only, Secure, Path=/", async () => {
+  const s = await setup();
+  const done = await signIn(s);
+  const cookie = done.headers.getSetCookie().find((c) => c.startsWith(`${SESSION_COOKIE}=`))!;
+  assert(cookie.startsWith("__Host-") && cookie.includes("; Path=/;") && cookie.includes("Secure") && cookie.includes("HttpOnly") && !/domain=/i.test(cookie), cookie);
+});
+
+Deno.test("a session signed in before the prefix is read for a transition, and never where the origin turned it off", async () => {
+  const s = await setup();
+  const session = jar(await signIn(s))[SESSION_COOKIE];
+  assertEquals((await s.serve(exchange(session, ORIGIN, LEGACY_SESSION_COOKIE))).status, 200);
+  // A new origin: a bare mecha_oidc there could only be a sibling host's, set for the parent domain.
+  const fresh = await setup(GOOGLE, memory(), { legacyCookie: false });
+  const theirs = jar(await signIn(fresh))[SESSION_COOKIE];
+  assertEquals((await fresh.serve(exchange(theirs, ORIGIN, LEGACY_SESSION_COOKIE))).status, 401);
+  assertEquals((await fresh.serve(exchange(theirs))).status, 200);
 });

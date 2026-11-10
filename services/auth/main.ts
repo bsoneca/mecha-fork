@@ -717,6 +717,9 @@ const providerSignIn = oidc({
   providers: OIDC_PROVIDERS,
   links,
   issue: (user) => issueUserToken(user.id, user.handle),
+  // An origin new since the __Host- session cookie sets this "off": a bare mecha_oidc there could
+  // only be a sibling host's (oidc.ts, LEGACY_SESSION_COOKIE).
+  legacyCookie: Deno.env.get("OIDC_LEGACY_COOKIE") !== "off",
 });
 
 export async function handler(req: Request): Promise<Response> {

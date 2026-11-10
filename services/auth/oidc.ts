@@ -25,8 +25,15 @@
 import { decodeBase64Url, encodeBase64Url, signJwt, verifyJwt } from "./jwt.ts";
 
 export const PREFIX = "/auth/oidc";
-export const SESSION_COOKIE = "mecha_oidc";
-export const STATE_COOKIE = "mecha_oidc_state";
+// Over https the session and state cookies are __Host-: host-only, Secure and Path=/, so a sibling
+// host under the same parent domain (a published game at <slug>-game.bsoneca.com beside Studio)
+// cannot set one this origin adopts (login fixation). Plain http, a local stand-in's, cannot carry
+// the prefix and keeps the bare names.
+export const SESSION_COOKIE = "__Host-mecha_oidc";
+/** The session's name before the prefix, read only where `legacyCookie` allows (Config). */
+export const LEGACY_SESSION_COOKIE = "mecha_oidc";
+export const STATE_COOKIE = "__Host-mecha_oidc_state";
+/** Not a credential: the provider's name, which the shell reads to resume a sign-in. */
 export const HINT_COOKIE = "mecha_oidc_hint";
 const STATE_TTL_S = 600;
 const HANDOFF_TTL_S = 60;
@@ -189,6 +196,9 @@ export type Config = {
   links: Links;
   issue: (user: User) => Promise<string>;
   fetcher?: typeof fetch;
+  /** Whether a session from before the __Host- prefix is still read (false: never, as an origin new
+   * since then sets, where only a sibling host could have left one). Default true, for a transition. */
+  legacyCookie?: boolean;
 };
 
 const dec = new TextDecoder();
@@ -297,13 +307,21 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
   const endpoints = discovery(fetcher);
   const keys = keySource(fetcher);
   const now = () => Math.floor(Date.now() / 1000);
-  const secure = (origin: string) => origin.startsWith("https://") ? "; Secure" : "";
+  const isSecure = (origin: string) => origin.startsWith("https://");
+  const secure = (origin: string) => isSecure(origin) ? "; Secure" : "";
+  const bare = (name: string) => name.replace(/^__Host-/, "");
+  // The session cookie as this origin names and scopes it.
+  const sessionName = (origin: string) => isSecure(origin) ? SESSION_COOKIE : LEGACY_SESSION_COOKIE;
+  const sessionPath = (origin: string) => isSecure(origin) ? "/" : PREFIX;
+  // One state cookie per provider: __Host- holds every one at Path=/.
+  const stateName = (origin: string, name: string) => isSecure(origin) ? `${STATE_COOKIE}_${name}` : `${bare(STATE_COOKIE)}_${name}`;
+  const statePath = (origin: string, name: string) => isSecure(origin) ? "/" : `${PREFIX}/${name}/callback`;
   const callbackOf = (origin: string, name: string) => `${origin}${PREFIX}/${name}/callback`;
   const clientOf = (p: Provider, origin: string) => p.client === ORIGIN_CLIENT ? origin : p.client;
   // Lax reaches the callback: the provider sends the reader back by a
   // top-level GET.
   const stateCookie = (origin: string, name: string, value: string, age: number) =>
-    `${STATE_COOKIE}=${value}; Path=${PREFIX}/${name}/callback; HttpOnly; SameSite=Lax${secure(origin)}; Max-Age=${age}`;
+    `${stateName(origin, name)}=${value}; Path=${statePath(origin, name)}; HttpOnly; SameSite=Lax${secure(origin)}; Max-Age=${age}`;
 
   async function start(req: Request, name: string): Promise<Response> {
     const p = cfg.providers[name];
@@ -354,7 +372,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     if (state === null || state.purpose !== "oidc" || state.provider !== name || state.issuer !== p.issuer || typeof state.nonce !== "string") {
       return refuse(400, "invalid state");
     }
-    const verifier = cookieOf(req, STATE_COOKIE);
+    const verifier = cookieOf(req, stateName(origin, name));
     if (verifier === null || (await sha256url(verifier)) !== state.bind) return refuse(400, "state is another browser's");
     const client = clientOf(p, origin);
     const ends = await endpoints(p);
@@ -393,7 +411,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     }
     const session = await signJwt(cfg.secret, { purpose: "oidc-session", provider: name, issuer: p.issuer, sub: user.id, exp: now() + COOKIE_TTL_S });
     return redirect(ret, [
-      `${SESSION_COOKIE}=${session}; Path=${PREFIX}; HttpOnly; SameSite=Lax${secure(origin)}; Max-Age=${COOKIE_TTL_S}`,
+      `${sessionName(origin)}=${session}; Path=${sessionPath(origin)}; HttpOnly; SameSite=Lax${secure(origin)}; Max-Age=${COOKIE_TTL_S}`,
       `${HINT_COOKIE}=${name}; Path=/; SameSite=Lax${secure(origin)}; Max-Age=${COOKIE_TTL_S}`,
       stateCookie(origin, name, "", 0),
     ]);
@@ -435,7 +453,10 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     if ((req.headers.get("content-type") ?? "").startsWith("application/json")) {
       c = await handedOff(req);
     } else {
-      const raw = cookieOf(req, SESSION_COOKIE);
+      const here = cfg.origin(req);
+      let raw = cookieOf(req, sessionName(here));
+      // Signed in before the prefix: read for a transition, never on an origin that turned it off.
+      if (raw === null && isSecure(here) && cfg.legacyCookie !== false) raw = cookieOf(req, LEGACY_SESSION_COOKIE);
       if (raw === null) return refuse(401, "not signed in");
       c = await verifyJwt(cfg.secret, raw);
       if (c?.purpose !== "oidc-session") c = null;
@@ -460,7 +481,8 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     if (origin !== null && origin !== cfg.origin(req)) return refuse(403, "another origin");
     const door = cfg.origin(req);
     const headers = new Headers({ "cache-control": "no-store" });
-    headers.append("set-cookie", `${SESSION_COOKIE}=; Path=${PREFIX}; HttpOnly; SameSite=Lax${secure(door)}; Max-Age=0`);
+    headers.append("set-cookie", `${sessionName(door)}=; Path=${sessionPath(door)}; HttpOnly; SameSite=Lax${secure(door)}; Max-Age=0`);
+    if (isSecure(door)) headers.append("set-cookie", `${LEGACY_SESSION_COOKIE}=; Path=${PREFIX}; HttpOnly; SameSite=Lax; Secure; Max-Age=0`);
     headers.append("set-cookie", `${HINT_COOKIE}=; Path=/; SameSite=Lax${secure(door)}; Max-Age=0`);
     return new Response(null, { status: 204, headers });
   }
