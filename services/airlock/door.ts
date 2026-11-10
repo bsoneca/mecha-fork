@@ -11,7 +11,10 @@
 //   enter    `entered + 1`, before the call: past one, a call may have reached
 //            the sink
 //   call     through the door's HTTPEndpoint, the credential added by the host from
-//            what it read at startup, the ledger key as the Idempotency-Key
+//            what it read at startup, the ledger key as the Idempotency-Key, or
+//            the caller's own `sinkKey` where it names one (the key it sends the
+//            sink by another way too, so a call retried that other way is the
+//            same call at the sink)
 //   outcome  a sink answer below 500, committed, then answered
 //
 // A 5xx or no answer is not an outcome: the caller is answered 502 and calls
@@ -45,6 +48,9 @@ export type DoorRequest = {
   body?: unknown;
   contentType?: string;
   headers?: Record<string, string>;
+  /** The sink's Idempotency-Key, where the caller keeps one of its own (1 to 255
+   * visible characters, Stripe's limit); frozen with the request. */
+  sinkKey?: string;
 };
 
 /** The ledger as a door uses it: three commits. */
@@ -62,6 +68,7 @@ export type DoorAnswer = { status: number; body: unknown };
 const METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 /** A caller's key: what Stripe takes as an Idempotency-Key, once prefixed. */
 const KEY = /^[A-Za-z0-9._:-]{1,200}$/;
+const SINK_KEY = /^[\x20-\x7e]{1,255}$/;
 
 /** effects.json's `doors`, checked; an absent map is no door. */
 export function parseDoors(text: string, effects: Record<string, unknown> = {}): Record<string, Door> {
@@ -118,13 +125,17 @@ export function request(door: Door, r: unknown): DoorRequest {
     if (typeof v !== "string" || v.length > 200 || !HEADER_VALUE.test(v)) throw new Refused(`header ${h}: a short visible value`);
     headers[declared] = v;
   }
+  if (q.sinkKey !== undefined && (typeof q.sinkKey !== "string" || !SINK_KEY.test(q.sinkKey))) throw new Refused("sinkKey is 1 to 255 visible characters");
   // JSON is the transport's default: an object body is encoded there.
   const contentType = q.contentType === "application/json" ? undefined : q.contentType;
-  return { key: q.key, method: q.method, path: q.path, body: q.body, contentType, headers };
+  return { key: q.key, method: q.method, path: q.path, body: q.body, contentType, headers, ...(q.sinkKey === undefined ? {} : { sinkKey: q.sinkKey }) };
 }
 
 /** What the ledger freezes: the request a key names. */
-const input = (r: DoorRequest) => ({ method: r.method, path: r.path, body: r.body ?? null, contentType: r.contentType ?? null, headers: r.headers ?? {} });
+const input = (r: DoorRequest) => ({
+  method: r.method, path: r.path, body: r.body ?? null, contentType: r.contentType ?? null, headers: r.headers ?? {},
+  ...(r.sinkKey === undefined ? {} : { sinkKey: r.sinkKey }),
+});
 
 /** JSON with every object's keys sorted: Postgres's jsonb hands keys back in
  * its own order. */
@@ -148,7 +159,7 @@ export async function pass(
   await ledger.enter(key);
   let answer: DoorAnswer;
   try {
-    answer = await transport(name, r.path, { method: r.method, body: r.body, contentType: r.contentType, headers: r.headers }, key, credential);
+    answer = await transport(name, r.path, { method: r.method, body: r.body, contentType: r.contentType, headers: r.headers }, r.sinkKey ?? key, credential);
   } catch (e) {
     return { unanswered: e instanceof Error ? e.message : String(e) };
   }
