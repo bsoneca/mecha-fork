@@ -23,7 +23,7 @@ export type Response = { status: number; body: unknown };
 export type Transport = (
   endpoint: string,
   path: string,
-  init: { method: string; body?: unknown; headers?: Record<string, string>; contentType?: string },
+  init: { method: string; body?: unknown; headers?: Record<string, string>; contentType?: string; timeoutMs?: number },
   key: string,
   headers: Record<string, string>,
 ) => Promise<Response>;
@@ -64,7 +64,8 @@ export function meshTransport(mesh: string): Transport {
   return async (endpoint, path, init, key, headers) => {
     const res = await fetch(`${mesh}/v1.0/invoke/${endpoint}/method${sinkPath(path)}`, {
       method: init.method,
-      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+      // A door's own timeout where it declares one (door.ts): a model's answer takes minutes.
+      signal: AbortSignal.timeout(init.timeoutMs ?? CALL_TIMEOUT_MS),
       headers: {
         Accept: "application/json",
         ...init.headers,
