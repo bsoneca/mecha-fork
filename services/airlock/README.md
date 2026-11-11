@@ -163,7 +163,7 @@ and no dead letter follows (`undeployed` in [reentry.ts](reentry.ts)).
 
 An effect answers later, as the machine's next event. A call that needs its answer
 now (a page waiting for a checkout URL) goes through a **door** ([door.ts](door.ts)):
-`effects.json`'s `doors`, each `{idempotent: true, credential?, headers?, callers}`,
+`effects.json`'s `doors`, each `{idempotent: true, credential?, headers?, timeoutMs?, callers}`,
 with an HTTPEndpoint of its name on the airlock's daprd as an effect has (not the app's door, its caddy). Only the services named in
 `callers` reach port 9998 (`DOOR_PORT`), over a network or NetworkPolicy nothing else joins.
 
@@ -186,6 +186,16 @@ A 5xx, or no answer, is no outcome: the caller is answered 502 and calls again w
 same key, which is why a door is declared idempotent only. The caller never holds the
 credential, and a door's `headers` may not name it. A door's row holds no instance
 (`row` is `{}`), so nothing moves a machine and Graphile never sees it.
+
+A door may declare `timeoutMs` (a whole number of milliseconds, at most 600000), how
+long its sink may take: a model's answer takes minutes, and a call cut short is no
+answer, asked again and billed again. Without it the transport's own
+(`CALL_TIMEOUT_MS`) holds. The daprd's resiliency policy for the door's endpoint, where
+a release declares one, is given the same timeout. A header the door declares as
+`{name, hidden: true}` (a person's own key to a gateway) reaches the sink, but the
+ledger freezes only `sha256:<hex>` of its value: the same value is the same request,
+another is another, and the value is stored nowhere. A hidden header is never the
+credential's.
 
 ## After a crash
 

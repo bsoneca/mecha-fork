@@ -368,3 +368,24 @@ Deno.test("a declared content type reaches the sink's call, and its body is the 
   await Deno.remove(dir, { recursive: true });
 });
 
+
+Deno.test("the mesh waits a call's own timeoutMs, else CALL_TIMEOUT_MS (PRONTO-271)", async () => {
+  const real = globalThis.fetch;
+  const signals: AbortSignal[] = [];
+  globalThis.fetch = (_url, init) => {
+    signals.push(init!.signal!);
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => resolve(new Response("{}", { status: 200, headers: { "content-type": "application/json" } })), 80);
+      init!.signal!.addEventListener("abort", () => (clearTimeout(t), reject(init!.signal!.reason)));
+    });
+  };
+  try {
+    const mesh = meshTransport("http://mesh");
+    await assertRejects(() => mesh("model", "/v1/messages", { method: "POST", body: {}, timeoutMs: 10 }, "k", {}));
+    assertEquals(await mesh("model", "/v1/messages", { method: "POST", body: {}, timeoutMs: 5_000 }, "k", {}), { status: 200, body: {} });
+    assertEquals(await mesh("model", "/v1/messages", { method: "POST", body: {} }, "k", {}), { status: 200, body: {} });
+    assertEquals(signals.length, 3);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
