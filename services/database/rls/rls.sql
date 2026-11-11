@@ -132,9 +132,20 @@ CREATE OR REPLACE FUNCTION public.app_pre_request() RETURNS void
   LANGUAGE plpgsql AS $$
 DECLARE
   sub text := nullif(current_setting('request.jwt.claims', true)::json->>'sub', '');
+  claims jsonb := coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb, '{}');
+  writes boolean := current_setting('request.method', true) IN ('POST', 'PATCH', 'PUT', 'DELETE');
 BEGIN
   IF sub LIKE '%,%' THEN
     RAISE EXCEPTION 'jwt sub contains a comma, which would split into two scopes';
+  END IF;
+  -- A token an API key minted (services/auth, README.md "API keys") names its key
+  -- (`kid`) and the key's scopes (`scp`), and reaches only what they grant: a
+  -- write, a function call included, needs `write`; anything else, a read or a
+  -- check with no request at all (the shape gatekeeper's), needs `read`. A
+  -- session's token names no key and is unchanged. 42501 is PostgREST's 403.
+  IF claims ? 'kid' AND NOT coalesce(claims -> 'scp' ? CASE WHEN writes THEN 'write' ELSE 'read' END, false) THEN
+    RAISE EXCEPTION 'this API key''s scopes do not allow a %', CASE WHEN writes THEN 'write' ELSE 'read' END
+      USING ERRCODE = '42501';
   END IF;
   PERFORM set_config('app.scopes',
     array_to_string(public.subject_scopes(sub), ','), true);

@@ -608,3 +608,15 @@ Deno.test("a provider's program defaults stand until the deployment sets its own
     assert.equal((await exported({}, "capabilities", { signIn: { google: bad } })).ok, false, JSON.stringify(bad));
   }
 });
+
+// API keys (PRONTO-312) reach the auth service as AUTH_API_KEYS=true only where the
+// program turns them on; an app that does not carries no variable at all.
+Deno.test("an app's apiKeys turn auth on and the key routes with it, and are absent otherwise", async () => {
+  const on = await exported({}, "surface.targets.auth.compose.environment", { apiKeys: true });
+  assert.equal(on.ok, true, on.stderr);
+  assert.equal(on.value.AUTH_API_KEYS, "true");
+  const off = await exported({}, "surface.targets.auth.compose.environment", { auth: true });
+  assert.equal(off.ok, true, off.stderr);
+  assert.equal("AUTH_API_KEYS" in off.value, false);
+  assert.equal((await exported({}, "capabilities", { apiKeys: true, auth: false })).ok, false);
+});

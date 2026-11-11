@@ -93,3 +93,30 @@ subjects or browser sessions. Removing a provider also ends cookie adoption.
 For an existing link table without issuers, add an `issuer text` column and
 populate it with each row's original issuer before starting auth; startup
 refuses unassigned rows because the provider label cannot identify their issuer.
+
+## API keys
+
+An account's durable credential for a client with no browser (a bot), behind
+the program's `apiKeys` capability (cluster.cue, `AUTH_API_KEYS=true`): off,
+every route below answers 404, so no app gets them by a pin bump alone.
+
+- `POST /auth/keys {label, scopes}` with a signed-in account's session makes a
+  key and answers it once, `pk_live_…`; `mecha_auth.api_key` keeps only its
+  SHA-256, with its owner, label, scopes, `created_at`, `last_used` and
+  `revoked_at`. Scopes are `read`, `write` and `machines:<name>`. At most five
+  live keys an account (409 past them; a revoke frees a place). A guest is 403
+  `guest`; a token a key minted is 403 `key token`, so a key never makes or
+  revokes another.
+- `GET /auth/keys` lists the caller's live keys, never a key or its hash.
+- `DELETE /auth/keys/<id>` revokes the caller's own live key (204); another's,
+  or one already revoked, is 404.
+- `POST /auth/key {key}` exchanges a live key for a **user token** of its owner
+  that lives 15 minutes and carries `kid` (the key's id) and `scp` (its
+  scopes) beside the usual claims, so `/crud` takes it as the owner and RLS
+  applies unchanged. An unknown or revoked key is 401. The key's `last_used`
+  moves.
+
+The table is in `mecha_auth` (api_keys.ts), a schema no app role may use, unlike
+the passkeys and links this line keeps in public: no app role reaches it, and the one reader by hash is `mecha_auth.api_key_owner`,
+`SECURITY DEFINER`, whose execute no one but its owner holds. The signing
+secret stays in this service: no other process mints a key's token.
