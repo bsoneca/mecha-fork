@@ -95,7 +95,20 @@ export function ceremonyOrigin(configured: string, host: string | null): string 
   return host !== null && /^localhost(:\d+)?$/.test(host) ? `https://${host}` : configured;
 }
 
-const USER_TOKEN_TTL_S = 7 * 24 * 3600;
+// Seconds, from the environment so a stack can make a session short (a scenario of a guest who comes
+// back after its token expired); a week by default.
+function seconds(name: string, fallback: number): number {
+  const raw = Deno.env.get(name);
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) throw new Error(`${name} must be a positive whole number of seconds, not ${raw}`);
+  return n;
+}
+const USER_TOKEN_TTL_S = seconds("USER_TOKEN_TTL_S", 7 * 24 * 3600);
+// How long after its token expired a guest may still trade it for a new one (POST /auth/guest/refresh):
+// a guest token is the only way back to a guest's account, so a guest away for longer than a week
+// comes back as itself; 90 days by default.
+const GUEST_REFRESH_GRACE_S = seconds("GUEST_REFRESH_GRACE_S", 90 * 24 * 3600);
 // A shape token outlives one long-poll cycle and little else: Electric holds a
 // request open for 300s, so a token shorter than that expires mid-stream, and a
 // long one is a scope set that cannot be revoked.
@@ -135,7 +148,7 @@ export async function migrate(): Promise<void> {
 const enc = new TextEncoder();
 
 export const signJwt = (claims: Record<string, unknown>) => sign(JWT_SECRET, claims);
-export const verifyJwt = (token: string) => verify(JWT_SECRET, token);
+export const verifyJwt = (token: string, graceS = 0) => verify(JWT_SECRET, token, graceS);
 
 // A guest's token says so, so a policy can keep writes to the people who
 // signed in (`request.jwt.claims ->> 'guest'`).
@@ -625,6 +638,27 @@ async function guest(_req: Request): Promise<Response> {
   return json(200, { token, user: { id: userId, handle, guest: true } });
 }
 
+// A guest's token for a new one of the same id and handle, so a guest who keeps coming back keeps its
+// account: the bearer must be a guest's, live or expired within GUEST_REFRESH_GRACE_S, and the account
+// still a guest (no passkey, no provider): an account's way back is its own sign-in. A refreshed
+// token is a bearer of a guest account only (no passkey, no payment, no friends).
+async function guestRefresh(req: Request): Promise<Response> {
+  const auth = req.headers.get("authorization");
+  const c = auth?.startsWith("Bearer ") ? await verifyJwt(auth.slice("Bearer ".length), GUEST_REFRESH_GRACE_S) : null;
+  if (c === null || c.role !== "app_user" || c.guest !== true || typeof c.sub !== "string" || !UUID.test(c.sub)) {
+    return jsonError(401, "invalid token");
+  }
+  const [u] = await sql`select u.handle,
+      exists (select 1 from mecha_auth.webauthn_credential w where w.user_id = u.id)
+      or exists (select 1 from mecha_auth.identity_link l where l.user_id = u.id) as promoted
+    from app_user u where u.id = ${c.sub}`;
+  if (!u) return jsonError(404, "no such user");
+  if (u.promoted) return jsonError(409, "already an account");
+  const handle = u.handle as string;
+  const token = await issueUserToken(c.sub, handle, true);
+  return json(200, { token, user: { id: c.sub, handle, guest: true } });
+}
+
 async function whoami(req: Request): Promise<Response> {
   const subject = await subjectOf(req);
   if (subject === "refused" || subject.claims === null) return jsonError(401, "invalid token");
@@ -735,6 +769,9 @@ export async function handler(req: Request): Promise<Response> {
     }
     if (req.method === "POST" && path === "/auth/guest") {
       return await guest(req);
+    }
+    if (req.method === "POST" && path === "/auth/guest/refresh") {
+      return await guestRefresh(req);
     }
     if (req.method === "GET" && path === "/auth/whoami") {
       return await whoami(req);
