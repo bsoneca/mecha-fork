@@ -202,3 +202,92 @@ Deno.test("the binding sends a door's form body as it is, its headers below the 
     "Content-Type": "application/x-www-form-urlencoded",
   });
 });
+
+// PRONTO-271: a door's own timeout, and headers the ledger holds only hashed.
+const model: Door = {
+  idempotent: true,
+  credential: { header: "Authorization", scheme: "Bearer", secret: "LITELLM_MASTER_KEY" },
+  headers: ["Anthropic-Version", { name: "X-Api-Key", hidden: true }],
+  timeoutMs: 300_000,
+  callers: ["builder"],
+};
+const turn = {
+  key: "turn-m1:abc",
+  method: "POST",
+  path: "/v1/messages",
+  body: { model: "claude-sonnet-5-5", messages: [] },
+  headers: { "Anthropic-Version": "2023-06-01", "X-Api-Key": "sk-person-secret" },
+};
+
+Deno.test("a door's timeoutMs reaches the transport; without one the transport keeps its own", async () => {
+  const log: string[] = [];
+  const { sent, transport } = sink(log, () => ({ status: 200, body: {} }));
+  await pass("model", request(model, turn), memory(log), transport, KEY, model);
+  assertEquals(sent[0].init.timeoutMs, 300_000);
+  await pass("stripe", request(stripe, checkout), memory(log), transport, KEY, stripe);
+  assertEquals(sent[1].init.timeoutMs, undefined, "the transport's default (CALL_TIMEOUT_MS)");
+});
+
+Deno.test("a door waits on a slow sink as long as it declares, and answers once", async () => {
+  const real = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (_url, init) => {
+    calls++;
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => resolve(new Response('{"ok":true}', { status: 200, headers: { "metadata.statuscode": "200", "metadata.content-type": "application/json" } })), 150);
+      init?.signal?.addEventListener("abort", () => (clearTimeout(t), reject(init.signal!.reason)));
+    });
+  };
+  try {
+    const log: string[] = [];
+    const ledger = memory(log);
+    const slow = { ...model, timeoutMs: 1_000 };
+    const serve = serveDoors({ model: slow }, ledger, bindingsTransport("http://mesh"), { model: KEY });
+    const post = () => serve(new Request("http://airlock:9998/door/model", { method: "POST", body: JSON.stringify(turn) }));
+    const first = await post();
+    assertEquals([first.status, await first.json()], [200, { status: 200, body: { ok: true }, replayed: false }]);
+    const again = await post();
+    assertEquals((await again.json()).replayed, true);
+    assertEquals(calls, 1, "one call at the sink");
+    // Shorter than the sink: no answer, the caller's to ask again.
+    const short = serveDoors({ model: { ...model, timeoutMs: 20 } }, memory(log), bindingsTransport("http://mesh"), { model: KEY });
+    const cut = await short(new Request("http://airlock:9998/door/model", { method: "POST", body: JSON.stringify(turn) }));
+    assertEquals(cut.status, 502);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+Deno.test("a door's timeoutMs is a positive whole number of ms, at most ten minutes", () => {
+  const doors = (d: unknown) => () => parseDoors(JSON.stringify({ effects: {}, doors: { model: d } }));
+  assertEquals(doors(model)().model.timeoutMs, 300_000);
+  assertEquals(doors({ ...model, timeoutMs: 600_000 })().model.timeoutMs, 600_000);
+  for (const bad of [0, -1, 600_001, 1.5, "300000", null]) assertThrows(doors({ ...model, timeoutMs: bad }), Error, "timeoutMs");
+});
+
+Deno.test("a hidden header reaches the sink; the ledger holds its hash, never its value", async () => {
+  const log: string[] = [];
+  const ledger = memory(log);
+  const { sent, transport } = sink(log, () => ({ status: 200, body: { id: "msg_1" } }));
+  await pass("model", request(model, turn), ledger, transport, KEY, model);
+  assertEquals(sent[0].init.headers, { "Anthropic-Version": "2023-06-01", "X-Api-Key": "sk-person-secret" });
+  const stored = JSON.stringify([...ledger.rows.values()]);
+  assert(!stored.includes("sk-person-secret"), "the stored input holds no secret");
+  const held = ledger.rows.get("model:turn-m1:abc")!.input as { headers: Record<string, string> };
+  assertEquals(held.headers["Anthropic-Version"], "2023-06-01");
+  assert(/^sha256:[0-9a-f]{64}$/.test(held.headers["X-Api-Key"]));
+  // The same value replays from the ledger; another value is another request.
+  assertEquals((await pass("model", request(model, turn), ledger, transport, KEY, model) as { replayed: boolean }).replayed, true);
+  assertEquals(sent.length, 1);
+  await assertRejects(() => pass("model", request(model, { ...turn, headers: { ...turn.headers, "X-Api-Key": "sk-other" } }), ledger, transport, KEY, model), Refused, "another request");
+});
+
+Deno.test("a hidden header is declared {name, hidden: true}, and never the credential's", () => {
+  const doors = (d: unknown) => () => parseDoors(JSON.stringify({ effects: {}, doors: { model: d } }));
+  assertEquals(doors(model)().model.headers, model.headers);
+  assertThrows(doors({ ...model, headers: [{ name: "Authorization", hidden: true }] }), Error, "credential's header");
+  for (const bad of [{ name: "X-Api-Key" }, { name: "X-Api-Key", hidden: false }, { name: "x-api-key", hidden: true }, { name: "X-Api-Key", hidden: true, more: 1 }]) {
+    assertThrows(doors({ ...model, headers: [bad] }), Error, "headers");
+  }
+  assertThrows(() => request(model, { ...turn, headers: { "X-Other": "v" } }), Refused, "not one the door declares");
+});

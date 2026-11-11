@@ -25,7 +25,7 @@ export type Response = { status: number; body: unknown };
 export type Transport = (
   endpoint: string,
   path: string,
-  init: { method: string; body?: unknown; contentType?: string; headers?: Record<string, string> },
+  init: { method: string; body?: unknown; contentType?: string; headers?: Record<string, string>; timeoutMs?: number },
   key: string,
   headers: Record<string, string>,
 ) => Promise<Response>;
@@ -62,7 +62,8 @@ export function bindingsTransport(mesh: string): Transport {
   return async (binding, path, init, key, headers) => {
     const res = await fetch(`${mesh}/v1.0/bindings/${binding}`, {
       method: "POST",
-      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+      // A door's own timeout where it declares one (door.ts): a model's answer takes minutes.
+      signal: AbortSignal.timeout(init.timeoutMs ?? CALL_TIMEOUT_MS),
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         operation: init.method.toLowerCase(),
