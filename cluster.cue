@@ -547,6 +547,15 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		if len(android) > 0 {
 			auth: true
 		}
+		// API keys (services/auth/README.md, "API keys"): an account's durable
+		// credential for a client with no browser, exchanged for a short user
+		// token. Off by default, so no app gets the routes by a pin bump alone:
+		// the auth service answers 404 for every key route until the program
+		// turns them on. Keys are an account's, so they presuppose `auth`.
+		apiKeys: *false | bool
+		if apiKeys {
+			auth: true
+		}
 
 		// The change feed: conduit reading the WAL onto the bus (redis, behind
 		// the mesh-events sidecar) and transform running the pipelines off it.
@@ -1077,6 +1086,11 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							// The app's Android builds by their signing certificates
 							// (capabilities.android); none by default.
 							WEBAUTHN_ANDROID_ORIGINS: "${WEBAUTHN_ANDROID_ORIGINS:-\(strings.Join(X.capabilities.android, ","))}"
+							// Only an app that turns keys on carries the variable, so an
+							// app that does not is byte for byte what it was.
+							if X.capabilities.apiKeys {
+								AUTH_API_KEYS: "true"
+							}
 							OIDC_PROVIDERS: strings.Join([for p, _ in X.capabilities.signIn {p}], ",")
 							for p, d in X.capabilities.signIn {
 								let k = "OIDC_\(strings.ToUpper(p))_CLIENT_ID"

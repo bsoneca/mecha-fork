@@ -13,7 +13,7 @@ import {
 } from "jsr:@std/assert@1.0.13";
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
 import { androidOrigin } from "./origins.ts";
-import { admittedOrigin, ceremonyOrigin, handler, issueUserToken, links, migrate, signJwt, sql, verifyJwt } from "./main.ts";
+import { admittedOrigin, ceremonyOrigin, handler, issueUserToken, KEY_TOKEN_TTL_S, links, MAX_LIVE_KEYS, migrate, signJwt, sql, verifyJwt } from "./main.ts";
 import { PUBLIC_WHERE } from "./jwt.ts";
 import { PUBLIC_WHERE as CLIENT_PUBLIC_WHERE } from "../../packages/client/src/public-where.ts";
 
@@ -104,6 +104,7 @@ await sql`INSERT INTO mecha.shape_key VALUES
 await migrate();
 await sql`delete from mecha_auth.webauthn_credential`;
 await sql`delete from mecha_auth.identity_link`;
+await sql`delete from mecha_auth.api_key`;
 await sql`delete from app_user`;
 
 function post(path: string, body: unknown, token?: string): Request {
@@ -1324,6 +1325,214 @@ Deno.test("a provider named without its client is refused at startup", async () 
   }).output();
   assert(!success);
   assertStringIncludes(new TextDecoder().decode(stderr), "OIDC_GOOGLE_CLIENT_ID is required");
+});
+
+// --- API keys (PRONTO-312): POST/GET /auth/keys, DELETE /auth/keys/{id}, POST /auth/key ---
+
+// Each case runs with the app's auth config's api_keys on (AUTH_API_KEYS) unless it says otherwise.
+async function withKeys<T>(on: boolean, fn: () => Promise<T>): Promise<T> {
+  const was = Deno.env.get("AUTH_API_KEYS");
+  Deno.env.set("AUTH_API_KEYS", on ? "true" : "false");
+  try {
+    return await fn();
+  } finally {
+    if (was === undefined) Deno.env.delete("AUTH_API_KEYS");
+    else Deno.env.set("AUTH_API_KEYS", was);
+  }
+}
+// A signed-in account (not a guest) and its session token.
+async function account(): Promise<{ id: string; handle: string; token: string }> {
+  const id = crypto.randomUUID();
+  const handle = `key-holder-${id.slice(0, 8)}`;
+  await sql`insert into app_user (id, handle) values (${id}, ${handle})`;
+  return { id, handle, token: await issueUserToken(id, handle) };
+}
+function call(method: string, path: string, token?: string, body?: unknown): Request {
+  return new Request(`http://auth:9999${path}`, {
+    method,
+    headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+}
+async function created(token: string, label = "bot", scopes = ["read", "write"]) {
+  const res = await handler(call("POST", "/auth/keys", token, { label, scopes }));
+  return { status: res.status, body: await res.json() };
+}
+const exchange = async (key: string) => {
+  const res = await handler(call("POST", "/auth/key", undefined, { key }));
+  return { status: res.status, body: await res.json() };
+};
+
+Deno.test({
+  name: "a key is answered once, when it is made, and only its SHA-256 is kept",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    const a = await account();
+    const { status, body } = await created(a.token, "my bot", ["read", "machines:match"]);
+    assertEquals(status, 201);
+    assert(/^pk_live_[A-Za-z0-9_-]{43}$/.test(body.key), `a pk_live_ key, got ${body.key}`);
+    assertEquals([body.label, body.scopes], ["my bot", ["read", "machines:match"]]);
+    const [row] = await sql`select owner, sha256, label from mecha_auth.api_key where id = ${body.id}`;
+    assertEquals(row.owner, a.id);
+    const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body.key)));
+    assertEquals(new Uint8Array(row.sha256), hash);
+    const [whole] = await sql`select count(*)::int as n from mecha_auth.api_key k
+      where position(convert_to(${body.key}, 'UTF8') in k.sha256) > 0 or k.label = ${body.key}`;
+    assertEquals(whole.n, 0, "the key itself is stored nowhere");
+  }),
+});
+
+Deno.test({
+  name: "a list names the caller's live keys and never a key or its hash",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    const a = await account();
+    const b = await account();
+    const one = (await created(a.token, "one")).body;
+    const two = (await created(a.token, "two", ["read"])).body;
+    await created(b.token, "not a's");
+    const res = await handler(call("GET", "/auth/keys", a.token));
+    assertEquals(res.status, 200);
+    const text = await res.text();
+    const { keys } = JSON.parse(text);
+    assertEquals(keys.map((k: Record<string, unknown>) => [k.id, k.label, k.scopes]), [[one.id, "one", ["read", "write"]], [two.id, "two", ["read"]]]);
+    for (const k of keys) assertEquals(Object.keys(k).sort(), ["created_at", "id", "label", "last_used", "scopes"]);
+    assert(!text.includes(one.key) && !text.includes(two.key) && !text.includes("pk_live_"), "no key in the list");
+  }),
+});
+
+Deno.test({
+  name: "an account holds at most MAX_LIVE_KEYS live keys: one more is refused, and a revoke frees a place",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    const a = await account();
+    const ids = [];
+    for (let i = 0; i < MAX_LIVE_KEYS; i++) {
+      const { status, body } = await created(a.token, `k${i}`);
+      assertEquals(status, 201);
+      ids.push(body.id);
+    }
+    const sixth = await created(a.token, "sixth");
+    assertEquals(sixth.status, 409);
+    const [n] = await sql`select count(*)::int as n from mecha_auth.api_key where owner = ${a.id}`;
+    assertEquals(n.n, MAX_LIVE_KEYS);
+    assertEquals((await handler(call("DELETE", `/auth/keys/${ids[0]}`, a.token))).status, 204);
+    assertEquals((await created(a.token, "after a revoke")).status, 201);
+  }),
+});
+
+Deno.test({
+  name: "an exchange gives a token of the key's owner that expires at KEY_TOKEN_TTL_S and carries kid and scp; last_used moves",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    const a = await account();
+    const k = (await created(a.token, "bot", ["read", "machines:match"])).body;
+    const [before] = await sql`select last_used from mecha_auth.api_key where id = ${k.id}`;
+    assertEquals(before.last_used, null);
+    const at = Math.floor(Date.now() / 1000);
+    const { status, body } = await exchange(k.key);
+    assertEquals(status, 200);
+    assertEquals(body.expires_in, KEY_TOKEN_TTL_S);
+    assertEquals(KEY_TOKEN_TTL_S, 15 * 60);
+    const claims = await verifyJwt(body.token);
+    assertEquals([claims?.role, claims?.sub, claims?.handle, claims?.guest, claims?.kid, claims?.scp], ["app_user", a.id, a.handle, false, k.id, ["read", "machines:match"]]);
+    const exp = claims?.exp as number;
+    assert(exp >= at + KEY_TOKEN_TTL_S && exp <= at + KEY_TOKEN_TTL_S + 2, `exp ${exp - at}s from now`);
+    const [after] = await sql`select last_used from mecha_auth.api_key where id = ${k.id}`;
+    assert(after.last_used instanceof Date, "last_used is set by the exchange");
+    const expired = await signJwt({ ...claims, exp: at - 1 });
+    assertEquals(await verifyJwt(expired), null, "past its exp the token is no session");
+  }),
+});
+
+Deno.test({
+  name: "a revoked key's next exchange is 401, as is a key nobody made; another's key cannot be revoked",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    const a = await account();
+    const b = await account();
+    const k = (await created(a.token)).body;
+    assertEquals((await exchange(k.key)).status, 200);
+    assertEquals((await handler(call("DELETE", `/auth/keys/${k.id}`, b.token))).status, 404, "b cannot revoke a's key");
+    assertEquals((await exchange(k.key)).status, 200);
+    assertEquals((await handler(call("DELETE", `/auth/keys/${k.id}`, a.token))).status, 204);
+    assertEquals((await handler(call("DELETE", `/auth/keys/${k.id}`, a.token))).status, 404, "already revoked");
+    assertEquals((await exchange(k.key)).status, 401);
+    assertEquals((await exchange("pk_live_" + "x".repeat(43))).status, 401);
+    assertEquals((await exchange("not a key")).status, 401);
+    const listed = await (await handler(call("GET", "/auth/keys", a.token))).json();
+    assertEquals(listed.keys, [], "a revoked key is not listed");
+  }),
+});
+
+Deno.test({
+  name: "a guest's create is 403 guest; no token, another role, a key's own token or a bad body are refused",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    const g = await created(guest.token);
+    assertEquals([g.status, g.body.error], [403, "guest"]);
+    assertEquals((await handler(call("GET", "/auth/keys", guest.token))).status, 403);
+    assertEquals((await handler(call("POST", "/auth/keys", undefined, { label: "x", scopes: ["read"] }))).status, 401);
+    const service = await signJwt({ role: "service", sub: crypto.randomUUID(), exp: Math.floor(Date.now() / 1000) + 60 });
+    assertEquals((await created(service)).status, 401);
+    const a = await account();
+    const k = (await created(a.token)).body;
+    const keyToken = (await exchange(k.key)).body.token;
+    const byKey = await created(keyToken);
+    assertEquals([byKey.status, byKey.body.error], [403, "key token"]);
+    assertEquals((await handler(call("DELETE", `/auth/keys/${k.id}`, keyToken))).status, 403);
+    assertEquals((await created(a.token, "")).status, 400);
+    assertEquals((await created(a.token, "x".repeat(65))).status, 400);
+    assertEquals((await created(a.token, "x", [])).status, 400);
+    assertEquals((await created(a.token, "x", ["admin"])).status, 400);
+    assertEquals((await created(a.token, "x", ["machines:"])).status, 400);
+    const [n] = await sql`select count(*)::int as n from mecha_auth.api_key where owner = ${a.id}`;
+    assertEquals(n.n, 1, "no refused create made a key");
+  }),
+});
+
+Deno.test({
+  name: "with api_keys off every key route is 404, and a key made while on no longer exchanges",
+  ...opts,
+  fn: async () => {
+    const a = await account();
+    const k = await withKeys(true, async () => (await created(a.token)).body);
+    await withKeys(false, async () => {
+      for (const req of [
+        call("POST", "/auth/keys", a.token, { label: "x", scopes: ["read"] }),
+        call("GET", "/auth/keys", a.token),
+        call("DELETE", `/auth/keys/${k.id}`, a.token),
+        call("POST", "/auth/key", undefined, { key: k.key }),
+      ]) {
+        const res = await handler(req);
+        assertEquals([req.method, new URL(req.url).pathname, res.status], [req.method, new URL(req.url).pathname, 404]);
+      }
+    });
+    const unset = Deno.env.get("AUTH_API_KEYS");
+    Deno.env.delete("AUTH_API_KEYS");
+    try {
+      assertEquals((await handler(call("GET", "/auth/keys", a.token))).status, 404, "unset is off");
+    } finally {
+      if (unset !== undefined) Deno.env.set("AUTH_API_KEYS", unset);
+    }
+  },
+});
+
+Deno.test({
+  name: "the key table is the auth service's: no app role reaches it, and only api_key_owner reads it by hash",
+  ...opts,
+  fn: async () => {
+    const [grants] = await sql`select count(*)::int as n from information_schema.role_table_grants
+      where table_schema = 'mecha_auth' and table_name = 'api_key' and grantee <> current_user`;
+    assertEquals(grants.n, 0);
+    const [fn] = await sql`select p.prosecdef, p.proacl from pg_proc p where p.oid = 'mecha_auth.api_key_owner(bytea)'::regprocedure`;
+    assertEquals(fn.prosecdef, true);
+    assert(fn.proacl !== null && !/(^|[{,])=X\//.test(String(fn.proacl)), `PUBLIC's execute revoked, got ${fn.proacl}`);
+    assertEquals((await sql`select to_regclass('public.api_key') as v`)[0].v, null, "no view in public for a table no release had there");
+    const [exempt] = await sql`select count(*)::int as n from mecha.rls_exempt where table_name = 'mecha_auth.api_key'`;
+    assertEquals(exempt.n, 1);
+  },
 });
 
 // Last, and it has to be: Deno runs tests in source order, and this closes the
