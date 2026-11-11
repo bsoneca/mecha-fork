@@ -129,3 +129,22 @@ REVOKE ALL ON FUNCTION mecha_auth.api_key_owner(bytea) FROM PUBLIC;
 INSERT INTO mecha.rls_exempt VALUES ('mecha_auth.api_key', 'the auth service''s own table, in a schema no app role may use')
   ON CONFLICT DO NOTHING;
 `;
+
+/**
+ * The native-app handoff codes spent (PRONTO-368): a row per code, written as the code is honoured
+ * (POST /auth/oidc/session), so a code spent through one auth instance is refused by every other on the
+ * same database. The primary key decides: the insert that lands honours the code, a second finds the row.
+ * A row outlives its code by HANDOFF_SPENT_GRACE so a clock ahead of the database's cannot honour a code
+ * whose row was pruned; rows past that are pruned as codes are spent. Only where provider sign-in is on.
+ */
+export const HANDOFF_SPENT_SQL = `
+CREATE TABLE IF NOT EXISTS mecha_auth.handoff_spent (
+  jti text primary key,
+  expires_at timestamptz not null
+);
+CREATE INDEX IF NOT EXISTS handoff_spent_expires ON mecha_auth.handoff_spent (expires_at);
+INSERT INTO mecha.rls_exempt VALUES ('mecha_auth.handoff_spent', 'the auth service''s own table, in a schema no app role may use')
+  ON CONFLICT DO NOTHING;
+`;
+// How long a spent code's row outlives the code.
+export const HANDOFF_SPENT_GRACE = "5 minutes";

@@ -28,7 +28,7 @@ import {
 } from "./jwt.ts";
 import { type Links, oidc, type Profile, providersFrom } from "./oidc.ts";
 import { androidOrigins } from "./origins.ts";
-import { API_KEYS_SQL, prepareAuthTables, sealAuthTables } from "./schema.ts";
+import { API_KEYS_SQL, HANDOFF_SPENT_GRACE, HANDOFF_SPENT_SQL, prepareAuthTables, sealAuthTables } from "./schema.ts";
 export { shapeWhere };
 
 function required(name: string): string {
@@ -156,6 +156,8 @@ export async function migrate(): Promise<void> {
     END $$`;
     // The keys' table only where the program turned keys on: an app that did not gets nothing new.
     if (apiKeysOn()) await tx.unsafe(API_KEYS_SQL);
+    // The handoff codes spent, only where provider sign-in is on (schema.ts, PRONTO-368).
+    if (Object.keys(OIDC_PROVIDERS).length > 0) await tx.unsafe(HANDOFF_SPENT_SQL);
     await tx.unsafe(sealAuthTables(["webauthn_credential", "identity_link"]));
   });
 }
@@ -849,11 +851,23 @@ export const links: Links = {
   },
 };
 
+/** Spends a handoff code in the database, so every auth instance on it refuses a second use (oidc.ts,
+ * Config.spend; PRONTO-368). The insert is the honouring: the one that lands spends the code. */
+export function handoffSpender(db: typeof sql): (jti: string, exp: number) => Promise<boolean> {
+  return async (jti, exp) => {
+    await db`delete from mecha_auth.handoff_spent where expires_at < now() - ${HANDOFF_SPENT_GRACE}::interval`;
+    const r = await db`insert into mecha_auth.handoff_spent (jti, expires_at) values (${jti}, to_timestamp(${exp}))
+      on conflict (jti) do nothing returning jti`;
+    return r.length === 1;
+  };
+}
+
 const providerSignIn = oidc({
   secret: JWT_SECRET,
   origin: (req) => ceremonyOrigin(ORIGIN, req.headers.get("host")),
   providers: OIDC_PROVIDERS,
   links,
+  spend: handoffSpender(sql),
   issue: (user) => issueUserToken(user.id, user.handle),
   // The guest a bearer names, for POST /auth/oidc/adopt: a guest token only, never an account's.
   guestOf: async (req) => {

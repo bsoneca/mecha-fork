@@ -19,6 +19,7 @@ import {
   safeReturn,
   SESSION_COOKIE,
   sha256url,
+  spentInMemory,
   STATE_COOKIE,
   type User,
   withHandoff,
@@ -134,7 +135,7 @@ const BROKERED: Record<string, string> = {
   OIDC_GOOGLE_AUTHORIZE_PARAMS: "provider=google",
 };
 
-async function setup(env = GOOGLE, links = memory(), { legacyCookie }: { legacyCookie?: boolean } = {}) {
+async function setup(env = GOOGLE, links = memory(), { legacyCookie, spend }: { legacyCookie?: boolean; spend?: (jti: string, exp: number) => Promise<boolean> } = {}) {
   const providers = providersFrom((name) => env[name]);
   const issuer = env.OIDC_GOOGLE_ISSUER ?? "https://accounts.google.com";
   const brokered = issuer !== "https://accounts.google.com";
@@ -156,6 +157,7 @@ async function setup(env = GOOGLE, links = memory(), { legacyCookie }: { legacyC
     },
     fetcher: idp.fetcher as typeof fetch,
     legacyCookie,
+    spend,
   });
   const serve = async (req: Request) => {
     const res = routes(req);
@@ -439,6 +441,17 @@ Deno.test("an app signs in through the system browser: its link back carries a c
   assert(typeof body.token === "string");
   // Once.
   assertEquals((await s.serve(redeem({ handoff, secret }))).status, 401);
+});
+
+Deno.test("a handoff code spent through one instance is refused by another that shares the spent set (PRONTO-368)", async () => {
+  const shared = spentInMemory();
+  const a = await setup(GOOGLE, memory(), { spend: shared });
+  const { secret, done } = await nativeSignIn(a);
+  const handoff = new URL(done.headers.get("location")!, ORIGIN).hash.slice("#handoff=".length);
+  // Another instance behind the same door: the same links and secret, the same spent set.
+  const b = await setup(GOOGLE, a.links, { spend: shared });
+  assertEquals((await a.serve(redeem({ handoff, secret }))).status, 200);
+  assertEquals((await b.serve(redeem({ handoff, secret }))).status, 401, "spent on a, refused on b");
 });
 
 Deno.test("a handoff code is refused without its secret, past its minute, as a cookie, or once the link is gone", async () => {
