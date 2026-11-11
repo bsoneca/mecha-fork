@@ -207,7 +207,24 @@ export type Config = {
   /** Whether a session from before the __Host- prefix is still read (false: never, as an origin new
    * since then sets, where only a sibling host could have left one). Default true, for a transition. */
   legacyCookie?: boolean;
+  /** Spends an app's handoff code (its `jti`, until `exp`, epoch seconds): true the first time, false
+   * ever after. Every instance of a service behind one door must share it, or a code spent on one is
+   * spent again on another (PRONTO-368): the host service keeps it in its database (main.ts). Default:
+   * this instance's memory, enough where one instance serves the door (the edge cluster's object). */
+  spend?: (jti: string, exp: number) => Promise<boolean>;
 };
+
+/** Handoff codes spent in this instance's memory, until each expires (Config.spend's default). */
+export function spentInMemory(): (jti: string, exp: number) => Promise<boolean> {
+  const spent = new Map<string, number>();
+  return (jti, exp) => {
+    const at = Math.floor(Date.now() / 1000);
+    for (const [k, e] of spent) if (e <= at) spent.delete(k);
+    if (spent.has(jti)) return Promise.resolve(false);
+    spent.set(jti, exp);
+    return Promise.resolve(true);
+  };
+}
 
 const dec = new TextDecoder();
 const enc = new TextEncoder();
@@ -446,16 +463,9 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     ]);
   }
 
-  // Handoff codes redeemed, until each expires. Held by this instance: the
-  // secret, which never left the app, is what binds a code to it; this only
-  // stops the app itself redeeming one twice here.
-  const spent = new Map<string, number>();
-  const spend = (jti: string, exp: number) => {
-    for (const [k, e] of spent) if (e <= now()) spent.delete(k);
-    if (spent.has(jti)) return false;
-    spent.set(jti, exp);
-    return true;
-  };
+  // Handoff codes redeemed, until each expires: the secret, which never left the app, is what binds a
+  // code to it; this stops the app itself redeeming one twice, on any instance that shares `spend`.
+  const spend = cfg.spend ?? spentInMemory();
 
   /** The claims of the code an app hands back with its secret, or null. */
   async function handedOff(req: Request): Promise<Record<string, unknown> | null> {
@@ -469,7 +479,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     const c = await verifyJwt(cfg.secret, body.handoff);
     if (c === null || c.purpose !== "oidc-handoff" || typeof c.native !== "string" || typeof c.jti !== "string") return null;
     if ((await sha256url(body.secret)) !== c.native) return null;
-    return spend(c.jti, c.exp as number) ? c : null;
+    return (await spend(c.jti, c.exp as number)) ? c : null;
   }
 
   // The cookie as this tab's session, or an app's handoff code with its

@@ -13,7 +13,9 @@ import {
 } from "jsr:@std/assert@1.0.13";
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
 import { androidOrigin } from "./origins.ts";
-import { admittedOrigin, ceremonyOrigin, handler, issueUserToken, KEY_TOKEN_TTL_S, links, MAX_LIVE_KEYS, migrate, signJwt, sql, verifyJwt } from "./main.ts";
+import { admittedOrigin, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, links, MAX_LIVE_KEYS, migrate, signJwt, sql, verifyJwt } from "./main.ts";
+import { HANDOFF_SPENT_SQL } from "./schema.ts";
+import postgres from "postgres";
 import { PUBLIC_WHERE } from "./jwt.ts";
 import { PUBLIC_WHERE as CLIENT_PUBLIC_WHERE } from "../../packages/client/src/public-where.ts";
 
@@ -1326,6 +1328,42 @@ Deno.test("a provider named without its client is refused at startup", async () 
   }).output();
   assert(!success);
   assertStringIncludes(new TextDecoder().decode(stderr), "OIDC_GOOGLE_CLIENT_ID is required");
+});
+
+// --- Handoff codes spent in the database (PRONTO-368) ---
+
+Deno.test({
+  name: "a handoff code is spent once across auth instances on one database, and expired rows are pruned",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    // Made by migrate where provider sign-in is on; this file's environment names no provider.
+    await sql.unsafe(HANDOFF_SPENT_SQL);
+    // Two instances: each its own connection pool, as two pods would hold.
+    const other = postgres(Deno.env.get("DATABASE_URL")!);
+    try {
+      const a = handoffSpender(sql), b = handoffSpender(other);
+      const exp = Math.floor(Date.now() / 1000) + 60;
+      const jti = crypto.randomUUID();
+      assertEquals(await a(jti, exp), true, "honoured once");
+      assertEquals(await a(jti, exp), false, "not twice on the same instance");
+      assertEquals(await b(jti, exp), false, "nor on another instance on the same database");
+      // Two instances racing for one code: exactly one honours it.
+      const raced = crypto.randomUUID();
+      assertEquals((await Promise.all([a(raced, exp), b(raced, exp)])).filter(Boolean).length, 1);
+      // A row past its code's lifetime and the grace is pruned as the next code is spent; one within it stays.
+      const old = crypto.randomUUID(), recent = crypto.randomUUID();
+      await sql`insert into mecha_auth.handoff_spent (jti, expires_at) values (${old}, now() - interval '1 hour'), (${recent}, now() - interval '1 minute')`;
+      assertEquals(await b(crypto.randomUUID(), exp), true);
+      const left = await sql`select jti from mecha_auth.handoff_spent where jti in (${old}, ${recent})`;
+      assertEquals(left.map((r) => r.jti), [recent]);
+      // No app role reaches it.
+      const [acl] = await sql`select relacl from pg_class where oid = 'mecha_auth.handoff_spent'::regclass`;
+      assertEquals(acl.relacl, null);
+    } finally {
+      await other.end();
+    }
+  },
 });
 
 // --- API keys (PRONTO-312): POST/GET /auth/keys, DELETE /auth/keys/{id}, POST /auth/key ---
