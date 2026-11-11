@@ -215,3 +215,24 @@ Deno.test("the bindings transport sends the host's metadata last, so a credentia
     globalThis.fetch = fetched;
   }
 });
+
+Deno.test("the bindings transport waits a call's own timeoutMs, else CALL_TIMEOUT_MS (PRONTO-271)", async () => {
+  const real = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (_url, init) => {
+    calls++;
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => resolve(new Response("{}", { status: 200, headers: { "metadata.statuscode": "200", "metadata.content-type": "application/json" } })), 80);
+      init!.signal!.addEventListener("abort", () => (clearTimeout(t), reject(init!.signal!.reason)));
+    });
+  };
+  try {
+    const t = bindingsTransport("http://mesh");
+    await assertRejects(() => t("model", "/v1/messages", { method: "POST", body: {}, timeoutMs: 10 }, "k", {}));
+    assertEquals(await t("model", "/v1/messages", { method: "POST", body: {}, timeoutMs: 5_000 }, "k", {}), { status: 200, body: {} });
+    assertEquals(await t("model", "/v1/messages", { method: "POST", body: {} }, "k", {}), { status: 200, body: {} });
+    assertEquals(calls, 3);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
