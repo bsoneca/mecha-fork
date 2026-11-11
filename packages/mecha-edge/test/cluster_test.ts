@@ -72,6 +72,15 @@ Deno.test({ name: 'the edge cluster serves many subjects from one object', sanit
       await res.body?.cancel()
       assert.equal(res.status, 401)
     })
+    await t.step("a guest trades its token for a new one of the same id; an account's or none is refused", async () => {
+      const res = await fetch(at('/auth/guest/refresh'), { method: 'POST', headers: bearer(alice.token) })
+      assert.equal(res.status, 200)
+      const body = await res.json() as { token: string; user: { id: string; guest: boolean } }
+      assert.deepEqual([body.user.id, body.user.guest], [alice.user.id, true])
+      const none = await fetch(at('/auth/guest/refresh'), { method: 'POST' })
+      await none.body?.cancel()
+      assert.equal(none.status, 401)
+    })
     await t.step('a request without a session is refused', async () => {
       const res = await fetch(at('/crud/note'))
       await res.body?.cancel()

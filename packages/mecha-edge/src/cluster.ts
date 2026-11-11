@@ -3,7 +3,7 @@
 // transaction (postgrest-js), and Electric's shape protocol answered for the
 // subject a shape token names (mecha-browser's shapes.ts). The schema is the
 // data directory's: nothing here migrates.
-// Routes: /auth/guest, /auth/whoami, /auth/shape, /crud/*, /electric/v1/shape.
+// Routes: /auth/guest, /auth/guest/refresh, /auth/whoami, /auth/shape, /crud/*, /electric/v1/shape.
 import type { PGlite } from '@electric-sql/pglite'
 import { createRestHandler, planRead, ReadQueryError, type ReadSchema } from '@mecha/postgrest-js'
 import { shapeWhere, signJwt, verifyJwt } from '../../../services/auth/jwt.ts'
@@ -33,6 +33,9 @@ export interface EdgeCluster {
 
 // The auth service's lifetimes (services/auth/main.ts).
 const USER_TOKEN_TTL_S = 7 * 24 * 3600
+// How long after its token expired a guest may still trade it for a new one (POST /auth/guest/refresh).
+const GUEST_REFRESH_GRACE_S = 90 * 24 * 3600
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SHAPE_TOKEN_TTL_S = 900
 
 type Claims = Record<string, unknown>
@@ -115,6 +118,20 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     await serialize(() => db.query('INSERT INTO app_user (id, handle) VALUES ($1, $2)', [id, handle]))
     const token = await signJwt(secret, { role: 'app_user', sub: id, handle, guest: true, exp: now() + USER_TOKEN_TTL_S })
     return json(200, { token, user: { id, handle, guest: true } })
+  }
+
+  /** A guest's token, live or expired within the grace, for a new one of the same id and handle:
+   * services/auth/main.ts's guestRefresh, the rules the same. No account is made here (no passkey, no
+   * provider), so every user here is still a guest. */
+  async function guestRefresh(req: Request): Promise<Response> {
+    const auth = req.headers.get('authorization')
+    const c = auth?.startsWith('Bearer ') ? await verifyJwt(secret, auth.slice('Bearer '.length), GUEST_REFRESH_GRACE_S) : null
+    if (!c || c.role !== 'app_user' || c.guest !== true || typeof c.sub !== 'string' || !UUID.test(c.sub)) return json(401, { error: 'invalid token' })
+    const sub = c.sub
+    const { rows: [u] } = await serialize(() => db.query<{ handle: string }>('SELECT handle FROM app_user WHERE id = $1', [sub]))
+    if (!u) return json(404, { error: 'no such user' })
+    const token = await signJwt(secret, { role: 'app_user', sub, handle: u.handle, guest: true, exp: now() + USER_TOKEN_TTL_S })
+    return json(200, { token, user: { id: sub, handle: u.handle, guest: true } })
   }
 
   async function whoami(req: Request): Promise<Response> {
@@ -205,6 +222,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     try {
       await ensureShapes()
       if (req.method === 'POST' && path === '/auth/guest') return await guest()
+      if (req.method === 'POST' && path === '/auth/guest/refresh') return await guestRefresh(req)
       if (req.method === 'GET' && path === '/auth/whoami') return await whoami(req)
       if (req.method === 'POST' && path === '/auth/shape') return await shapeToken(req)
       if (path.startsWith('/crud/')) return await crud(req)
