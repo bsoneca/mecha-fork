@@ -255,9 +255,10 @@ Deno.test({
     assertEquals(claims.role, "app_user");
     assertEquals(claims.sub, id);
     assertEquals(claims.handle, "alice");
+    // USER_TOKEN_TTL_S from the environment (a day, main_test_env.ts) sets the mint's exp.
     const exp = claims.exp as number;
-    const sevenDays = Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
-    assert(Math.abs(exp - sevenDays) < 60, `exp ${exp} not ~7d out`);
+    const oneDay = Math.floor(Date.now() / 1000) + 24 * 3600;
+    assert(Math.abs(exp - oneDay) < 60, `exp ${exp} not ~1d out`);
     const res = await handler(
       new Request("http://auth:9999/auth/whoami", {
         headers: { authorization: `Bearer ${token}` },
@@ -265,6 +266,76 @@ Deno.test({
     );
     assertEquals(res.status, 200);
     assertEquals(await res.json(), { id, handle: "alice" });
+  },
+});
+
+// --- A guest's refresh (POST /auth/guest/refresh): a kept guest lives on past its token ---
+
+const nowS = () => Math.floor(Date.now() / 1000);
+async function refresh(token?: string): Promise<{ status: number; body: Record<string, unknown> }> {
+  const res = await handler(post("/auth/guest/refresh", {}, token));
+  return { status: res.status, body: await res.json() };
+}
+// A guest's token as the service would have minted it `ago` seconds past its expiry.
+const expiredGuest = (id: string, handle: string, ago: number) =>
+  signJwt({ role: "app_user", sub: id, handle, guest: true, exp: nowS() - ago });
+
+Deno.test({
+  name: "a live guest is refreshed: same id and handle, a new exp",
+  ...opts,
+  fn: async () => {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    const old = await verifyJwt(guest.token);
+    await new Promise((r) => setTimeout(r, 1100));
+    const { status, body } = await refresh(guest.token);
+    assertEquals(status, 200);
+    assertEquals(body.user, { id: guest.user.id, handle: guest.user.handle, guest: true });
+    const claims = await verifyJwt(body.token as string);
+    assertEquals([claims?.sub, claims?.handle, claims?.guest, claims?.role], [guest.user.id, guest.user.handle, true, "app_user"]);
+    assert((claims?.exp as number) > (old?.exp as number), "the refreshed token lives longer");
+  },
+});
+
+Deno.test({
+  name: "a guest whose token expired within the grace is refreshed; past it, it is refused",
+  ...opts,
+  fn: async () => {
+    const guest = (await (await handler(post("/auth/guest", {}))).json()).user;
+    // A week and a day after it expired: the grace (90 days by default) still admits it.
+    const late = await expiredGuest(guest.id, guest.handle, 8 * 24 * 3600);
+    assertEquals(await verifyJwt(late), null, "an expired token is no session");
+    const ok = await refresh(late);
+    assertEquals([ok.status, (ok.body.user as { id: string }).id], [200, guest.id]);
+    assert(await verifyJwt(ok.body.token as string) !== null, "the new token is a session");
+    const gone = await refresh(await expiredGuest(guest.id, guest.handle, 91 * 24 * 3600));
+    assertEquals(gone.status, 401);
+  },
+});
+
+Deno.test({
+  name: "refresh refuses a forged token, an account's, no token, and a promoted guest; an unknown user is 404",
+  ...opts,
+  fn: async () => {
+    const guest = (await (await handler(post("/auth/guest", {}))).json()).user;
+    const real = await issueUserToken(guest.id, guest.handle, true);
+    const [h, p] = real.split(".");
+    const forged = `${h}.${p}.${"A".repeat(43)}`;
+    assertEquals((await refresh(forged)).status, 401);
+    assertEquals((await refresh("garbage")).status, 401);
+    assertEquals((await refresh()).status, 401);
+    // An account's token (guest: false) is no guest's: its way back is its own sign-in.
+    assertEquals((await refresh(await issueUserToken(guest.id, guest.handle))).status, 401);
+    // A shape token or any other role is refused.
+    assertEquals((await refresh(await signJwt({ role: "service", sub: guest.id, handle: guest.handle, guest: true, exp: nowS() + 60 }))).status, 401);
+    // A guest that became an account (a passkey, or a provider's link) is refused, even with its old guest token.
+    const promoted = (await (await handler(post("/auth/guest", {}))).json());
+    await sql`insert into mecha_auth.webauthn_credential (id, user_id, public_key, counter) values (${"cred-r-" + promoted.user.id}, ${promoted.user.id}, ${new Uint8Array([1])}, 0)`;
+    assertEquals((await refresh(promoted.token)).status, 409);
+    const linked = (await (await handler(post("/auth/guest", {}))).json());
+    await links.userFor({ provider: "google", issuer: "https://accounts.google.com", sub: "g-refresh-linked", name: null, picture: null, email: null }, linked.user.id);
+    assertEquals((await refresh(linked.token)).status, 409);
+    // A guest token for no such user.
+    assertEquals((await refresh(await issueUserToken(crypto.randomUUID(), "nobody-here-00", true))).status, 404);
   },
 });
 
