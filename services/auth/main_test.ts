@@ -101,7 +101,8 @@ await sql`INSERT INTO mecha.shape_key VALUES
   ('public.gk_doc', 'id', 'public.gk_doc', 'id'),
   ('public.gk_line', 'doc_id', 'public.gk_doc', 'id')
   ON CONFLICT DO NOTHING`;
-await migrate();
+// The key table is made only where keys are on (AUTH_API_KEYS); the cases below turn them on and off.
+await withKeys(true, migrate);
 await sql`delete from mecha_auth.webauthn_credential`;
 await sql`delete from mecha_auth.identity_link`;
 await sql`delete from mecha_auth.api_key`;
@@ -1516,6 +1517,19 @@ Deno.test({
     } finally {
       if (unset !== undefined) Deno.env.set("AUTH_API_KEYS", unset);
     }
+  },
+});
+
+Deno.test({
+  name: "with keys off a migration makes no key table",
+  ...opts,
+  fn: async () => {
+    await sql`drop function if exists mecha_auth.api_key_owner(bytea)`;
+    await sql`drop table if exists mecha_auth.api_key`;
+    await withKeys(false, migrate);
+    assertEquals((await sql`select to_regclass('mecha_auth.api_key') as t`)[0].t, null);
+    await withKeys(true, migrate);
+    assertEquals((await sql`select to_regclass('mecha_auth.api_key') as t`)[0].t, "mecha_auth.api_key");
   },
 });
 

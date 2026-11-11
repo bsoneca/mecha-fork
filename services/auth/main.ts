@@ -154,7 +154,8 @@ export async function migrate(): Promise<void> {
         ALTER TABLE mecha_auth.identity_link ADD PRIMARY KEY (provider, issuer, sub);
       END IF;
     END $$`;
-    await tx.unsafe(API_KEYS_SQL);
+    // The keys' table only where the program turned keys on: an app that did not gets nothing new.
+    if (apiKeysOn()) await tx.unsafe(API_KEYS_SQL);
     await tx.unsafe(sealAuthTables(["webauthn_credential", "identity_link"]));
   });
 }
