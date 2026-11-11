@@ -538,7 +538,49 @@ BEGIN
   IF n = 0 THEN RAISE EXCEPTION '58 the floor evaluates its scopes without an InitPlan'; END IF;
   RESET ROLE;
 
-  RAISE WARNING 'rls: 62/62 pass';
+  -- A token an API key minted reaches only its scopes (services/auth, kid and
+  -- scp): a read needs `read`, a write or a call `write`, a check outside any
+  -- request `read`; a session's token, with no kid, is untouched.
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1","scp":["read"]}', true);
+  PERFORM set_config('request.method', 'GET', true);
+  PERFORM app_pre_request();
+  PERFORM set_config('request.method', 'PATCH', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '63 a read-only key wrote';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1","scp":["write","machines:match"]}', true);
+  PERFORM set_config('request.method', 'POST', true);
+  PERFORM set_config('request.path', '/rpc/_f_call', true);
+  PERFORM app_pre_request();
+  PERFORM set_config('request.method', 'GET', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '64 a key without read read';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.method', '', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '65 a key without read passed a check outside a request';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1"}', true);
+  PERFORM set_config('request.method', 'GET', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '66 a key token with no scopes read';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana"}', true);
+  PERFORM set_config('request.method', 'DELETE', true);
+  PERFORM set_config('request.path', '/_f_public', true);
+  PERFORM app_pre_request();
+  PERFORM set_config('request.method', 'GET', true);
+  PERFORM set_config('response.headers', '', true);
+
+  RAISE WARNING 'rls: 66/66 pass';
 END $$;
 
 DROP TABLE _f_posting, _f_note, _f_denied;

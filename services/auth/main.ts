@@ -24,6 +24,7 @@ import {
   subsetParams,
   verifyJwt as verify,
 } from "./jwt.ts";
+import { API_KEYS_SQL } from "./api_keys.ts";
 import { type Links, oidc, type Profile, providersFrom } from "./oidc.ts";
 export { shapeWhere };
 
@@ -103,6 +104,21 @@ const USER_TOKEN_TTL_S = seconds("USER_TOKEN_TTL_S", 7 * 24 * 3600);
 // a guest token is the only way back to a guest's account, so a guest away for longer than a week
 // comes back as itself; 90 days by default.
 const GUEST_REFRESH_GRACE_S = seconds("GUEST_REFRESH_GRACE_S", 90 * 24 * 3600);
+// API keys (PRONTO-312): off unless the app's auth config turns them on (cluster.cue's apiKeys, as
+// AUTH_API_KEYS=true), so no app gets them by a pin bump alone; off, every key route answers 404. Read at
+// each request, so a test can hold both; a value that is neither is refused at startup.
+export function apiKeysOn(): boolean {
+  const raw = Deno.env.get("AUTH_API_KEYS") ?? "";
+  if (raw === "" || raw === "false") return false;
+  if (raw === "true") return true;
+  throw new Error(`AUTH_API_KEYS must be true or false, not ${raw}`);
+}
+apiKeysOn();
+// A key's token is short: a key is the durable credential and the token only carries one session of
+// calls, so revoking a key ends its reach within this.
+export const KEY_TOKEN_TTL_S = 900;
+// At most this many live keys an account; a revoked one frees its place.
+export const MAX_LIVE_KEYS = 5;
 // A shape token outlives one long-poll cycle and little else: Electric holds a
 // request open for 300s, so a token shorter than that expires mid-stream, and a
 // long one is a scope set that cannot be revoked.
@@ -151,6 +167,8 @@ export async function migrate(): Promise<void> {
   await sql`INSERT INTO mecha.rls_exempt VALUES
     ('public.identity_link', 'the auth service''s own table: read by it alone, on its own connection')
     ON CONFLICT DO NOTHING`;
+  // The keys' table only where the program turned keys on: an app that did not gets nothing new.
+  if (apiKeysOn()) await sql.unsafe(API_KEYS_SQL);
 }
 
 // --- HS256 JWT via WebCrypto, under this service's secret ---
@@ -671,6 +689,107 @@ async function whoami(req: Request): Promise<Response> {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+// --- API keys (PRONTO-312; README.md, "API keys") ---
+
+const KEY_PREFIX = "pk_live_";
+const KEY_SCOPE = /^(read|write|machines:[a-z][a-z0-9_]{0,62})$/;
+const KEY_LABEL_MAX = 64;
+
+async function sha256(text: string): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(text)));
+}
+
+function newKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return KEY_PREFIX + btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// The caller who may hold keys: a signed-in account's own session. No token or a bad one is 401; a
+// guest is 403 `guest` (a guest is refused every online operation, and a key would let it persist);
+// a token a key minted is 403 `key token`, so a key can never make or revoke another.
+async function keyHolder(req: Request): Promise<{ id: string } | Response> {
+  const subject = await subjectOf(req);
+  if (subject === "refused" || subject.claims === null || typeof subject.claims.sub !== "string" || !UUID.test(subject.claims.sub)) {
+    return jsonError(401, "invalid token");
+  }
+  if (subject.claims.guest === true) return jsonError(403, "guest");
+  if (subject.claims.kid !== undefined) return jsonError(403, "key token");
+  return { id: subject.claims.sub };
+}
+
+// POST /auth/keys {label, scopes}: a new key, answered once; only its hash is kept.
+async function createKey(req: Request): Promise<Response> {
+  const holder = await keyHolder(req);
+  if (holder instanceof Response) return holder;
+  const body = await readBody(req);
+  const label = body?.label;
+  const scopes = body?.scopes;
+  if (typeof label !== "string" || label.trim() === "" || label.length > KEY_LABEL_MAX) {
+    return jsonError(400, `label required, at most ${KEY_LABEL_MAX} characters`);
+  }
+  if (!Array.isArray(scopes) || scopes.length === 0 || !scopes.every((s) => typeof s === "string" && KEY_SCOPE.test(s))) {
+    return jsonError(400, "scopes required: read, write or machines:<name>");
+  }
+  const key = newKey();
+  const hash = await sha256(key);
+  const id = crypto.randomUUID();
+  const made = await sql.begin(async (tx) => {
+    // One account's creates one at a time, so two at once cannot both take the last place.
+    await tx`select pg_advisory_xact_lock(hashtext(${"api_key:" + holder.id}))`;
+    const [n] = await tx`select count(*)::int as live from mecha_auth.api_key where owner = ${holder.id} and revoked_at is null`;
+    if (n.live >= MAX_LIVE_KEYS) return null;
+    const [row] = await tx`insert into mecha_auth.api_key (id, owner, label, scopes, sha256)
+      values (${id}, ${holder.id}, ${label}, ${[...new Set(scopes as string[])]}, ${hash})
+      returning id, label, scopes, created_at`;
+    return row;
+  });
+  if (made === null) return jsonError(409, `at most ${MAX_LIVE_KEYS} live keys`);
+  return json(201, { id: made.id, key, label: made.label, scopes: made.scopes, created_at: made.created_at });
+}
+
+// GET /auth/keys: the caller's live keys, never a key or its hash.
+async function listKeys(req: Request): Promise<Response> {
+  const holder = await keyHolder(req);
+  if (holder instanceof Response) return holder;
+  const keys = await sql`select id, label, scopes, created_at, last_used from mecha_auth.api_key
+    where owner = ${holder.id} and revoked_at is null order by created_at, id`;
+  return json(200, { keys: [...keys] });
+}
+
+// DELETE /auth/keys/{id}: the caller's own live key, revoked; another's, or one already revoked, is 404.
+async function revokeKey(req: Request, id: string): Promise<Response> {
+  const holder = await keyHolder(req);
+  if (holder instanceof Response) return holder;
+  if (!UUID.test(id)) return jsonError(404, "no such key");
+  const [row] = await sql`update mecha_auth.api_key set revoked_at = now()
+    where id = ${id} and owner = ${holder.id} and revoked_at is null returning id`;
+  if (!row) return jsonError(404, "no such key");
+  return new Response(null, { status: 204 });
+}
+
+// POST /auth/key {key}: a live key for a user token of its owner, KEY_TOKEN_TTL_S long, carrying the
+// key's id (`kid`) and scopes (`scp`); /crud takes it as the owner, as any session. A key unknown or
+// revoked is 401. The key's last_used moves.
+async function exchangeKey(req: Request): Promise<Response> {
+  const body = await readBody(req);
+  const key = body?.key;
+  if (typeof key !== "string" || !key.startsWith(KEY_PREFIX)) return jsonError(401, "invalid key");
+  const [k] = await sql`select id, owner, handle, scopes from mecha_auth.api_key_owner(${await sha256(key)})`;
+  if (!k) return jsonError(401, "invalid key");
+  await sql`update mecha_auth.api_key set last_used = now() where id = ${k.id}`;
+  const token = await signJwt({
+    role: "app_user",
+    sub: k.owner,
+    handle: k.handle,
+    guest: false,
+    kid: k.id,
+    scp: k.scopes,
+    exp: Math.floor(Date.now() / 1000) + KEY_TOKEN_TTL_S,
+  });
+  return json(200, { token, expires_in: KEY_TOKEN_TTL_S });
+}
+
+
 export const links: Links = {
   userFor(p: Profile, adopt?: string) {
     return sql.begin(async (tx) => {
@@ -758,6 +877,13 @@ export async function handler(req: Request): Promise<Response> {
     }
     if (req.method === "POST" && path === "/auth/guest/refresh") {
       return await guestRefresh(req);
+    }
+    if (apiKeysOn()) {
+      if (req.method === "POST" && path === "/auth/keys") return await createKey(req);
+      if (req.method === "GET" && path === "/auth/keys") return await listKeys(req);
+      const revoke = req.method === "DELETE" ? /^\/auth\/keys\/([^/]+)$/.exec(path) : null;
+      if (revoke) return await revokeKey(req, revoke[1]);
+      if (req.method === "POST" && path === "/auth/key") return await exchangeKey(req);
     }
     if (req.method === "GET" && path === "/auth/whoami") {
       return await whoami(req);
