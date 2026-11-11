@@ -36,8 +36,10 @@ export async function signJwt(secret: string, claims: Record<string, unknown>): 
   return `${head}.${payload}.${encodeBase64Url(sig)}`;
 }
 
-/** The claims a token carries, or null for anything that is not a live token of this secret. */
-export async function verifyJwt(secret: string, token: string): Promise<Record<string, unknown> | null> {
+/** The claims a token carries, or null for anything that is not a live token of this secret. `graceS`
+ * admits a token that expired up to that many seconds ago (signature and shape still checked): only
+ * a guest's refresh asks for one (main.ts, POST /auth/guest/refresh). */
+export async function verifyJwt(secret: string, token: string, graceS = 0): Promise<Record<string, unknown> | null> {
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   try {
@@ -45,7 +47,7 @@ export async function verifyJwt(secret: string, token: string): Promise<Record<s
     if (!ok) return null;
     const claims = JSON.parse(new TextDecoder().decode(decodeBase64Url(parts[1])));
     if (typeof claims.exp !== "number") return null;
-    if (claims.exp <= Math.floor(Date.now() / 1000)) return null;
+    if (claims.exp + Math.max(0, graceS) <= Math.floor(Date.now() / 1000)) return null;
     return claims;
   } catch {
     return null;

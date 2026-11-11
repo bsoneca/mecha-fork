@@ -7,6 +7,12 @@ the emitter writes the policies that call `auth_uid()`.
 - **HS256**, claims `{role, sub, handle, exp}`, secret from `PGRST_JWT_SECRET`.
   A dev default ships so a fresh cluster boots; production overrides it.
 - **A user token** carries role `app_user` and `sub` = the `app_user` row id.
+- **A guest's refresh**: `POST /auth/guest/refresh` with a guest's bearer, live or
+  expired up to `GUEST_REFRESH_GRACE_S` ago (90 days by default), answers a new
+  token of the same id and handle (`{token, user}`, as `/auth/guest`) while the
+  account is still a guest: 401 for anything else, 409 once it has a passkey or
+  a provider's link (its way back is its own sign-in), 404 for no such user.
+  `USER_TOKEN_TTL_S` (a week by default) is a token's life.
 - **A service token** carries role `service` and the nil uuid, pre-signed
   against the dev secret and delivered as a compose env default. It exists so a
   transform can write without a reader, which is the only caller that has no
