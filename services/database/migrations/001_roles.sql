@@ -52,9 +52,12 @@ BEGIN
     ALTER ROLE authenticator NOINHERIT LOGIN;
   END IF;
   FOREACH r IN ARRAY ARRAY['anon', 'app_user', 'service'] LOOP
+    -- Switchable into (SET) and inheriting nothing: a grant made otherwise is
+    -- set again, so a wrong one outside fails here rather than at a request.
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_auth_members
-                   WHERE roleid = r::regrole AND member = 'authenticator'::regrole) THEN
-      EXECUTE format('GRANT %I TO authenticator', r);
+                   WHERE roleid = r::regrole AND member = 'authenticator'::regrole
+                     AND set_option AND NOT inherit_option) THEN
+      EXECUTE format('GRANT %I TO authenticator WITH INHERIT FALSE, SET TRUE', r);
     END IF;
   END LOOP;
 

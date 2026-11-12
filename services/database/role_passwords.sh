@@ -8,7 +8,7 @@
 # running the migrations may not alter them: this step then sets nothing.
 if [ "${ROLES_MANAGED_OUTSIDE:-}" = true ]; then
   echo "role passwords: the roles are managed outside, nothing set"
-  return 0
+  return 0 2>/dev/null || exit 0
 fi
 : "${ELECTRIC_PASSWORD:?ELECTRIC_PASSWORD is required: the password of the electric role, which the DATABASE_URL of electric carries}"
 : "${AUTHENTICATOR_PASSWORD:?AUTHENTICATOR_PASSWORD is required: the password of the authenticator role, which PostgREST logs in as}"
