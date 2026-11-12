@@ -118,6 +118,44 @@ rather than a container of the unit. Where managed Kafka is already paid for,
 Debezium on it with Flink replaces the change path and the stream tier
 together.
 
+## Roles managed outside
+
+The roles migration (`001_roles.sql`) makes the roles the cluster's services
+act as (`anon`, `authenticator`, `app_user`, `service`, `electric`) and sets
+their attributes, memberships and timeouts. A shared managed database often
+keeps its roles itself: a DBA or an operator makes them, and the login that
+runs the migrations holds no `CREATEROLE`, `BYPASSRLS` or `REPLICATION`. The
+migration changes a role only where it lacks what the file sets, so against
+roles made as it would make them it changes nothing, and that login needs no
+role privilege at all. A role made short of something is still set, and the
+login's missing privilege is the error that says which.
+
+"As it would make them" is literal. The attributes are PostgreSQL's own, so a
+provider that grants replication by a role membership instead (Amazon RDS's
+`rds_replication`) does not satisfy the `electric` check. The timeouts are
+compared as the text the file sets, role-wide: `statement_timeout = '5s'`, not
+`5000`, and not `ALTER ROLE … IN DATABASE`. The memberships of `authenticator`
+are `SET TRUE` and `INHERIT FALSE`.
+
+The roles' passwords are another step's (`899_role_passwords.sh`): an initdb
+step, so it runs when a database is first made, and again wherever a
+deployment's migrate sources it on each run. With `ROLES_MANAGED_OUTSIDE=true`
+in that container's environment it sets nothing, and the passwords stay
+whoever made the roles'.
+
+What the DBA runs, as a role that may, to make them:
+
+```sql
+CREATE ROLE anon NOINHERIT;
+CREATE ROLE app_user NOLOGIN;
+CREATE ROLE service NOLOGIN BYPASSRLS;
+CREATE ROLE electric LOGIN BYPASSRLS REPLICATION PASSWORD '…';
+CREATE ROLE authenticator LOGIN NOINHERIT PASSWORD '…';
+GRANT anon, app_user, service TO authenticator WITH INHERIT FALSE, SET TRUE;
+ALTER ROLE anon SET statement_timeout = '5s';
+-- … and every other timeout in 001_roles.sql, spelled as it spells them
+```
+
 ## Clouds, as built
 
 mecha emits compose and nothing else. Its mesh image carries only the Redis
