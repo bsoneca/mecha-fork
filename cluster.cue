@@ -556,6 +556,15 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		if apiKeys {
 			auth: true
 		}
+		// The app's per-request say over keys (services/auth/README.md, "API
+		// keys"): a function schema.name(owner uuid) returns boolean in its
+		// database, such as one reading a feature flag, asked on every make,
+		// list and exchange. Naming one turns the routes on and leaves the
+		// answer to it, so a flag, not a deploy, turns keys on and off.
+		apiKeysGate: *"" | =~"^[a-z_][a-z0-9_]*\\.[a-z_][a-z0-9_]*$"
+		if apiKeysGate != "" {
+			apiKeys: true
+		}
 		// The schemas PostgREST serves besides public (PRONTO-376, pronto-plugins
 		// docs/pronto-api.md): an app's API, such as ["api_v1"], read and called
 		// with Accept-Profile / Content-Profile: api_v1. public stays first, so a
@@ -1102,6 +1111,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							// app that does not is byte for byte what it was.
 							if X.capabilities.apiKeys {
 								AUTH_API_KEYS: "true"
+							}
+							if X.capabilities.apiKeysGate != "" {
+								AUTH_API_KEYS_GATE: X.capabilities.apiKeysGate
 							}
 							OIDC_PROVIDERS: strings.Join([for p, _ in X.capabilities.signIn {p}], ",")
 							for p, d in X.capabilities.signIn {

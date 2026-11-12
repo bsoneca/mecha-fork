@@ -907,6 +907,17 @@ Deno.test("an app's apiKeys turn auth on and the key routes with it, and are abs
   assert.equal((await exported({}, "capabilities", { apiKeys: true, auth: false })).ok, false);
 });
 
+// A gate (PRONTO-323) names the app's function that answers per request, and turns keys on with it.
+Deno.test("an app's apiKeysGate reaches auth with the keys it turns on, and a bad name is refused", async () => {
+  const on = await exported({}, "surface.targets.auth.compose.environment", { apiKeysGate: "public.api_keys_on" });
+  assert.equal(on.ok, true, on.stderr);
+  assert.equal(on.value.AUTH_API_KEYS, "true");
+  assert.equal(on.value.AUTH_API_KEYS_GATE, "public.api_keys_on");
+  const keys = await exported({}, "surface.targets.auth.compose.environment", { apiKeys: true });
+  assert.equal("AUTH_API_KEYS_GATE" in keys.value, false);
+  assert.equal((await exported({}, "capabilities", { apiKeysGate: "api_keys_on; drop table x" })).ok, false);
+});
+
 // An app's API schemas (PRONTO-376) reach PostgREST after public, which stays the
 // default profile; an app that names none keeps crud serving public alone.
 Deno.test("an app's apiSchemas are served after public, and only public otherwise", async () => {

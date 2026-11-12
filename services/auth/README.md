@@ -128,6 +128,13 @@ An account's durable credential for a client with no browser (a bot), behind
 the program's `apiKeys` capability (cluster.cue, `AUTH_API_KEYS=true`): off,
 every route below answers 404, so no app gets them by a pin bump alone.
 
+An app that wants a feature flag, not a deploy, to turn keys on names a gate
+(`apiKeysGate`, as `AUTH_API_KEYS_GATE=schema.name`): a function
+`schema.name(owner uuid) returns boolean` in its database, asked for the caller
+on every make and list and for the key's owner on every exchange. False
+answers 404, as keys off; a revoke is never refused, so a credential can
+always be cut. A token already minted lives out its 15 minutes.
+
 - `POST /auth/keys {label, scopes}` with a signed-in account's session makes a
   key and answers it once, `pk_live_…`; `mecha_auth.api_key` keeps only its
   SHA-256, with its owner, label, scopes, `created_at`, `last_used` and
