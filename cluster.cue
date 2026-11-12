@@ -561,7 +561,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		// with Accept-Profile / Content-Profile: api_v1. public stays first, so a
 		// request that names no profile reads and writes it as before. None by
 		// default, which leaves crud's environment as it was, byte for byte.
-		// The app makes each schema and grants on it; its crud is the server's.
+		// The app makes each schema and grants on it before naming it here:
+		// PostgREST loads no schema cache while a named schema is missing, and
+		// then answers every /crud request 503 (PGRST002). Its crud is the server's.
 		apiSchemas: [...string & =~"^[a-z_][a-z0-9_]{0,62}$" & !="public"]
 		if len(apiSchemas) > 0 {
 			server: true
