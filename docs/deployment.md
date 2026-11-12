@@ -118,6 +118,36 @@ rather than a container of the unit. Where managed Kafka is already paid for,
 Debezium on it with Flink replaces the change path and the stream tier
 together.
 
+## Roles managed outside
+
+The roles migration (`001_roles.sql`) makes the roles the cluster's services
+act as (`anon`, `authenticator`, `app_user`, `service`, `electric`) and sets
+their attributes, memberships and timeouts. A managed database often keeps its
+roles itself: a DBA or an operator makes them, and the login that runs the
+migrations holds no `CREATEROLE`, `BYPASSRLS` or `REPLICATION`. The migration
+changes a role only where it lacks what the file sets, so against roles made
+as it would make them it changes nothing, and that login needs no role
+privilege at all. A role made short of something is still set, and the
+login's missing privilege is the error that says which.
+
+The roles' passwords are another step's (`899_role_passwords.sh`), and it sets
+them at every run. With `ROLES_MANAGED_OUTSIDE=true` in the migrating
+container's environment it sets nothing, and the passwords stay whoever made
+the roles'.
+
+What the DBA runs, as a role that may, to make them:
+
+```sql
+CREATE ROLE anon NOINHERIT;
+CREATE ROLE app_user NOLOGIN;
+CREATE ROLE service NOLOGIN BYPASSRLS;
+CREATE ROLE electric LOGIN BYPASSRLS REPLICATION PASSWORD '…';
+CREATE ROLE authenticator LOGIN NOINHERIT PASSWORD '…';
+GRANT anon, app_user, service TO authenticator;
+ALTER ROLE anon SET statement_timeout = '5s';
+-- … and every timeout the migration sets, as it sets them
+```
+
 ## Clouds, as built
 
 mecha emits compose and nothing else. Its mesh image carries only the Redis
