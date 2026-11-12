@@ -139,6 +139,18 @@ async function keysAllowed(owner: string): Promise<boolean> {
   return row?.on === true;
 }
 const KEYS_OFF = () => jsonError(404, "not found");
+// The app's hook on a key's exchange (cluster.cue's keyExchanged, as AUTH_KEY_EXCHANGED_HOOK): a function
+// `schema.name(owner uuid) returns void` in the app's database, called with the key's owner on every
+// exchange, after the gate passed and before the token is signed, so an app can mark a key's owner (a
+// bot) the moment it is used. If it throws, the exchange answers 500 and no token is issued, so the
+// mark cannot be skipped. Unset, an exchange calls nothing.
+export function keyExchangedHook(): string | null {
+  const raw = Deno.env.get("AUTH_KEY_EXCHANGED_HOOK") ?? "";
+  if (raw === "") return null;
+  if (GATE_NAME.test(raw)) return raw;
+  throw new Error(`AUTH_KEY_EXCHANGED_HOOK must name a function as schema.name, not ${raw}`);
+}
+keyExchangedHook();
 // A key's token is short: a key is the durable credential and the token only carries one session of
 // calls, so revoking a key ends its reach within this.
 export const KEY_TOKEN_TTL_S = 900;
@@ -812,6 +824,8 @@ async function exchangeKey(req: Request): Promise<Response> {
   if (!k) return jsonError(401, "invalid key");
   if (!(await keysAllowed(k.owner))) return KEYS_OFF();
   await sql`update mecha_auth.api_key set last_used = now() where id = ${k.id}`;
+  const hook = keyExchangedHook();
+  if (hook !== null) await sql.unsafe(`select ${hook}($1::uuid)`, [k.owner]);
   const token = await signJwt({
     role: "app_user",
     sub: k.owner,

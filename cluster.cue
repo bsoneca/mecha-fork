@@ -565,6 +565,12 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		if apiKeysGate != "" {
 			apiKeys: true
 		}
+		// The app's hook on a key's exchange (services/auth/README.md, "API
+		// keys"): a function schema.name(owner uuid) returns void in its
+		// database, called with the key's owner on every exchange before the
+		// token is signed. A failure answers 500 and no token, so what it does
+		// (marking a bot) cannot be skipped. It does not turn keys on.
+		keyExchanged: *"" | =~"^[a-z_][a-z0-9_]*\\.[a-z_][a-z0-9_]*$"
 		// The schemas PostgREST serves besides public (PRONTO-376, pronto-plugins
 		// docs/pronto-api.md): an app's API, such as ["api_v1"], read and called
 		// with Accept-Profile / Content-Profile: api_v1. public stays first, so a
@@ -1114,6 +1120,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							}
 							if X.capabilities.apiKeysGate != "" {
 								AUTH_API_KEYS_GATE: X.capabilities.apiKeysGate
+							}
+							if X.capabilities.keyExchanged != "" {
+								AUTH_KEY_EXCHANGED_HOOK: X.capabilities.keyExchanged
 							}
 							OIDC_PROVIDERS: strings.Join([for p, _ in X.capabilities.signIn {p}], ",")
 							for p, d in X.capabilities.signIn {

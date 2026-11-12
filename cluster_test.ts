@@ -918,6 +918,16 @@ Deno.test("an app's apiKeysGate reaches auth with the keys it turns on, and a ba
   assert.equal((await exported({}, "capabilities", { apiKeysGate: "api_keys_on; drop table x" })).ok, false);
 });
 
+// A key-exchanged hook (PRONTO-316) names the app's function auth calls on an exchange; it turns nothing on.
+Deno.test("an app's keyExchanged reaches auth as its hook, and a bad name is refused", async () => {
+  const on = await exported({}, "surface.targets.auth.compose.environment", { apiKeys: true, keyExchanged: "player_record.mark_bot" });
+  assert.equal(on.ok, true, on.stderr);
+  assert.equal(on.value.AUTH_KEY_EXCHANGED_HOOK, "player_record.mark_bot");
+  const keys = await exported({}, "surface.targets.auth.compose.environment", { apiKeys: true });
+  assert.equal("AUTH_KEY_EXCHANGED_HOOK" in keys.value, false);
+  assert.equal((await exported({}, "capabilities", { keyExchanged: "mark_bot; drop table x" })).ok, false);
+});
+
 // An app's API schemas (PRONTO-376) reach PostgREST after public, which stays the
 // default profile; an app that names none keeps crud serving public alone.
 Deno.test("an app's apiSchemas are served after public, and only public otherwise", async () => {
