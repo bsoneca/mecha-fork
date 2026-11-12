@@ -119,6 +119,26 @@ export function apiKeysOn(): boolean {
   throw new Error(`AUTH_API_KEYS must be true or false, not ${raw}`);
 }
 apiKeysOn();
+// An app's own per-request say over keys (cluster.cue's apiKeysGate, as AUTH_API_KEYS_GATE): a
+// function `schema.name(owner uuid) returns boolean` in the app's database, such as one that reads a
+// feature flag, so the flag turns keys on and off without a deploy. Asked for the caller on every make
+// and list, and for the key's owner on every exchange; false answers as keys off (404). A revoke is
+// never refused, so a credential can always be cut. Unset, keys answer to AUTH_API_KEYS alone.
+const GATE_NAME = /^[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*$/;
+export function apiKeysGate(): string | null {
+  const raw = Deno.env.get("AUTH_API_KEYS_GATE") ?? "";
+  if (raw === "") return null;
+  if (GATE_NAME.test(raw)) return raw;
+  throw new Error(`AUTH_API_KEYS_GATE must name a function as schema.name, not ${raw}`);
+}
+apiKeysGate();
+async function keysAllowed(owner: string): Promise<boolean> {
+  const gate = apiKeysGate();
+  if (gate === null) return true;
+  const [row] = await sql.unsafe(`select ${gate}($1::uuid) as on`, [owner]);
+  return row?.on === true;
+}
+const KEYS_OFF = () => jsonError(404, "not found");
 // A key's token is short: a key is the durable credential and the token only carries one session of
 // calls, so revoking a key ends its reach within this.
 export const KEY_TOKEN_TTL_S = 900;
@@ -733,6 +753,7 @@ async function keyHolder(req: Request): Promise<{ id: string } | Response> {
 async function createKey(req: Request): Promise<Response> {
   const holder = await keyHolder(req);
   if (holder instanceof Response) return holder;
+  if (!(await keysAllowed(holder.id))) return KEYS_OFF();
   const body = await readBody(req);
   const label = body?.label;
   const scopes = body?.scopes;
@@ -763,6 +784,7 @@ async function createKey(req: Request): Promise<Response> {
 async function listKeys(req: Request): Promise<Response> {
   const holder = await keyHolder(req);
   if (holder instanceof Response) return holder;
+  if (!(await keysAllowed(holder.id))) return KEYS_OFF();
   const keys = await sql`select id, label, scopes, created_at, last_used from mecha_auth.api_key
     where owner = ${holder.id} and revoked_at is null order by created_at, id`;
   return json(200, { keys: [...keys] });
@@ -788,6 +810,7 @@ async function exchangeKey(req: Request): Promise<Response> {
   if (typeof key !== "string" || !key.startsWith(KEY_PREFIX)) return jsonError(401, "invalid key");
   const [k] = await sql`select id, owner, handle, scopes from mecha_auth.api_key_owner(${await sha256(key)})`;
   if (!k) return jsonError(401, "invalid key");
+  if (!(await keysAllowed(k.owner))) return KEYS_OFF();
   await sql`update mecha_auth.api_key set last_used = now() where id = ${k.id}`;
   const token = await signJwt({
     role: "app_user",

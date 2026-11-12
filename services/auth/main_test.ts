@@ -13,7 +13,7 @@ import {
 } from "jsr:@std/assert@1.0.13";
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
 import { androidOrigin } from "./origins.ts";
-import { admittedOrigin, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, links, MAX_LIVE_KEYS, migrate, signJwt, sql, verifyJwt } from "./main.ts";
+import { admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, links, MAX_LIVE_KEYS, migrate, signJwt, sql, verifyJwt } from "./main.ts";
 import { HANDOFF_SPENT_SQL } from "./schema.ts";
 import postgres from "postgres";
 import { PUBLIC_WHERE } from "./jwt.ts";
@@ -1556,6 +1556,46 @@ Deno.test({
       if (unset !== undefined) Deno.env.set("AUTH_API_KEYS", unset);
     }
   },
+});
+
+// The app's gate (AUTH_API_KEYS_GATE, PRONTO-323): a function of the owner, asked per request.
+async function withGate<T>(gate: string | null, fn: () => Promise<T>): Promise<T> {
+  const was = Deno.env.get("AUTH_API_KEYS_GATE");
+  if (gate === null) Deno.env.delete("AUTH_API_KEYS_GATE");
+  else Deno.env.set("AUTH_API_KEYS_GATE", gate);
+  try {
+    return await fn();
+  } finally {
+    if (was === undefined) Deno.env.delete("AUTH_API_KEYS_GATE");
+    else Deno.env.set("AUTH_API_KEYS_GATE", was);
+  }
+}
+
+Deno.test({
+  name: "the app's gate answers per request: closed, keys are off for that owner and a revoke still cuts one",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    await sql`create table if not exists public.key_gate_open (owner uuid primary key)`;
+    await sql`create or replace function public.key_gate_test(o uuid) returns boolean language sql stable as
+      $$ select exists (select 1 from public.key_gate_open where owner = o) $$`;
+    const a = await account();
+    await withGate("public.key_gate_test", async () => {
+      assertEquals((await created(a.token)).status, 404, "closed: no key is made");
+      assertEquals((await handler(call("GET", "/auth/keys", a.token))).status, 404, "closed: no list");
+      await sql`insert into public.key_gate_open (owner) values (${a.id})`;
+      const k = (await created(a.token)).body;
+      assertEquals((await exchange(k.key)).status, 200, "open: the key is exchanged");
+      await sql`delete from public.key_gate_open where owner = ${a.id}`;
+      assertEquals((await exchange(k.key)).status, 404, "closed again, with no deploy: no token");
+      const res = await handler(call("DELETE", `/auth/keys/${k.id}`, a.token));
+      assertEquals(res.status, 204, "a revoke is never refused");
+    });
+    assertEquals((await created(a.token)).status, 201, "no gate: keys answer to AUTH_API_KEYS alone");
+    await withGate("nope; drop table x", async () => {
+      assertThrows(() => apiKeysGate(), Error, "schema.name");
+      assertEquals((await handler(call("GET", "/auth/keys", a.token))).status, 500, "never run as SQL");
+    });
+  }),
 });
 
 Deno.test({
