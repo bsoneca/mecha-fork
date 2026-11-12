@@ -135,6 +135,14 @@ on every make and list and for the key's owner on every exchange. False
 answers 404, as keys off; a revoke is never refused, so a credential can
 always be cut. A token already minted lives out its 15 minutes.
 
+An app that must act when a key is used names a hook (`keyExchanged`, as
+`AUTH_KEY_EXCHANGED_HOOK=schema.name`): a function `schema.name(owner uuid)
+returns void` in its database, called with the key's owner on every exchange,
+after the gate (if any) passed and before the token is signed. If it throws,
+the exchange answers 500 and no token is issued, so what it does, such as
+marking the owner a bot, cannot be skipped. It is not called on make, list or
+revoke, and naming one does not turn keys on.
+
 - `POST /auth/keys {label, scopes}` with a signed-in account's session makes a
   key and answers it once, `pk_live_…`; `mecha_auth.api_key` keeps only its
   SHA-256, with its owner, label, scopes, `created_at`, `last_used` and

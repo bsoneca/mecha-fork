@@ -13,7 +13,7 @@ import {
 } from "jsr:@std/assert@1.0.13";
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
 import { androidOrigin } from "./origins.ts";
-import { admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, links, MAX_LIVE_KEYS, migrate, signJwt, sql, verifyJwt } from "./main.ts";
+import { admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, keyExchangedHook, links, MAX_LIVE_KEYS, migrate, signJwt, sql, verifyJwt } from "./main.ts";
 import { HANDOFF_SPENT_SQL } from "./schema.ts";
 import postgres from "postgres";
 import { PUBLIC_WHERE } from "./jwt.ts";
@@ -1594,6 +1594,56 @@ Deno.test({
     await withGate("nope; drop table x", async () => {
       assertThrows(() => apiKeysGate(), Error, "schema.name");
       assertEquals((await handler(call("GET", "/auth/keys", a.token))).status, 500, "never run as SQL");
+    });
+  }),
+});
+
+// The app's hook on an exchange (AUTH_KEY_EXCHANGED_HOOK, PRONTO-316): called with the owner, and a failure issues no token.
+async function withHook<T>(hook: string | null, fn: () => Promise<T>): Promise<T> {
+  const was = Deno.env.get("AUTH_KEY_EXCHANGED_HOOK");
+  if (hook === null) Deno.env.delete("AUTH_KEY_EXCHANGED_HOOK");
+  else Deno.env.set("AUTH_KEY_EXCHANGED_HOOK", hook);
+  try {
+    return await fn();
+  } finally {
+    if (was === undefined) Deno.env.delete("AUTH_KEY_EXCHANGED_HOOK");
+    else Deno.env.set("AUTH_KEY_EXCHANGED_HOOK", was);
+  }
+}
+
+Deno.test({
+  name: "the app's keyExchanged hook is called with the owner on an exchange, not on make or list, and a failure issues no token",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    await sql`create table if not exists public.key_hook_log (owner uuid)`;
+    await sql`create table if not exists public.key_hook_fail (owner uuid primary key)`;
+    await sql`create or replace function public.key_hook_test(o uuid) returns void language plpgsql as
+      $$ begin
+        if exists (select 1 from public.key_hook_fail where owner = o) then raise exception 'hook refused'; end if;
+        insert into public.key_hook_log (owner) values (o);
+      end $$`;
+    const a = await account();
+    const calls = async () => (await sql`select count(*)::int as n from public.key_hook_log where owner = ${a.id}`)[0].n;
+    await withHook("public.key_hook_test", async () => {
+      const k = (await created(a.token)).body;
+      assertEquals((await handler(call("GET", "/auth/keys", a.token))).status, 200);
+      assertEquals(await calls(), 0, "not called on make or list");
+      assertEquals((await exchange(k.key)).status, 200);
+      assertEquals(await calls(), 1, "called once with the owner on exchange");
+      await sql`insert into public.key_hook_fail (owner) values (${a.id})`;
+      const res = await exchange(k.key);
+      assertEquals(res.status, 500, "a failing hook answers 500");
+      assertEquals(res.body.token, undefined, "and no token is issued");
+      assertEquals(await calls(), 1);
+      assertEquals((await handler(call("DELETE", `/auth/keys/${k.id}`, a.token))).status, 204, "a revoke never calls it");
+      await sql`delete from public.key_hook_fail where owner = ${a.id}`;
+    });
+    const k2 = (await created(a.token)).body;
+    assertEquals((await exchange(k2.key)).status, 200, "no hook: nothing is called");
+    assertEquals(await calls(), 1);
+    await withHook("nope; drop table x", async () => {
+      assertThrows(() => keyExchangedHook(), Error, "schema.name");
+      assertEquals((await exchange(k2.key)).status, 500, "never run as SQL");
     });
   }),
 });
