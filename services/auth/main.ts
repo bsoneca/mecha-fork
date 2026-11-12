@@ -140,8 +140,8 @@ export async function migrate(): Promise<void> {
     ('public.identity_link', 'the auth service''s own table: read by it alone, on its own connection')
     ON CONFLICT DO NOTHING`;
   // Both tables say who may sign in as whom, and an app's grants (its default privileges, or a
-  // migration granting every public table on each replay) would hand them to app_user, service and
-  // anon through the CRUD API: a session could read every link and passkey, or attach its own to
+  // migration granting every public table on each replay) would hand them to every request
+  // (authenticator) and to Electric: a session could read every link and passkey, or attach its own to
   // another account. As the edge cluster closes them (packages/mecha-edge/src/cluster.ts): row
   // security, with a policy for this service's own role alone, so a grant made later still reaches no
   // row, and no app role keeps a grant.
@@ -155,7 +155,7 @@ export async function migrate(): Promise<void> {
       await tx.unsafe(`DO $$ BEGIN EXECUTE format('CREATE POLICY auth_service ON ${table} TO %I USING (true) WITH CHECK (true)', current_user); END $$`);
       await tx.unsafe(`REVOKE ALL ON ${table} FROM PUBLIC`);
       await tx.unsafe(`DO $$ DECLARE r text; BEGIN
-        FOR r IN SELECT rolname FROM pg_roles WHERE rolname IN ('app_user', 'service', 'anon') AND rolname <> current_user LOOP
+        FOR r IN SELECT rolname FROM pg_roles WHERE rolname IN ('authenticator', 'electric') AND rolname <> current_user LOOP
           EXECUTE format('REVOKE ALL ON ${table} FROM %I', r);
         END LOOP;
       END $$`);
@@ -171,10 +171,13 @@ export const signJwt = (claims: Record<string, unknown>) => sign(JWT_SECRET, cla
 export const verifyJwt = (token: string) => verify(JWT_SECRET, token);
 
 // A guest's token says so, so a policy can keep writes to the people who
-// signed in (`request.jwt.claims ->> 'guest'`).
+// signed in (`request.jwt.claims ->> 'guest'`). `role` names the database role
+// PostgREST runs the request as, the one login it holds; the request's role is
+// `app_role`, which the policies read (rls.sql, request_role()).
 export function issueUserToken(id: string, handle: string, guest = false): Promise<string> {
   return signJwt({
-    role: "app_user",
+    role: "authenticator",
+    app_role: "app_user",
     sub: id,
     handle,
     guest,
@@ -232,11 +235,13 @@ export function rowWhere(column: string, value: string): string {
 // Whether a shape over `table` keyed `column = value` reaches only rows this
 // subject may read: mecha.shape_reach, asked as the subject. Role and claims
 // are set here the way PostgREST sets them on a request, and rls.sql says why
-// the switch has to be the caller's.
+// the switch has to be the caller's: this service's login owns the tables,
+// which the floor does not bind, so it switches to the login a request runs as
+// (it holds SET on it) and carries the subject's claims.
 async function rowReach(uid: string, table: string, column: string, value: string): Promise<boolean> {
   return await sql.begin(async (tx) => {
-    await tx`SET LOCAL ROLE app_user`;
-    await tx`SELECT set_config('request.jwt.claims', ${JSON.stringify({ sub: uid, role: "app_user" })}, true)`;
+    await tx`SET LOCAL ROLE authenticator`;
+    await tx`SELECT set_config('request.jwt.claims', ${JSON.stringify({ sub: uid, role: "authenticator", app_role: "app_user" })}, true)`;
     await tx`SELECT public.app_pre_request()`;
     const rows = await tx`SELECT mecha.shape_reach(${"public." + table}, ${column}, ${value}) AS ok`;
     return rows[0].ok as boolean;
@@ -255,7 +260,7 @@ type Subject = { claims: Record<string, unknown> | null } | "refused";
 async function subjectOf(req: Request): Promise<Subject> {
   if (!req.headers.get("authorization")) return { claims: null };
   const claims = await bearerClaims(req);
-  if (!claims || claims.role !== "app_user") return "refused";
+  if (!claims || claims.app_role !== "app_user") return "refused";
   return { claims };
 }
 
@@ -329,7 +334,7 @@ async function shapeToken(req: Request): Promise<Response> {
 // - Electric's where parser admits its own operators and functions only, and
 //   no subquery while no ELECTRIC_FEATURE_FLAGS enables one, so a subset
 //   cannot read another table, call pg_sleep or reach a function Postgres
-//   would run as Electric's BYPASSRLS role.
+//   would run as Electric's login, which reads every row.
 // - The verify is GET-only, so a subset sent as a POST body never passes.
 // Returning is not evaluating: Postgres orders the two predicates by its own
 // costs, so a subset's runs on rows the token's excludes too, and an error it

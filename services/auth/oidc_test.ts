@@ -140,7 +140,7 @@ async function setup(env = GOOGLE, links = memory()) {
     origin: () => ORIGIN,
     providers,
     links,
-    issue: (u) => signJwt(SECRET, { role: "app_user", sub: u.id, handle: u.handle, guest: false, exp: now() + 60 }),
+    issue: (u) => signJwt(SECRET, { role: "authenticator", app_role: "app_user", sub: u.id, handle: u.handle, guest: false, exp: now() + 60 }),
     fetcher: idp.fetcher as typeof fetch,
   });
   const serve = async (req: Request) => {

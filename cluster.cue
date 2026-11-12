@@ -233,9 +233,10 @@ _from: F={
 }
 
 // Pre-signed against the dev PGRST_JWT_SECRET: HS256, claims
-// {role: "service", sub: all-zeros uuid, exp: 2033-01-01}. Compose default
+// {role: "authenticator", app_role: "service", sub: all-zeros uuid,
+// exp: 2033-01-01}. Compose default
 // only — prod overrides both SERVICE_JWT and PGRST_JWT_SECRET together.
-_devServiceJwt: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZSIsInN1YiI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCIsImV4cCI6MTk4ODE1MDQwMH0.dGYz_sMSnOvZy0eANh7spJbgyr2fEzeynOERIqW7gd4"
+_devServiceJwt: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYXV0aGVudGljYXRvciIsImFwcF9yb2xlIjoic2VydmljZSIsInN1YiI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCIsImV4cCI6MTk4ODE1MDQwMH0.0m-fSGKQDT5H9PoI1LBeeEe8tw6NPhhMqJKTW5nhu8c"
 
 _devJwtSecret: "mecha-dev-secret-please-override-32ch"
 // The query parameter caddy adds after the gate and electric checks; one
@@ -783,11 +784,11 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 					compose: {
 						depends_on: X._schemaReady
 						environment: {
-							// Not postgres: PostgREST applies a token role's settings (its
-							// statement_timeout among them) only to roles granted to its login.
-							PGRST_DB_URI:       "postgres://authenticator:\(authenticatorPassword)@database:5432/${POSTGRES_DB:-\(X.meta.app)}"
-							PGRST_DB_SCHEMA:    "public"
-							PGRST_DB_ANON_ROLE: "anon"
+							// Not postgres, which owns the tables: every request runs as this
+							// login, and the token's app_role claim is what the policies read.
+							// No anonymous role: a request without a token is refused (401).
+							PGRST_DB_URI:    "postgres://authenticator:\(authenticatorPassword)@database:5432/${POSTGRES_DB:-\(X.meta.app)}"
+							PGRST_DB_SCHEMA: "public"
 							// Called once per request, in the request's transaction, after the
 							// role switch: it sets app.scopes, which the tenancy floor reads.
 							// Without it current_scopes() is empty and every floored table is

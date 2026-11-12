@@ -147,15 +147,19 @@ BEGIN
   IF n <> 0 THEN RAISE EXCEPTION '16 a second role escaped the floor: saw % rows from an unheld scope', n; END IF;
   RESET ROLE;
 
-  -- The owner is exempt from RLS without FORCE, and migrations run as the owner
-  -- -- which is exactly the out-of-band table the floor exists to catch.
-  CREATE TABLE _f_noforce(id int, scope_id text);
-  ALTER TABLE _f_noforce ENABLE ROW LEVEL SECURITY;
-  CREATE POLICY tenancy ON _f_noforce AS RESTRICTIVE FOR ALL
-    USING (scope_id = ANY((SELECT current_scopes())::text[])) WITH CHECK (scope_id = ANY((SELECT current_scopes())::text[]));
+  -- The owner is exempt from RLS without FORCE, and the floor does not FORCE
+  -- (rls_protect says why): so a table a request's or Electric's login owns is
+  -- a table its own sessions read whole, and the audit says so.
+  CREATE TABLE _f_noforce(id int, scope_id text NOT NULL);
+  CALL rls_protect('_f_noforce');
   SELECT count(*) INTO n FROM mecha.rls_unprotected WHERE table_name = 'public._f_noforce';
-  IF n <> 1 THEN RAISE EXCEPTION '17 audit accepted a table without FORCE'; END IF;
+  IF n <> 0 THEN RAISE EXCEPTION '17 audit flagged a floored table its migrating owner holds'; END IF;
+  CREATE ROLE electric NOLOGIN;
+  ALTER TABLE _f_noforce OWNER TO electric;
+  SELECT count(*) INTO n FROM mecha.rls_unprotected WHERE table_name = 'public._f_noforce';
+  IF n <> 1 THEN RAISE EXCEPTION '17 audit accepted a table Electric''s login owns'; END IF;
   DROP TABLE _f_noforce;
+  DROP ROLE electric;
 
   CREATE TABLE _f_rolescoped(id int, scope_id text);
   ALTER TABLE _f_rolescoped ENABLE ROW LEVEL SECURITY;
@@ -538,7 +542,92 @@ BEGIN
   IF n = 0 THEN RAISE EXCEPTION '58 the floor evaluates its scopes without an InitPlan'; END IF;
   RESET ROLE;
 
-  RAISE WARNING 'rls: 62/62 pass';
+  -- Request roles are a claim, and every request runs as one login. The
+  -- backend's claim reads across the floor; a person's reads their scopes; no
+  -- claims read nothing.
+  SET LOCAL ROLE _f_app;
+  PERFORM set_config('app.scopes', '', true);
+  PERFORM set_config('request.jwt.claims', '{"role":"authenticator","app_role":"service"}', true);
+  SELECT count(*) INTO n FROM _f_posting;
+  IF n <> 4 THEN RAISE EXCEPTION '63 the service claim did not read across the floor: saw % rows', n; END IF;
+  PERFORM set_config('request.jwt.claims', '{"role":"authenticator","app_role":"app_user","sub":"x"}', true);
+  SELECT count(*) INTO n FROM _f_posting;
+  IF n <> 0 THEN RAISE EXCEPTION '64 a person''s claim read across the floor: saw % rows', n; END IF;
+  PERFORM set_config('request.jwt.claims', '{"role":"service"}', true);
+  SELECT count(*) INTO n FROM _f_posting;
+  IF n <> 0 THEN RAISE EXCEPTION '65 a token''s role claim stood in for app_role: saw % rows', n; END IF;
+  PERFORM set_config('request.jwt.claims', '', true);
+  IF request_role() IS NOT NULL THEN RAISE EXCEPTION '66 no claims named a request role'; END IF;
+  BEGIN PERFORM require_role('service');
+        RAISE EXCEPTION '66 require_role admitted a request without a token';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  PERFORM set_config('request.jwt.claims', '{"role":"authenticator","app_role":"app_user"}', true);
+  BEGIN PERFORM require_role('service');
+        RAISE EXCEPTION '67 require_role admitted a person for the backend';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  PERFORM set_config('request.jwt.claims', '{"role":"authenticator","app_role":"service"}', true);
+  PERFORM require_role('service');
+  PERFORM set_config('request.jwt.claims', '', true);
+  RESET ROLE;
+
+  -- Electric reads through the policies: across the floor by its login, and
+  -- only where a read policy admits it, which the audit asks of a published table.
+  CREATE ROLE electric NOLOGIN;
+  CREATE TABLE _f_synced(id int, scope_id text NOT NULL);
+  INSERT INTO _f_synced VALUES (1, 'user:ana'), (2, 'user:davi');
+  CALL rls_protect('_f_synced');
+  GRANT SELECT ON _f_synced TO electric;
+  CREATE PUBLICATION electric_publication_default FOR TABLE _f_synced;
+  SELECT count(*) INTO n FROM mecha.rls_unprotected WHERE table_name = 'public._f_synced';
+  IF n <> 1 THEN RAISE EXCEPTION '68 a published table without Electric''s read policy passed'; END IF;
+  CREATE POLICY _f_synced_electric_read ON _f_synced FOR SELECT TO electric USING (true);
+  SELECT count(*) INTO n FROM mecha.rls_unprotected WHERE table_name = 'public._f_synced';
+  IF n <> 0 THEN RAISE EXCEPTION '68 Electric''s read policy did not satisfy the audit'; END IF;
+  SET LOCAL ROLE electric;
+  SELECT count(*) INTO n FROM _f_synced;
+  RESET ROLE;
+  IF n <> 2 THEN RAISE EXCEPTION '69 Electric did not read every published row: saw %', n; END IF;
+  DROP PUBLICATION electric_publication_default;
+  DROP TABLE _f_synced;
+  DROP ROLE electric;
+
+  -- A permissive policy for the request login that does not test the request's
+  -- role admits every token and no token alike.
+  CREATE ROLE authenticator NOLOGIN;
+  CREATE TABLE _f_untested(id int, scope_id text NOT NULL);
+  CALL rls_protect('_f_untested');
+  CREATE POLICY open_read ON _f_untested FOR SELECT TO authenticator USING (true);
+  SELECT count(*) INTO n FROM mecha.rls_unprotected WHERE table_name = 'public._f_untested';
+  IF n <> 1 THEN RAISE EXCEPTION '70 a policy for authenticator that tests no request role passed'; END IF;
+  DROP POLICY open_read ON _f_untested;
+  CREATE POLICY own_read ON _f_untested FOR SELECT TO authenticator USING (request_role() = 'app_user');
+  SELECT count(*) INTO n FROM mecha.rls_unprotected WHERE table_name = 'public._f_untested';
+  IF n <> 0 THEN RAISE EXCEPTION '70 a policy for authenticator testing the request role was flagged'; END IF;
+
+  -- What a revoke from a request role said is a restrictive policy now: the
+  -- backend's claim writes, a person's does not, whatever permits it.
+  INSERT INTO _f_untested VALUES (1, 'public:');
+  CREATE POLICY wide_write ON _f_untested FOR ALL TO authenticator
+    USING (request_role() IS NOT NULL) WITH CHECK (request_role() IS NOT NULL);
+  CALL rls_service_only('_f_untested', 'update', 'delete');
+  CALL rls_service_only('_f_untested', 'update', 'delete');
+  GRANT SELECT, UPDATE, DELETE ON _f_untested TO authenticator;
+  SET LOCAL ROLE authenticator;
+  PERFORM set_config('app.scopes', 'public:', true);
+  PERFORM set_config('request.jwt.claims', '{"role":"authenticator","app_role":"app_user"}', true);
+  BEGIN UPDATE _f_untested SET id = 2;
+        RAISE EXCEPTION '71 a person updated a backend-only table';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  PERFORM set_config('request.jwt.claims', '{"role":"authenticator","app_role":"service"}', true);
+  UPDATE _f_untested SET id = 2;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n <> 1 THEN RAISE EXCEPTION '72 the backend could not update a backend-only table'; END IF;
+  PERFORM set_config('request.jwt.claims', '', true);
+  RESET ROLE;
+  DROP TABLE _f_untested;
+  DROP ROLE authenticator;
+
+  RAISE WARNING 'rls: 72/72 pass';
 END $$;
 
 DROP TABLE _f_posting, _f_note, _f_denied;

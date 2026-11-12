@@ -40,12 +40,55 @@ CREATE OR REPLACE FUNCTION public.subject_scopes(uid text) RETURNS text[]
   $$;
 
 -- The request's subject: the `sub` PostgREST puts in request.jwt.claims, NULL
--- outside a request or for a token without one (anon). Every row policy above
+-- outside a request or for a request without a token. Every row policy above
 -- the floor calls it and a column default may, so it exists before a caller's
 -- first table, and is restated here rather than migrated with the tables.
 CREATE OR REPLACE FUNCTION public.auth_uid() RETURNS uuid LANGUAGE sql STABLE AS $$
-  SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub','')::uuid
+  SELECT nullif(nullif(current_setting('request.jwt.claims', true), '')::json->>'sub','')::uuid
 $$;
+
+-- The request's role: a claim of its token, not a database role. Every request
+-- runs as the one login PostgREST holds (`authenticator`), so what tells a
+-- person's session from the backend is the token's `app_role` (`app_user` or
+-- `service`); `role` must name a database role PostgREST may switch into, and
+-- names that login. NULL outside a request and for a request without a token,
+-- and no policy admits NULL, so such a request reaches no row.
+CREATE OR REPLACE FUNCTION public.request_role() RETURNS text LANGUAGE sql STABLE AS $$
+  SELECT nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'app_role'
+$$;
+
+-- Who reads across every scope: the backend (a `service` token) and Electric,
+-- whose snapshots are the sync path's and are filtered by the shape gate, not
+-- here. Neither holds BYPASSRLS, which a managed Postgres may grant to no role:
+-- the floor admits them by this test, which is in the floor's text and so in
+-- the audit's. The table's owner needs neither: the floor does not FORCE (see
+-- rls_protect), so the migrations and the owner's SECURITY DEFINER functions
+-- read as they always did.
+CREATE OR REPLACE FUNCTION public.reads_every_scope() RETURNS boolean
+  LANGUAGE sql STABLE
+  SET search_path = pg_catalog, public
+  AS $$
+    SELECT coalesce(public.request_role() = 'service', false) OR current_user = 'electric'
+  $$;
+
+-- What only some request roles may do refuses the rest, as a missing privilege
+-- did when request roles were database roles: every request runs as the same
+-- login, so EXECUTE and a table grant alone cannot tell them apart.
+-- `PERFORM public.require_role('service')` is the first statement of a function
+-- only the backend calls; rls_service_only's policies call it too. True, or it
+-- raises.
+CREATE OR REPLACE FUNCTION public.require_role(VARIADIC roles text[]) RETURNS boolean
+  LANGUAGE plpgsql STABLE
+  SET search_path = pg_catalog, public
+  AS $$
+BEGIN
+  IF NOT coalesce(public.request_role() = ANY(roles), false) THEN
+    RAISE EXCEPTION 'insufficient_privilege: permission denied, % alone may, and the request is %',
+      coalesce(array_to_string(roles, ' or '), 'no one'), coalesce(public.request_role(), 'no token''s')
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  RETURN true;
+END $$;
 
 -- The caller supplies `scope_id`: its derivation differs per access mode and
 -- belongs to whoever declared the entity. Prefer a generated column --
@@ -53,10 +96,10 @@ $$;
 -- Postgres then refuses a client-supplied value, so the derivation cannot be
 -- made to lie without a trigger to defend it.
 --
--- The missing TO clause and the FORCE are both deliberate and both invisible to
--- a reader who does not know to look for them; assertions 16 and 17 say why. A
--- role that must see across scopes takes BYPASSRLS, which is a row in pg_roles
--- and so auditable, rather than an absence from a TO list, which is not.
+-- The missing TO clause is deliberate and invisible to a reader who does not
+-- know to look for it; assertion 16 says why. A caller that must see across
+-- scopes is named in the floor itself (reads_every_scope), which the audit
+-- pins, rather than by an absence from a TO list, which nothing would show.
 --
 -- The other sanctioned reach across scopes is the emitted validation trigger,
 -- `<table>_validate()`: SECURITY DEFINER, owned by the migration role, fired
@@ -66,12 +109,8 @@ $$;
 -- the rows an entity's declared `via` edges name -- one query per edge, joined
 -- on the referenced id -- and answers once per write. The refusal it raises
 -- carries only `validation <table>.<name>`, never a row, so the reach discloses
--- one bit per admitted write and nothing else. Its precondition: the migration
--- role must bypass RLS, as a superuser or a role holding BYPASSRLS. Where it
--- does not, FORCE ROW LEVEL SECURITY scopes the definer's read by the CALLER's
--- app.scopes and the trigger judges what the writer can see rather than what
--- stands -- so the emitted validation migration opens with a DO block that
--- refuses to install under a role holding neither.
+-- one bit per admitted write and nothing else. Its precondition: the definer
+-- reads past the floor, as the owner of a table the floor does not FORCE (assertion 17).
 DROP PROCEDURE IF EXISTS public.rls_protect(regclass, text);
 -- Whether a table carries a scope the floor can read: the column, NOT NULL.
 -- The floor's precondition and the gate's answer to "can this table carry a
@@ -98,15 +137,56 @@ BEGIN
       'table protected', tbl;
   END IF;
   EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', tbl);
-  EXECUTE format('ALTER TABLE %s FORCE ROW LEVEL SECURITY', tbl);
+  -- Not FORCE, and un-FORCEd where an earlier floor forced it: the owner is the
+  -- migrate login, which no request runs as (the audit refuses a table a
+  -- request's or Electric's login owns). Under FORCE without BYPASSRLS, which a
+  -- managed Postgres grants nobody, the owner's SECURITY DEFINER functions
+  -- would read with their caller's reach and recurse into the policies that
+  -- call them; unforced, they read as the owner, as the validation trigger
+  -- and every shared-entity helper assume.
+  EXECUTE format('ALTER TABLE %s NO FORCE ROW LEVEL SECURITY', tbl);
   EXECUTE format('DROP POLICY IF EXISTS tenancy ON %s', tbl);
   -- The scopes as a scalar subquery: Postgres runs it once per statement, as an
   -- InitPlan, where a bare current_scopes() call runs once per row -- about
-  -- 1.3 microseconds a row, 120 ms over a 90,000-row scan.
+  -- 1.3 microseconds a row, 120 ms over a 90,000-row scan. reads_every_scope()
+  -- likewise.
   EXECUTE format(
     'CREATE POLICY tenancy ON %s AS RESTRICTIVE FOR ALL '
-    'USING (scope_id = ANY((SELECT current_scopes())::text[])) '
-    'WITH CHECK (scope_id = ANY((SELECT current_scopes())::text[]))', tbl);
+    'USING (scope_id = ANY((SELECT current_scopes())::text[]) OR (SELECT reads_every_scope())) '
+    'WITH CHECK (scope_id = ANY((SELECT current_scopes())::text[]) OR (SELECT reads_every_scope()))', tbl);
+END $$;
+
+-- Writes (or reads) only the backend makes: restrictive, so no permissive
+-- policy an app or a generator adds later can widen them, and bound to the
+-- request login alone, so Electric's read and the owner are untouched. What a
+-- `REVOKE … FROM <request role>` said when request roles were database roles,
+-- and refused as that was: a statement of another request that reaches a row
+-- raises permission denied (require_role, once per statement), where a policy
+-- alone would leave the rows out in silence. `cmds` are SELECT, INSERT, UPDATE
+-- or DELETE.
+CREATE OR REPLACE PROCEDURE public.rls_service_only(tbl regclass, VARIADIC cmds text[])
+  LANGUAGE plpgsql
+  SET search_path = pg_catalog, public
+  AS $$
+DECLARE
+  cmd text;
+  name text;
+BEGIN
+  FOREACH cmd IN ARRAY cmds LOOP
+    cmd := upper(cmd);
+    IF cmd NOT IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE') THEN
+      RAISE EXCEPTION 'rls_service_only(%): % is no command a policy binds', tbl, cmd;
+    END IF;
+    name := 'service_only_' || lower(cmd);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON %s', name, tbl);
+    EXECUTE format('CREATE POLICY %I ON %s AS RESTRICTIVE FOR %s TO authenticator %s',
+      name, tbl, cmd,
+      CASE cmd
+        WHEN 'INSERT' THEN 'WITH CHECK ((SELECT public.require_role(''service'')))'
+        WHEN 'UPDATE' THEN 'USING ((SELECT public.require_role(''service''))) WITH CHECK ((SELECT public.require_role(''service'')))'
+        ELSE 'USING ((SELECT public.require_role(''service'')))'
+      END);
+  END LOOP;
 END $$;
 
 -- PostgREST calls this once per request, in the request's transaction, after
@@ -131,7 +211,7 @@ END $$;
 CREATE OR REPLACE FUNCTION public.app_pre_request() RETURNS void
   LANGUAGE plpgsql AS $$
 DECLARE
-  sub text := nullif(current_setting('request.jwt.claims', true)::json->>'sub', '');
+  sub text := nullif(nullif(current_setting('request.jwt.claims', true), '')::json->>'sub', '');
 BEGIN
   IF sub LIKE '%,%' THEN
     RAISE EXCEPTION 'jwt sub contains a comma, which would split into two scopes';
@@ -252,7 +332,7 @@ BEGIN
     WHERE table_name = tbl AND column_name = col;
   IF p IS NULL THEN RETURN false; END IF;
   IF p = 'subject' THEN
-    RETURN val = nullif(current_setting('request.jwt.claims', true)::json->>'sub', '');
+    RETURN val = nullif(nullif(current_setting('request.jwt.claims', true), '')::json->>'sub', '');
   END IF;
   -- The value is cast to the key's own type, so the comparison can use the
   -- key's index; comparing on the text side would scan the parent per mint.
@@ -300,49 +380,70 @@ CREATE OR REPLACE FUNCTION mecha.rls_audit()
   LANGUAGE sql STABLE
   SET search_path = pg_catalog, public
 AS $$
-  SELECT n.nspname || '.' || c.relname,
-         CASE c.relkind
-           WHEN 'm' THEN 'materialized view: a snapshot RLS never evaluates'
-           WHEN 'v' THEN 'view without security_invoker: runs as its owner'
-           ELSE CASE
-             WHEN NOT c.relrowsecurity      THEN 'RLS not enabled'
-             WHEN NOT c.relforcerowsecurity THEN 'RLS not forced: the owner is exempt'
-             WHEN EXISTS (SELECT 1 FROM pg_policy p
-                           WHERE p.polrelid = c.oid AND p.polpermissive
-                             AND p.polroles = '{0}'::oid[])
-               THEN 'a permissive policy granted to PUBLIC: every role holds public:, so anon reaches what it admits'
-             ELSE 'no tenancy policy: restrictive, PUBLIC, FOR ALL, both sides the scope test'
-           END
-         END
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+  SELECT n.nspname || '.' || c.relname, coalesce(f.reason, q.reason)
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+    -- The floor's terms; a table in rls_exempt is past them by a row a reviewer reads.
+    LATERAL (SELECT CASE
+      WHEN EXISTS (SELECT 1 FROM mecha.rls_exempt e
+                    WHERE e.table_name = n.nspname || '.' || c.relname) THEN NULL
+      WHEN c.relkind = 'm' THEN 'materialized view: a snapshot RLS never evaluates'
+      WHEN c.relkind = 'v' THEN
+        CASE WHEN NOT coalesce(c.reloptions, '{}') @> ARRAY['security_invoker=true']
+             THEN 'view without security_invoker: runs as its owner' END
+      WHEN NOT c.relrowsecurity THEN 'RLS not enabled'
+      -- The owner skips the floor (rls_protect says why it does not FORCE), so
+      -- the owner must be no login a request or the sync path runs as.
+      WHEN pg_get_userbyid(c.relowner) IN ('authenticator', 'electric')
+        THEN 'owned by a login requests or Electric run as: its own sessions skip RLS'
+      WHEN EXISTS (SELECT 1 FROM pg_policy p
+                    WHERE p.polrelid = c.oid AND p.polpermissive
+                      AND p.polroles = '{0}'::oid[])
+        THEN 'a permissive policy granted to PUBLIC: it admits every login, whatever the request'
+      WHEN NOT EXISTS (
+             SELECT 1 FROM pg_policy p
+              WHERE p.polrelid = c.oid
+                AND NOT p.polpermissive
+                AND p.polroles = '{0}'::oid[]
+                AND p.polcmd = '*'
+                AND pg_get_expr(p.polqual, p.polrelid)
+                      = '((scope_id = ANY (( SELECT current_scopes() AS current_scopes)::text[])) OR ( SELECT reads_every_scope() AS reads_every_scope))'
+                AND pg_get_expr(p.polwithcheck, p.polrelid)
+                      = '((scope_id = ANY (( SELECT current_scopes() AS current_scopes)::text[])) OR ( SELECT reads_every_scope() AS reads_every_scope))')
+        THEN 'no tenancy policy: restrictive, PUBLIC, FOR ALL, both sides the scope test'
+    END AS reason) f,
+    -- The request's terms, which an exemption from the floor does not lift.
+    LATERAL (SELECT CASE
+      WHEN c.relkind NOT IN ('r', 'p') THEN NULL
+      -- Every request runs as authenticator, so a policy for it that does not
+      -- test the request's role admits every token, and a request without one.
+      WHEN EXISTS (SELECT 1 FROM pg_policy p
+                    WHERE p.polrelid = c.oid AND p.polpermissive
+                      AND to_regrole('authenticator') = ANY(p.polroles)
+                      AND ((p.polqual IS NOT NULL
+                            AND pg_get_expr(p.polqual, p.polrelid) NOT LIKE '%request_role()%')
+                        OR (p.polwithcheck IS NOT NULL
+                            AND pg_get_expr(p.polwithcheck, p.polrelid) NOT LIKE '%request_role()%')))
+        THEN 'a permissive policy for authenticator that does not test request_role(): it admits every request'
+      -- Electric reads its snapshots through the policies like any login: a
+      -- published table it has no read policy on syncs empty, with no error.
+      WHEN EXISTS (SELECT 1 FROM pg_publication_tables pt
+                    WHERE pt.pubname = 'electric_publication_default'
+                      AND pt.schemaname = n.nspname AND pt.tablename = c.relname)
+       AND NOT EXISTS (SELECT 1 FROM pg_policy p
+                        WHERE p.polrelid = c.oid AND p.polpermissive
+                          AND p.polcmd IN ('r', '*')
+                          AND to_regrole('electric') = ANY(p.polroles)
+                          AND pg_get_expr(p.polqual, p.polrelid) = 'true')
+        THEN 'published to Electric without its read policy: its shapes sync empty'
+    END AS reason) q
    WHERE c.relkind IN ('r', 'p', 'v', 'm')
-     AND NOT EXISTS (SELECT 1 FROM mecha.rls_exempt e
-                      WHERE e.table_name = n.nspname || '.' || c.relname)
+     AND coalesce(f.reason, q.reason) IS NOT NULL
      AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
      AND n.nspname NOT LIKE 'pg\_temp\_%'
      AND n.nspname NOT LIKE 'pg\_toast\_temp\_%'
      AND NOT EXISTS (SELECT 1 FROM pg_depend d
                       WHERE d.objid = c.oid AND d.classid = 'pg_class'::regclass
                         AND d.deptype = 'e')
-     AND (c.relkind = 'm'
-          OR (c.relkind = 'v'
-              AND NOT coalesce(c.reloptions, '{}') @> ARRAY['security_invoker=true'])
-          OR (c.relkind IN ('r', 'p')
-              AND (NOT c.relrowsecurity
-                   OR NOT c.relforcerowsecurity
-                   OR EXISTS (SELECT 1 FROM pg_policy p
-                               WHERE p.polrelid = c.oid AND p.polpermissive
-                                 AND p.polroles = '{0}'::oid[])
-                   OR NOT EXISTS (
-                        SELECT 1 FROM pg_policy p
-                         WHERE p.polrelid = c.oid
-                           AND NOT p.polpermissive
-                           AND p.polroles = '{0}'::oid[]
-                           AND p.polcmd = '*'
-                           AND pg_get_expr(p.polqual, p.polrelid)
-                                 = '(scope_id = ANY (( SELECT current_scopes() AS current_scopes)::text[]))'
-                           AND pg_get_expr(p.polwithcheck, p.polrelid)
-                                 = '(scope_id = ANY (( SELECT current_scopes() AS current_scopes)::text[]))'))))
 $$;
 
 -- security_invoker because the audit flags views that lack it, and a check that
@@ -356,6 +457,41 @@ CREATE VIEW mecha.rls_unprotected WITH (security_invoker = true)
 -- surfaces or neither: assertions 39 and 40. `rls_exempt` is readable by
 -- contrast because a GRANT says so.
 REVOKE EXECUTE ON FUNCTION mecha.rls_audit() FROM PUBLIC;
+
+-- The functions on /rpc a request may call without its role being tested: in
+-- `public` (the schema PostgREST serves), executable by authenticator, and
+-- either reading past the caller (SECURITY DEFINER) or applying a call's answer
+-- (`call_apply_*`, the backend's by name), with no request_role() or
+-- require_role() in their source. Every request runs as authenticator, so
+-- EXECUTE no longer tells a person from the backend. A definer a person's
+-- session is meant to reach (a membership test its policies call) lists here
+-- too: this is the list a reviewer reads, not a gate that must be empty.
+DROP VIEW IF EXISTS mecha.rpc_unchecked;
+CREATE OR REPLACE FUNCTION mecha.rpc_audit()
+  RETURNS TABLE (function_name text, reason text)
+  LANGUAGE sql STABLE
+  SET search_path = pg_catalog, public
+AS $$
+  SELECT p.oid::regprocedure::text,
+         CASE WHEN p.proname LIKE 'call\_apply\_%'
+              THEN 'applies a call''s answer, and any token may call it'
+              ELSE 'SECURITY DEFINER, and any token may call it' END
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.prokind = 'f'
+     -- A trigger's function is never called by name.
+     AND p.prorettype <> 'trigger'::regtype
+     AND (p.prosecdef OR p.proname LIKE 'call\_apply\_%')
+     AND to_regrole('authenticator') IS NOT NULL
+     AND has_function_privilege('authenticator', p.oid, 'EXECUTE')
+     AND p.prosrc NOT LIKE '%request_role()%'
+     AND p.prosrc NOT LIKE '%require_role(%'
+     AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.objid = p.oid AND d.classid = 'pg_proc'::regclass
+                        AND d.deptype = 'e')
+$$;
+CREATE VIEW mecha.rpc_unchecked WITH (security_invoker = true)
+  AS SELECT * FROM mecha.rpc_audit();
+REVOKE EXECUTE ON FUNCTION mecha.rpc_audit() FROM PUBLIC;
 
 -- `rls_exempt` is a table in a schema the audit scans, so it exempts itself
 -- -- by a row, in the list a reviewer reads, rather than by a term in the

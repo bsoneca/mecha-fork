@@ -73,13 +73,13 @@ await sql`CREATE TABLE IF NOT EXISTS inherited_article (
 await sql`CREATE TABLE IF NOT EXISTS inherited_article_child (
   scope_id text generated always as ('user:' || owner_id) stored not null
 ) INHERITS (inherited_article)`;
-// A per-row shape is answered as the subject, so the role the gate switches
+// A per-row shape is answered as the subject, so the login the gate switches
 // to has to exist, and the fixture needs a policy for it to read through:
 // gk_doc is readable by its owner, gk_line is content of a doc.
 await sql`DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_user') THEN CREATE ROLE app_user NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticator') THEN CREATE ROLE authenticator NOLOGIN; END IF;
 END $$`;
-await sql`GRANT USAGE ON SCHEMA public, mecha TO app_user`;
+await sql`GRANT USAGE ON SCHEMA public, mecha TO authenticator`;
 await sql`CREATE TABLE IF NOT EXISTS gk_doc (
   id uuid primary key default gen_random_uuid(),
   owner_id uuid not null
@@ -91,8 +91,8 @@ await sql`CREATE TABLE IF NOT EXISTS gk_line (
 )`;
 await sql`ALTER TABLE gk_doc ENABLE ROW LEVEL SECURITY`;
 await sql`DROP POLICY IF EXISTS gk_doc_own ON gk_doc`;
-await sql`CREATE POLICY gk_doc_own ON gk_doc FOR SELECT TO app_user USING (owner_id = auth_uid())`;
-await sql`GRANT SELECT ON gk_doc, gk_line TO app_user`;
+await sql`CREATE POLICY gk_doc_own ON gk_doc FOR SELECT TO authenticator USING (request_role() = 'app_user' AND owner_id = auth_uid())`;
+await sql`GRANT SELECT ON gk_doc, gk_line TO authenticator`;
 await sql`INSERT INTO mecha.shape_key VALUES
   ('public.gk_doc', 'id', 'public.gk_doc', 'id'),
   ('public.gk_line', 'doc_id', 'public.gk_doc', 'id')
@@ -248,7 +248,8 @@ Deno.test({
     const token = await issueUserToken(id, "alice");
     const claims = await verifyJwt(token);
     assert(claims !== null);
-    assertEquals(claims.role, "app_user");
+    assertEquals(claims.role, "authenticator");
+    assertEquals(claims.app_role, "app_user");
     assertEquals(claims.sub, id);
     assertEquals(claims.handle, "alice");
     const exp = claims.exp as number;
@@ -274,7 +275,8 @@ Deno.test({
     assert(/^[a-z]+-[a-z]+-\d\d$/.test(body.user.handle), `generated handle, got ${body.user.handle}`);
     const claims = await verifyJwt(body.token);
     assert(claims !== null);
-    assertEquals(claims.role, "app_user");
+    assertEquals(claims.role, "authenticator");
+    assertEquals(claims.app_role, "app_user");
     assertEquals(claims.sub, body.user.id);
     assertEquals(claims.handle, body.user.handle);
     const rows = await sql`select handle from app_user where id = ${body.user.id}`;
@@ -1075,13 +1077,15 @@ Deno.test({
     const as = async (q: string): Promise<string> => {
       const c = await sql.reserve();
       try {
-        await c.unsafe("SET ROLE app_user");
+        await c.unsafe("SET ROLE authenticator");
+        await c.unsafe(`SELECT set_config('request.jwt.claims', '{"role":"authenticator","app_role":"app_user"}', false)`);
         const rows = await c.unsafe(q);
         return `rows:${rows.length}`;
       } catch (e) {
         return String((e as Error).message);
       } finally {
         await c.unsafe("RESET ROLE");
+        await c.unsafe("RESET request.jwt.claims");
         c.release();
       }
     };
@@ -1089,7 +1093,7 @@ Deno.test({
       assertStringIncludes(await as(`select * from ${t}`), "permission denied", `${t} is granted to no app role`);
     }
     // What an app's migration does on each replay: every public table granted to its roles.
-    await sql`GRANT SELECT, INSERT, UPDATE, DELETE ON identity_link, webauthn_credential TO app_user`;
+    await sql`GRANT SELECT, INSERT, UPDATE, DELETE ON identity_link, webauthn_credential TO authenticator`;
     assertEquals(await as("select * from identity_link"), "rows:0", "a link reaches no session");
     assertEquals(await as("select * from webauthn_credential"), "rows:0", "nor a passkey");
     assertStringIncludes(await as(`insert into webauthn_credential (id, user_id, public_key) values ('cred-stolen', '${u.id}', '\\x00') returning id`), "row-level security");

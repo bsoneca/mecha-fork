@@ -69,6 +69,15 @@ docker_process_sql() {
 	psql -X -q -v ON_ERROR_STOP=1 --no-password --no-psqlrc -d "$POSTGRES_DB" "$@"
 }
 export -f docker_process_sql
+# The two logins the schema grants to and no migration makes, made here as a
+# deployment's operator makes them: PostgREST's, and Electric's, which reads
+# the WAL. Their passwords are the role-passwords step's.
+psql -X -q -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticator') THEN CREATE ROLE authenticator LOGIN; END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'electric') THEN CREATE ROLE electric LOGIN REPLICATION; END IF;
+END $$;
+SQL
 resolve() {
 	case $1 in
 	'{mecha}/'*) printf '%s/%s' "$mecha" "${1#\{mecha\}/}" ;;
