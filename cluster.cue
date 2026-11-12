@@ -116,7 +116,9 @@ _machineTimersSql: _ @embed(file="services/ticker/machine-timers.sql", type=text
 // Sets the electric and authenticator roles' passwords from the database's
 // ELECTRIC_PASSWORD and AUTHENTICATOR_PASSWORD, placed where a server is: the
 // schema grants both LOGIN and leaves their passwords to the deployment. A
-// framework prefix past every step that could create the roles.
+// framework prefix past every step that could create the roles. A deployment
+// whose roles are managed outside sets ROLES_MANAGED_OUTSIDE=true and the step
+// sets nothing (docs/deployment.md, roles managed outside).
 #RolePasswordsStep: "899_role_passwords.sh"
 
 // Canonical PostgreSQL options for both container and process-compose runtimes.
