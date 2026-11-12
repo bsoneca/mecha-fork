@@ -556,6 +556,16 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		if apiKeys {
 			auth: true
 		}
+		// The schemas PostgREST serves besides public (PRONTO-376, pronto-plugins
+		// docs/pronto-api.md): an app's API, such as ["api_v1"], read and called
+		// with Accept-Profile / Content-Profile: api_v1. public stays first, so a
+		// request that names no profile reads and writes it as before. None by
+		// default, which leaves crud's environment as it was, byte for byte.
+		// The app makes each schema and grants on it; its crud is the server's.
+		apiSchemas: [...string & =~"^[a-z_][a-z0-9_]{0,62}$" & !="public"]
+		if len(apiSchemas) > 0 {
+			server: true
+		}
 
 		// The change feed: conduit reading the WAL onto the bus (redis, behind
 		// the mesh-events sidecar) and transform running the pipelines off it.
@@ -1035,7 +1045,7 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							// Not postgres: PostgREST applies a token role's settings (its
 							// statement_timeout among them) only to roles granted to its login.
 							PGRST_DB_URI:       ["postgres://authenticator:\(authenticatorPassword)@", {peer: "database", port: "pg"}, "/${POSTGRES_DB:-\(X.meta.app)}"]
-							PGRST_DB_SCHEMA:    "public"
+							PGRST_DB_SCHEMA:    strings.Join(list.Concat([["public"], X.capabilities.apiSchemas]), ",")
 							PGRST_DB_ANON_ROLE: "anon"
 							// Called once per request, in the request's transaction, after the
 							// role switch: it sets app.scopes, which the tenancy floor reads.

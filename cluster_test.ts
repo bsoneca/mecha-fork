@@ -907,6 +907,22 @@ Deno.test("an app's apiKeys turn auth on and the key routes with it, and are abs
   assert.equal((await exported({}, "capabilities", { apiKeys: true, auth: false })).ok, false);
 });
 
+// An app's API schemas (PRONTO-376) reach PostgREST after public, which stays the
+// default profile; an app that names none keeps crud serving public alone.
+Deno.test("an app's apiSchemas are served after public, and only public otherwise", async () => {
+  const off = await exported({}, "surface.targets.crud.compose.environment");
+  assert.equal(off.ok, true, off.stderr);
+  assert.equal(off.value.PGRST_DB_SCHEMA, "public");
+  const on = await exported({}, "surface.targets.crud.compose.environment", { apiSchemas: ["api_v1"] });
+  assert.equal(on.ok, true, on.stderr);
+  assert.equal(on.value.PGRST_DB_SCHEMA, "public,api_v1");
+  const two = await exported({}, "surface.targets.crud.compose.environment", { apiSchemas: ["api_v1", "api_v2"] });
+  assert.equal(two.value.PGRST_DB_SCHEMA, "public,api_v1,api_v2");
+  assert.equal((await exported({}, "capabilities", { apiSchemas: ["public"] })).ok, false, "public is always first");
+  assert.equal((await exported({}, "capabilities", { apiSchemas: ["api-v1"] })).ok, false, "a schema name, not an identifier to quote");
+  assert.equal((await exported({}, "capabilities", { apiSchemas: ["api_v1"], server: false })).ok, false, "an API is crud's, so it presupposes server");
+});
+
 // A provider the service has no preset for is the issuer the program names in
 // its place (an identity broker's phone sign-in), beside Google.
 Deno.test("a provider with no preset signs in through the issuer the program names", async () => {
