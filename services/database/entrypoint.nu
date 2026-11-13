@@ -44,6 +44,8 @@ def main --wrapped [initdb: string, ...args: string] {
 				if ($f | str ends-with ".sql") {
 					^$psql -h $host_arg -p $init_port -U $user -d $db -v ON_ERROR_STOP=1 -q -f $f out> (null-device)
 				} else if ($f | str ends-with "role_passwords.sh") {
+					# As role_passwords.sh: roles kept outside keep their passwords.
+					if ($env.ROLES_MANAGED_OUTSIDE? | default "") == "true" { continue }
 					let elec = ($env.ELECTRIC_PASSWORD? | default "")
 					let auth = ($env.AUTHENTICATOR_PASSWORD? | default "")
 					if ($elec | is-empty) or ($auth | is-empty) { error make { msg: "ELECTRIC_PASSWORD and AUTHENTICATOR_PASSWORD are required" } }

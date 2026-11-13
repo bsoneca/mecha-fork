@@ -141,7 +141,8 @@ The roles' passwords are another step's (`899_role_passwords.sh`): an initdb
 step, so it runs when a database is first made, and again wherever a
 deployment's migrate sources it on each run. With `ROLES_MANAGED_OUTSIDE=true`
 in that container's environment it sets nothing, and the passwords stay
-whoever made the roles'.
+whoever made the roles'; the process runtime's database entrypoint, which
+runs that step's SQL itself, reads the same variable.
 
 What the DBA runs, as a role that may, to make them:
 

@@ -57,6 +57,7 @@ tasks:
       - task: test:airlock
       - task: test:auth
       - task: test:pgroll
+      - task: test:roles
       - task: test:cluster
       - task: test:browser
 
@@ -71,6 +72,12 @@ tasks:
     dir: packages/mecha-browser
     cmds:
       - mise x -- deno test --no-config --import-map cluster.deno.json --lock deno.lock --frozen --allow-read --allow-env rest_read_test.ts
+
+  test:roles:
+    desc: "the roles migration and the password steps, roles managed outside included; the Postgres cases run where initdb is on PATH"
+    dir: services/database
+    cmds:
+      - mise x -- deno test --no-config --no-lock --allow-read --allow-write --allow-env --allow-net --allow-run roles_test.ts
 
   test:cluster:
     desc: "what a cluster refuses of its initdb steps, and which services its change feed brings"
