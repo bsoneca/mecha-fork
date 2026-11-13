@@ -994,9 +994,33 @@ Deno.test("a cluster's own schemas reach PostgREST, auth and the runner", async 
 });
 
 Deno.test("a schema name that is no plain identifier, or lists the served schema reaches, is refused", async () => {
-  for (const schema of [{ app: "Shop" }, { app: "select" }, { floor: "pg_floor" }, { mecha: "public" }, { app: "shop", mecha: "shop" }]) {
+  for (const schema of [{ app: "Shop" }, { app: "select" }, { floor: "pg_floor" }, { mecha: "public" }, { app: "shop", mecha: "shop" }, { app: "mecha_auth" }, { floor: "mecha_auth" }, { mecha: "mecha_auth" }, { app: "airlock" }, { app: "pgroll" }]) {
     assert.equal((await schemaTargets(schema)).ok, false, JSON.stringify(schema));
   }
+  // An app in `mecha` leaves the lists no default: they would share its schema, and the app's grants
+  // ON ALL TABLES would reach rls_exempt and shape_key. Named elsewhere, they are apart.
+  const schemaOf = (schema: { app?: string; mecha?: string }) =>
+    evaluated(`(#Cluster & {meta: {app: "t", images: [string]: name: "img", bounds: {authStatementMs: 5000, tickerCallMs: 35000}, schema: ${JSON.stringify(schema)}}, state: {migrations: [], pipelines: [], schedules: [], computations: []}, capabilities: {}}).meta.schema`);
+  for (const schema of [{ app: "mecha" }, { app: "mecha", mecha: "mecha" }]) {
+    assert.equal((await schemaOf(schema)).ok, false, JSON.stringify(schema));
+  }
+  assert.deepEqual((await schemaOf({ app: "mecha", mecha: "lists" })).value, { app: "mecha", floor: "public", mecha: "lists" });
+  const apart = await schemaTargets({ app: "mecha", mecha: "lists" });
+  assert.equal(apart.ok, true, apart.stderr);
+  assert.equal(apart.value.crud.compose.environment.PGRST_DB_SCHEMA, "mecha");
+});
+
+// #Tenancy renames every spelling of the floor's and the lists' schemas: for a layout of its own,
+// nothing of `public.` or `mecha.` is left but the lines kept on purpose (the trace setting, which
+// is a setting, and the drops of objects an older file made in public).
+Deno.test("the tenancy floor for schemas of its own spells neither public nor mecha but where it means them", async () => {
+  const got = await evaluated(`(#Tenancy & {schema: {app: "shop", floor: "floor", mecha: "lists"}}).out`);
+  assert.equal(got.ok, true, got.stderr);
+  const kept = [/'mecha\.traceparent'/g, /LOCAL mecha\.traceparent/g, /DROP VIEW IF EXISTS public\.rls_unprotected;/g, /DROP FUNCTION IF EXISTS public\.rls_audit\(\);/g];
+  const statements = kept.reduce((sql, k) => sql.replace(k, ""), (got.value as string).replace(/--[^\n]*/g, ""));
+  const left = [...statements.matchAll(/\b(public|mecha)\.[a-z_]+/g)].map((m) => m[0]);
+  assert.deepEqual(left, []);
+  assert.ok(/LOCAL mecha\.traceparent|'mecha\.traceparent'/.test(got.value as string), "the trace setting keeps its name");
 });
 
 Deno.test("the tenancy floor on the default schemas is the file itself", async () => {
@@ -1024,4 +1048,33 @@ Deno.test("the tenancy floor for other schemas renames its functions and lists, 
   assert.equal(/\bmecha\.(?!traceparent\b)[a-z_]+/.test(sql), false);
   assert.ok(got.value.names.floor.includes("app_pre_request"));
   assert.ok(got.value.names.mecha.includes("rls_exempt"));
+});
+
+// Every schema the rendered floor grants on or makes an object in is one it
+// made first, or the app's (the caller makes it) or public, for every layout a
+// cluster may state: the floor apart, the floor with the lists, the floor with
+// the app's tables.
+Deno.test("the tenancy floor makes each schema before it grants on or creates in it", async () => {
+  for (const schema of [
+    { app: "shop", floor: "floor", mecha: "lists" },
+    { app: "shop", floor: "lists", mecha: "lists" },
+    { app: "shop", floor: "shop", mecha: "lists" },
+    { app: "shop", floor: "public", mecha: "mecha" },
+    { app: "public", floor: "public", mecha: "mecha" },
+  ]) {
+    const got = await evaluated(`(#Tenancy & {schema: ${JSON.stringify(schema)}}).out`);
+    assert.equal(got.ok, true, got.stderr);
+    // Comments name schemas loosely; only statements count.
+    const sql = (got.value as string).replace(/--[^\n]*/g, "");
+    const made = (s: string) => sql.indexOf(`CREATE SCHEMA IF NOT EXISTS ${s};`);
+    const uses = [
+      ...sql.matchAll(/ON SCHEMA ([a-z_]+)/g),
+      ...sql.matchAll(/CREATE (?:OR REPLACE )?(?:FUNCTION|PROCEDURE|TABLE IF NOT EXISTS|VIEW) ([a-z_]+)\./g),
+    ];
+    for (const use of uses) {
+      const s = use[1];
+      if (s === schema.app || s === "public") continue;
+      assert.ok(made(s) >= 0 && made(s) < use.index!, `${JSON.stringify(schema)}: ${s} used at ${use.index} before it is made`);
+    }
+  }
 });
