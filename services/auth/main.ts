@@ -117,6 +117,23 @@ function seconds(name: string, fallback: number): number {
   return n;
 }
 const USER_TOKEN_TTL_S = seconds("USER_TOKEN_TTL_S", 7 * 24 * 3600);
+/** The least an upgraded token lives, in seconds. */
+const UPGRADE_MIN_TTL_S = 5;
+/**
+ * The longest an upgraded session lives (`POST /auth/upgrade`), whatever its
+ * caller asks: one hour unless the deployment names its own, in seconds, and
+ * never under the least it must live, where every upgrade would be refused.
+ */
+export function upgradeTtlOf(value: string | undefined): number {
+  if (value === undefined || value === "") return 3600;
+  const ttl = Number(value);
+  if (!Number.isSafeInteger(ttl) || ttl <= 0) throw new Error(`UPGRADE_TOKEN_TTL_S is ${value}, not a number of seconds`);
+  if (ttl < UPGRADE_MIN_TTL_S) {
+    throw new Error(`UPGRADE_TOKEN_TTL_S is ${value}, under the ${UPGRADE_MIN_TTL_S}s an upgraded token must live`);
+  }
+  return ttl;
+}
+const UPGRADE_TOKEN_TTL_S = upgradeTtlOf(Deno.env.get("UPGRADE_TOKEN_TTL_S"));
 // How long after its token expired a guest may still trade it for a new one (POST /auth/guest/refresh):
 // a guest token is the only way back to a guest's account, so a guest away for longer than a week
 // comes back as itself; 90 days by default.
@@ -707,13 +724,17 @@ async function guest(_req: Request): Promise<Response> {
 // A guest's token for a new one of the same id and handle, so a guest who keeps coming back keeps its
 // account: the bearer must be a guest's, live or expired within GUEST_REFRESH_GRACE_S, and the account
 // still a guest (no passkey, no provider): an account's way back is its own sign-in. A refreshed
-// token is a bearer of a guest account only (no passkey, no payment, no friends).
+// token is a bearer of a guest account only (no passkey, no payment, no friends). An upgraded token is
+// refused.
 async function guestRefresh(req: Request): Promise<Response> {
   const auth = req.headers.get("authorization");
   const c = auth?.startsWith("Bearer ") ? await verifyJwt(auth.slice("Bearer ".length), GUEST_REFRESH_GRACE_S) : null;
   if (c === null || c.role !== "app_user" || c.guest !== true || typeof c.sub !== "string" || !UUID.test(c.sub)) {
     return jsonError(401, "invalid token");
   }
+  // An upgraded token is scoped to one operation and capped (POST /auth/upgrade): refreshed, it would
+  // outlive its cap as a plain session. Its holder refreshes the session it was upgraded from.
+  if (UPGRADE_CLAIMS.some((k) => Object.hasOwn(c, k))) return jsonError(403, "upgraded token");
   const [u] = await sql`select u.handle,
       exists (select 1 from mecha_auth.webauthn_credential w where w.user_id = u.id)
       or exists (select 1 from mecha_auth.identity_link l where l.user_id = u.id) as promoted
@@ -853,6 +874,82 @@ async function exchangeKey(req: Request): Promise<Response> {
   return json(200, { token, expires_in: KEY_TOKEN_TTL_S });
 }
 
+// --- Upgrade: a session issued again, scoped to one operation ---
+//
+// A service that has proven something about a session's person (another
+// issuer's token, say, checked on its own) asks for that session's token
+// again, with the operation it was proven for. The service holds no key: it
+// upgrades only a token it was handed, never one already upgraded, and for no
+// longer than that token lives; the session keeps its own subject, so what it
+// reads by subject it reads still. A caller that wants one upgrade per proof
+// keeps that itself: the same session can be upgraded again.
+
+/** The claims an upgrade adds, all of them, and nothing else. */
+const UPGRADE_CLAIMS = ["operation_kind", "operation_id", "amr", "idp"];
+/** A session's own claims, kept from the token upgraded and never asked for. */
+const SESSION_CLAIMS = ["role", "sub", "handle", "guest"];
+const CLAIM_MAX = 200;
+
+const claimText = (v: unknown) => typeof v === "string" && v !== "" && v.length <= CLAIM_MAX;
+const instant = (v: unknown, now: number): v is number => Number.isSafeInteger(v) && (v as number) > now;
+
+/** Why the claims asked for are not the closed list's, or null when they are. */
+function upgradeRefusal(claims: unknown): string | null {
+  if (typeof claims !== "object" || claims === null || Array.isArray(claims)) return "claims must be an object";
+  const asked = claims as Record<string, unknown>;
+  for (const k of Object.keys(asked)) {
+    if (SESSION_CLAIMS.includes(k)) return `${k} is the session's own, kept from its token`;
+    if (!UPGRADE_CLAIMS.includes(k)) return `${k} is not a claim an upgrade adds`;
+  }
+  for (const k of ["operation_kind", "operation_id", "idp"]) {
+    if (!claimText(asked[k])) return `${k} must be text of 1 to ${CLAIM_MAX} characters`;
+  }
+  const amr = asked.amr;
+  if (!Array.isArray(amr) || amr.length === 0 || amr.length > 8 || !amr.every(claimText)) {
+    return "amr must be a list of 1 to 8 methods";
+  }
+  return null;
+}
+
+async function upgrade(req: Request): Promise<Response> {
+  const caller = await bearerClaims(req);
+  if (!caller) return jsonError(401, "invalid token");
+  if (caller.role !== "service") return jsonError(403, "service only");
+  const body = await readBody(req);
+  if (!body) return jsonError(400, "invalid json body");
+  const refusal = upgradeRefusal(body.claims);
+  if (refusal !== null) return jsonError(400, refusal);
+  const now = Math.floor(Date.now() / 1000);
+  // The caller's wish and its family's end; the deployment's ceiling and the
+  // end of the token handed over cut both.
+  if (!instant(body.exp, now)) return jsonError(400, "exp must be a time in seconds after now");
+  if (!instant(body.cap, now)) return jsonError(400, "cap must be a time in seconds after now");
+  if (typeof body.token !== "string") return jsonError(400, "token required");
+  const session = await verifyJwt(body.token);
+  if (!session) return jsonError(401, "invalid user token");
+  if (session.role !== "app_user" || typeof session.sub !== "string") return jsonError(403, "not a user session");
+  // A key's token is scoped to the key (kid, scp), which an upgrade would drop.
+  if (Object.hasOwn(session, "kid") || Object.hasOwn(session, "scp")) return jsonError(403, "key token");
+  if (UPGRADE_CLAIMS.some((k) => Object.hasOwn(session, k))) return jsonError(409, "already upgraded");
+  const exp = Math.min(body.exp, body.cap, now + UPGRADE_TOKEN_TTL_S, session.exp as number);
+  // A token that ends before its holder can use it is no upgrade.
+  if (exp < now + UPGRADE_MIN_TTL_S) return jsonError(400, `the upgraded token would end within ${UPGRADE_MIN_TTL_S}s`);
+  const asked = body.claims as Record<string, unknown>;
+  const token = await signJwt({
+    role: session.role,
+    sub: session.sub,
+    ...(Object.hasOwn(session, "handle") ? { handle: session.handle } : {}),
+    ...(Object.hasOwn(session, "guest") ? { guest: session.guest } : {}),
+    operation_kind: asked.operation_kind,
+    operation_id: asked.operation_id,
+    amr: asked.amr,
+    idp: asked.idp,
+    exp,
+  });
+  return json(200, { token });
+}
+
+
 export const links: Links = {
   userFor(p: Profile, adopt?: string) {
     return sql.begin(async (tx) => {
@@ -965,6 +1062,9 @@ export async function handler(req: Request): Promise<Response> {
     }
     if (req.method === "GET" && path === "/auth/whoami") {
       return await whoami(req);
+    }
+    if (req.method === "POST" && path === "/auth/upgrade") {
+      return await upgrade(req);
     }
     if (req.method === "GET" && path === "/auth/door") {
       return await door(req);

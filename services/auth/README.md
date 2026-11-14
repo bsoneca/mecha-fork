@@ -51,6 +51,41 @@ Both ceremonies admit each one beside `WEBAUTHN_ORIGIN`. A fingerprint that is
 not 32 bytes stops the service at startup. Unset, the door admits no app. A
 program declares them as `capabilities.android`, the variable's default.
 
+## Upgrade
+
+`POST /auth/upgrade` issues a **user token** again, scoped to one operation, for
+a service that has proven something about the session's person on its own (a
+token of another issuer, say). The service holds no key and adds no claim of
+its own choosing:
+
+- Only a **service token** calls it (`Authorization`), else 401 or 403.
+- `token` is the session to upgrade: a live `app_user` token of this secret
+  that carries none of the claims below, else 401, 403 or 409. Its `role`,
+  `sub`, `handle` and `guest` are kept, so whatever it reads by its subject it
+  reads still, and nothing else of it is carried. A key's token (`kid`, `scp`)
+  is a 403: its scopes would not survive the upgrade. An upgraded token is never
+  upgraded again; the session it came from can be, so a caller that wants one
+  upgrade per proof keeps that itself.
+- `claims` is the closed list, all four: `operation_kind`, `operation_id` and
+  `idp` as text, `amr` as a list of methods. Any other name, the four a session
+  keeps among them, is a 400.
+- `exp` is the time the caller asks for and `cap` the end of the session's
+  family (a refresh's absolute ceiling), both in seconds; the token's `exp` is
+  the earliest of the two, of now plus `UPGRADE_TOKEN_TTL_S` (an hour unless
+  the deployment names one, of at least 5; another value refuses to start) and of the session
+  token's own `exp`, so an upgraded token never outlives the one it came from.
+  One that would end within 5 seconds is a 400.
+
+The answer is `{token}`, signed as every user token is. Nothing of either
+token is logged.
+
+An upgraded token is a full `app_user` session of the same person, narrowed only
+by the policies and functions that read its claims: a consumer that grants
+something for the operation reads `operation_kind` and `operation_id`, and one
+that serves only accounts checks `guest`, since a guest's session upgrades too.
+`POST /auth/guest/refresh` refuses an upgraded token (403), so it never outlives
+its cap as a plain session; its holder refreshes the session it came from.
+
 ## Provider sign-in
 
 A provider `signIn` names (`oidc.ts`) signs a person in by OpenID Connect's
