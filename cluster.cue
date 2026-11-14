@@ -93,6 +93,10 @@ _airlockLock:       _ @embed(file="services/airlock/deno.lock", type=text)
 // extensions, roles and grants a caller opens with.
 #TenancyMigration: "003_rls.sql"
 
+// What the door's entrypoint sets as it starts (the caddy target's entrypoint and
+// its image's): a caller's meta.doorEnvironment setting one would be overridden.
+_doorStarted: ["PORT", "CADDY_TLS_HOST_PORT", "CADDY_DOOR_PORT", "CADDY_TLS", "PRONTO_SRV_ROOT", "PRONTO_OMNISHELL_ROOT", "PRONTO_RELEASE_SCRIPTS", "XDG_DATA_HOME", "XDG_CONFIG_HOME"]
+
 // A schema's name, as a cluster states one (meta.schema). Every reader writes it
 // unquoted, so it is a plain lowercase identifier, no keyword PostgreSQL
 // reserves (its SQL Key Words appendix, "reserved"), and no pg_ name, which the
@@ -1120,7 +1124,7 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							PGRST_DB_PRE_REQUEST:    "\(X.meta.schema.floor).app_pre_request"
 							// A function's body PostgREST calls finds the floor's functions
 							// where the cluster keeps them outside the schema it serves.
-							if X.meta.schema.floor != "public" {PGRST_DB_EXTRA_SEARCH_PATH: X.meta.schema.floor}
+							if X.meta.schema.floor != "public" {PGRST_DB_EXTRA_SEARCH_PATH: "\(X.meta.schema.floor),public"}
 							PGRST_SERVER_HOST:       "*"
 							PGRST_SERVER_PORT:       {port: "http", part: "port"}
 							PGRST_ADMIN_SERVER_PORT: {port: "admin", part: "port"}
@@ -1302,19 +1306,16 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 						shell: "sh"
 						do:    "\(admitted)\(tlsEnv)\(scripts)\(validators)exec caddy run --envfile /etc/caddy/env --config /etc/caddy/Caddyfile --adapter caddyfile"
 					}
-					env: {
+					// What the cluster sets on the door itself, which a caller's
+					// meta.doorEnvironment may not set again.
+					let doorOwn = {
 						// The Caddyfile substitutes this into the electric route, which is
 						// the only place the secret is added. Same default as the electric
 						// service reads, and both are overridden together or neither.
 						ELECTRIC_SECRET: "${ELECTRIC_SECRET:-\(_devElectricSecret)}"
 						ORIGIN:          ["${ORIGIN:-\(X.meta.door.scheme)://", {port: "door", host: "localhost"}, "}"]
-						// The door's settings the caller adds (meta.doorEnvironment).
-						// A variable's name, as compose and a shell spell one.
-						for k, v in X.meta.doorEnvironment {(k): [
-							if k !~ "^[A-Z][A-Z0-9_]*$" {error("meta.doorEnvironment names \(k), not a variable")},
-							if k == "ORIGIN" || k == "ELECTRIC_SECRET" || strings.HasPrefix(k, "PRONTO_UPSTREAM_") {error("meta.doorEnvironment sets \(k), which the cluster sets itself")},
-							v,
-						][0]}
+						// Electric reads a bare table as public's (services/proxy/Caddyfile).
+						if X.meta.schema.app != "public" {ELECTRIC_TABLE_PREFIX: "\(X.meta.schema.app)."}
 						if X.capabilities.server {
 							PRONTO_UPSTREAM_CRUD:     {peer: "crud", port: "http"}
 							PRONTO_UPSTREAM_ELECTRIC: {peer: "electric", port: "http"}
@@ -1336,6 +1337,17 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							let _n = strings.Split(p, "=")
 							"PRONTO_UPSTREAM_\(strings.Replace(strings.ToUpper(_n[0]), "-", "_", -1))": "127.0.0.1:\(_n[1])"
 						}
+					}
+					env: {
+						doorOwn
+						// The door's settings the caller adds (meta.doorEnvironment), each
+						// a variable's name the cluster sets neither here nor as the door
+						// starts (_doorStarted).
+						for k, v in X.meta.doorEnvironment {(k): [
+							if k !~ "^[A-Z][A-Z0-9_]*$" {error("meta.doorEnvironment names \(k), not a variable")},
+							if doorOwn[k] != _|_ || list.Contains(_doorStarted, k) {error("meta.doorEnvironment sets \(k), which the cluster sets itself")},
+							v,
+						][0]}
 						...
 					}
 					if X.capabilities.server {

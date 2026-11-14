@@ -27,6 +27,11 @@
 				uri /auth/shape/verify
 			}
 			uri query secret {$ELECTRIC_SECRET}
+			# The gate compared the bare table the request names; Electric reads a
+			# bare name as public's, so an app whose tables are in a schema of its
+			# own has the door name it (ELECTRIC_TABLE_PREFIX, `<schema>.`, which
+			# the cluster sets from meta.schema; unset, the table is as asked).
+			uri query table {$ELECTRIC_TABLE_PREFIX}{query.table}
 			reverse_proxy {$PRONTO_UPSTREAM_ELECTRIC:electric:3000} {
 				flush_interval -1
 				transport http {

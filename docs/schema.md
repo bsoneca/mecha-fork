@@ -105,8 +105,12 @@ the served schema (in `mecha`, say) so no request reaches its functions over
 every table would reach the lists.
 
 PostgREST serves `app` and calls the floor's pre-request where it is, with
-the floor on its extra search path; auth reads `MECHA_DB_SCHEMA`,
-`MECHA_FLOOR_SCHEMA` and `MECHA_SCHEMA`; the migrate runner keeps pgroll's
+the floor and then `public` on its extra search path; auth reads `MECHA_DB_SCHEMA`,
+`MECHA_FLOOR_SCHEMA` and `MECHA_SCHEMA`, and its sessions search the app's, the
+floor's and `public`; a shape token names the table qualified by `app`, and the
+door names it so for Electric (`ELECTRIC_TABLE_PREFIX`), which reads a bare
+name as `public`'s; the host's Electric stand-in serves `public` alone and
+refuses another app or floor schema; the migrate runner keeps pgroll's
 ledger under `PGROLL_SCHEMA` (the framework's own tables, the ticker's
 `schedule` among them, stay in `public`). Each is stated only where it is not the
 default. The image's `003_rls.sql` spells the defaults, so a caller on other

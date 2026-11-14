@@ -978,6 +978,7 @@ Deno.test("the default schemas leave PostgREST, auth and the runner as they were
   for (const k of ["MECHA_DB_SCHEMA", "MECHA_FLOOR_SCHEMA", "MECHA_SCHEMA"]) assert.equal(auth[k], undefined, k);
   assert.equal(got.value.migrate.compose.environment.PGROLL_SCHEMA, undefined);
   assert.equal(got.value.electric.compose.environment.MECHA_DB_SCHEMA, undefined);
+  assert.equal(got.value.caddy.compose.environment.ELECTRIC_TABLE_PREFIX, undefined);
 });
 
 Deno.test("a cluster's own schemas reach PostgREST, auth and the runner", async () => {
@@ -986,7 +987,8 @@ Deno.test("a cluster's own schemas reach PostgREST, auth and the runner", async 
   const crud = got.value.crud.compose.environment;
   assert.equal(crud.PGRST_DB_SCHEMA, "shop");
   assert.equal(crud.PGRST_DB_PRE_REQUEST, "mecha.app_pre_request");
-  assert.equal(crud.PGRST_DB_EXTRA_SEARCH_PATH, "mecha");
+  // PostgREST's own default is public; naming the floor keeps it, where extensions keep their functions.
+  assert.equal(crud.PGRST_DB_EXTRA_SEARCH_PATH, "mecha,public");
   const auth = got.value.auth.compose.environment;
   assert.equal(auth.MECHA_DB_SCHEMA, "shop");
   assert.equal(auth.MECHA_FLOOR_SCHEMA, "mecha");
@@ -995,6 +997,8 @@ Deno.test("a cluster's own schemas reach PostgREST, auth and the runner", async 
   // The host's Electric stand-in is told, so it refuses them (services/electric/main.ts).
   assert.equal(got.value.electric.compose.environment.MECHA_DB_SCHEMA, "shop");
   assert.equal(got.value.electric.compose.environment.MECHA_FLOOR_SCHEMA, "mecha");
+  // The door names the table for Electric (services/proxy/Caddyfile).
+  assert.equal(got.value.caddy.compose.environment.ELECTRIC_TABLE_PREFIX, "shop.");
 });
 
 Deno.test("a schema name that is no plain identifier, or lists the served schema reaches, is refused", async () => {
@@ -1095,7 +1099,7 @@ Deno.test("a caller's door settings reach caddy, and never replace the cluster's
   assert.equal(env.SITES_MODE, "on");
   assert.equal(env.SITES, "localhost {env.ORIGIN} main -");
   assert.equal(env.ORIGIN, "${ORIGIN:-https://localhost:${CADDY_TLS_HOST_PORT}}");
-  for (const k of ["ORIGIN", "ELECTRIC_SECRET", "PRONTO_UPSTREAM_CRUD"]) {
+  for (const k of ["ORIGIN", "ELECTRIC_SECRET", "PRONTO_UPSTREAM_CRUD", "PORT", "CADDY_DOOR_PORT", "PRONTO_SRV_ROOT"]) {
     const set = await doorEnv({ [k]: "x" });
     assert.equal(set.ok, false, k);
     assert.match(set.stderr, new RegExp(`meta.doorEnvironment sets ${k}, which the cluster sets itself`), k);
