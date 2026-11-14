@@ -54,6 +54,14 @@ const DB_SCHEMA = schema("MECHA_DB_SCHEMA", "public");
 const FLOOR_SCHEMA = schema("MECHA_FLOOR_SCHEMA", "public");
 const MECHA_SCHEMA = schema("MECHA_SCHEMA", "mecha");
 const SCHEMAS = { app: DB_SCHEMA, mecha: MECHA_SCHEMA };
+/** The session's search_path under the app's schema: it, the floor's, then public. */
+export function searchPath(app: string, floor: string): string {
+  return [...new Set([app, floor, "public"])].join(", ");
+}
+/** The relation a shape token names: the table, qualified by the app's schema unless that is public. */
+export function shapeTable(app: string, table: string): string {
+  return app === "public" ? table : `${app}.${table}`;
+}
 /** The dev cluster's door: localhost, on whatever port the host published. */
 const DEV_DOOR = "https://localhost:*";
 
@@ -192,8 +200,10 @@ const SHAPE_TOKEN_TTL_S = 900;
 const STATE_TTL_S = 300;
 
 // app_user, which it reads unqualified, is where the app's tables are.
+// The floor's after it, and public last, where extensions keep their functions (a schema the role may
+// not use is skipped).
 export const sql = postgres(DATABASE_URL, {
-  connection: { statement_timeout: STATEMENT_TIMEOUT_MS, ...(DB_SCHEMA === "public" ? {} : { search_path: DB_SCHEMA }) },
+  connection: { statement_timeout: STATEMENT_TIMEOUT_MS, ...(DB_SCHEMA === "public" ? {} : { search_path: searchPath(DB_SCHEMA, FLOOR_SCHEMA) }) },
 });
 
 export async function migrate(): Promise<void> {
@@ -364,7 +374,9 @@ async function shapeToken(req: Request): Promise<Response> {
   }
   const token = await signJwt({
     typ: "shape",
-    table: body.table,
+    // Qualified where the app's tables are not public's, so a token never reaches a table of the same
+    // name in another schema.
+    table: shapeTable(DB_SCHEMA, body.table),
     where,
     sub,
     exp: Math.floor(Date.now() / 1000) + SHAPE_TOKEN_TTL_S,
@@ -494,7 +506,8 @@ async function shapeVerify(req: Request): Promise<Response> {
   // A missing parameter is not a matching one. `??` would let an absent `where`
   // read as authorized against a claim that named a predicate.
   if (claims.typ === "shape") {
-    if (get("table") !== claims.table) return jsonError(403, "table not authorized");
+    // The request names the bare table (the door qualifies it for Electric after this gate).
+    if (shapeTable(DB_SCHEMA, get("table") ?? "") !== claims.table) return jsonError(403, "table not authorized");
     if (get("where") !== claims.where) return jsonError(403, "where not authorized");
   } else {
     if (!validTable(get("table"))) return jsonError(403, "table not authorized");

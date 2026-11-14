@@ -977,6 +977,7 @@ Deno.test("the default schemas leave PostgREST, auth and the runner as they were
   const auth = got.value.auth.compose.environment;
   for (const k of ["MECHA_DB_SCHEMA", "MECHA_FLOOR_SCHEMA", "MECHA_SCHEMA"]) assert.equal(auth[k], undefined, k);
   assert.equal(got.value.migrate.compose.environment.PGROLL_SCHEMA, undefined);
+  assert.equal(got.value.electric.compose.environment.MECHA_DB_SCHEMA, undefined);
 });
 
 Deno.test("a cluster's own schemas reach PostgREST, auth and the runner", async () => {
@@ -991,6 +992,9 @@ Deno.test("a cluster's own schemas reach PostgREST, auth and the runner", async 
   assert.equal(auth.MECHA_FLOOR_SCHEMA, "mecha");
   assert.equal(auth.MECHA_SCHEMA, undefined);
   assert.equal(got.value.migrate.compose.environment.PGROLL_SCHEMA, "shop");
+  // The host's Electric stand-in is told, so it refuses them (services/electric/main.ts).
+  assert.equal(got.value.electric.compose.environment.MECHA_DB_SCHEMA, "shop");
+  assert.equal(got.value.electric.compose.environment.MECHA_FLOOR_SCHEMA, "mecha");
 });
 
 Deno.test("a schema name that is no plain identifier, or lists the served schema reaches, is refused", async () => {

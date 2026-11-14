@@ -13,7 +13,7 @@ import {
 } from "jsr:@std/assert@1.0.13";
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
 import { androidOrigin } from "./origins.ts";
-import { admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, keyExchangedHook, links, MAX_LIVE_KEYS, migrate, signJwt, sql, upgradeTtlOf, verifyJwt } from "./main.ts";
+import { admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, keyExchangedHook, links, MAX_LIVE_KEYS, migrate, searchPath, shapeTable, signJwt, sql, upgradeTtlOf, verifyJwt } from "./main.ts";
 import { handoffSpentSql } from "./schema.ts";
 import postgres from "postgres";
 import { PUBLIC_WHERE, signJwt as signWith } from "./jwt.ts";
@@ -923,6 +923,32 @@ Deno.test({
       assertEquals((await handler(shapeReq(token, `/v1/shape?table=article&where=${raw}`))).status, 403, raw);
     }
   },
+});
+
+// A shape token names the relation it was minted for: under an app schema of its own, the table
+// qualified by it, so a token for one schema's table never reaches a table of the same name in
+// another. The gate qualifies the bare table the request names the same way.
+Deno.test({
+  name: "a shape token for a table of the same name in another schema is refused",
+  ...opts,
+  async fn() {
+    assertEquals([shapeTable("public", "article"), shapeTable("shop", "article"), shapeTable("archive", "article")], ["article", "shop.article", "archive.article"]);
+    const where = `"title" = 'a'`;
+    const uri = `/v1/shape?table=article&where=${encodeURIComponent(where)}`;
+    const exp = Math.floor(Date.now() / 1000) + 60;
+    assertEquals((await handler(shapeReq(await signJwt({ typ: "shape", table: "article", where, exp }), uri))).status, 200);
+    for (const table of ["shop.article", "archive.article", "public.article"]) {
+      assertEquals((await handler(shapeReq(await signJwt({ typ: "shape", table, where, exp }), uri))).status, 403, table);
+    }
+  },
+});
+
+// Under an app schema, a session reads it first, then the floor's, then public's, where extensions
+// keep their functions; one schema named twice is named once.
+Deno.test("the session's search_path keeps public after the app's and the floor's", () => {
+  assertEquals(searchPath("shop", "mecha"), "shop, mecha, public");
+  assertEquals(searchPath("shop", "public"), "shop, public");
+  assertEquals(searchPath("shop", "shop"), "shop, public");
 });
 
 Deno.test({

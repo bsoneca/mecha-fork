@@ -1400,6 +1400,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							// build one, which would need CREATE on the database and
 							// ownership of every table it names.
 							ELECTRIC_MANUAL_TABLE_PUBLISHING: "true"
+							// The host's stand-in refuses schemas it cannot serve (services/electric/main.ts).
+							if X.meta.schema.app != "public" {MECHA_DB_SCHEMA: X.meta.schema.app}
+							if X.meta.schema.floor != "public" {MECHA_FLOOR_SCHEMA: X.meta.schema.floor}
 						}
 						after: X._schemaReady
 					}
