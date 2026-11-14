@@ -14,7 +14,7 @@ import {
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
 import { androidOrigin } from "./origins.ts";
 import { admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, keyExchangedHook, links, MAX_LIVE_KEYS, migrate, signJwt, sql, verifyJwt } from "./main.ts";
-import { HANDOFF_SPENT_SQL } from "./schema.ts";
+import { handoffSpentSql } from "./schema.ts";
 import postgres from "postgres";
 import { PUBLIC_WHERE } from "./jwt.ts";
 import { PUBLIC_WHERE as CLIENT_PUBLIC_WHERE } from "../../packages/client/src/public-where.ts";
@@ -1338,7 +1338,7 @@ Deno.test({
   sanitizeOps: false,
   async fn() {
     // Made by migrate where provider sign-in is on; this file's environment names no provider.
-    await sql.unsafe(HANDOFF_SPENT_SQL);
+    await sql.unsafe(handoffSpentSql());
     // Two instances: each its own connection pool, as two pods would hold.
     const other = postgres(Deno.env.get("DATABASE_URL")!);
     try {

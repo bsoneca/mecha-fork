@@ -28,7 +28,7 @@ import {
 } from "./jwt.ts";
 import { type Links, oidc, type Profile, providersFrom } from "./oidc.ts";
 import { androidOrigins } from "./origins.ts";
-import { API_KEYS_SQL, HANDOFF_SPENT_GRACE, HANDOFF_SPENT_SQL, prepareAuthTables, sealAuthTables } from "./schema.ts";
+import { apiKeysSql, HANDOFF_SPENT_GRACE, handoffSpentSql, prepareAuthTables, sealAuthTables } from "./schema.ts";
 export { shapeWhere };
 
 function required(name: string): string {
@@ -202,9 +202,9 @@ export async function migrate(): Promise<void> {
       END IF;
     END $$`;
     // The keys' table only where the program turned keys on: an app that did not gets nothing new.
-    if (apiKeysOn()) await tx.unsafe(API_KEYS_SQL);
+    if (apiKeysOn()) await tx.unsafe(apiKeysSql(SCHEMAS));
     // The handoff codes spent, only where provider sign-in is on (schema.ts, PRONTO-368).
-    if (Object.keys(OIDC_PROVIDERS).length > 0) await tx.unsafe(HANDOFF_SPENT_SQL);
+    if (Object.keys(OIDC_PROVIDERS).length > 0) await tx.unsafe(handoffSpentSql(SCHEMAS));
     await tx.unsafe(sealAuthTables(["webauthn_credential", "identity_link"], SCHEMAS));
   });
 }

@@ -115,10 +115,10 @@ END $auth$;
  * `api_key`). A key is read by its hash only through mecha_auth.api_key_owner, SECURITY DEFINER, the
  * one way a reader other than this service could be let at it: no service role, no table grant.
  */
-export const API_KEYS_SQL = `
+export const apiKeysSql = ({ app, mecha }: AuthSchemas = DEFAULT_SCHEMAS): string => `
 CREATE TABLE IF NOT EXISTS mecha_auth.api_key (
   id uuid primary key,
-  owner uuid not null references public.app_user(id) on delete cascade,
+  owner uuid not null references ${app}.app_user(id) on delete cascade,
   label text not null,
   scopes text[] not null,
   sha256 bytea not null unique,
@@ -130,11 +130,11 @@ CREATE INDEX IF NOT EXISTS api_key_owner_live ON mecha_auth.api_key (owner) WHER
 CREATE OR REPLACE FUNCTION mecha_auth.api_key_owner(hash bytea)
   RETURNS TABLE (id uuid, owner uuid, handle text, scopes text[])
   LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $fn$
-    SELECT k.id, k.owner, u.handle, k.scopes FROM mecha_auth.api_key k JOIN public.app_user u ON u.id = k.owner
+    SELECT k.id, k.owner, u.handle, k.scopes FROM mecha_auth.api_key k JOIN ${app}.app_user u ON u.id = k.owner
       WHERE k.sha256 = hash AND k.revoked_at IS NULL
   $fn$;
 REVOKE ALL ON FUNCTION mecha_auth.api_key_owner(bytea) FROM PUBLIC;
-INSERT INTO mecha.rls_exempt VALUES ('mecha_auth.api_key', 'the auth service''s own table, in a schema no app role may use')
+INSERT INTO ${mecha}.rls_exempt VALUES ('mecha_auth.api_key', 'the auth service''s own table, in a schema no app role may use')
   ON CONFLICT DO NOTHING;
 `;
 
@@ -145,13 +145,13 @@ INSERT INTO mecha.rls_exempt VALUES ('mecha_auth.api_key', 'the auth service''s 
  * A row outlives its code by HANDOFF_SPENT_GRACE so a clock ahead of the database's cannot honour a code
  * whose row was pruned; rows past that are pruned as codes are spent. Only where provider sign-in is on.
  */
-export const HANDOFF_SPENT_SQL = `
+export const handoffSpentSql = ({ mecha }: AuthSchemas = DEFAULT_SCHEMAS): string => `
 CREATE TABLE IF NOT EXISTS mecha_auth.handoff_spent (
   jti text primary key,
   expires_at timestamptz not null
 );
 CREATE INDEX IF NOT EXISTS handoff_spent_expires ON mecha_auth.handoff_spent (expires_at);
-INSERT INTO mecha.rls_exempt VALUES ('mecha_auth.handoff_spent', 'the auth service''s own table, in a schema no app role may use')
+INSERT INTO ${mecha}.rls_exempt VALUES ('mecha_auth.handoff_spent', 'the auth service''s own table, in a schema no app role may use')
   ON CONFLICT DO NOTHING;
 `;
 // How long a spent code's row outlives the code.
