@@ -27,6 +27,14 @@ export interface ShapesConfig {
   /** Server tables that carry shapes. */
   tables: string[]
   schema?: Record<string, { durability?: string }>
+  /** The schema `tables` are in, `public` unless named. A request names a table
+   * of another schema qualified by it (`<schema>.<table>`), as Electric reads a
+   * bare name as public's. */
+  appSchema?: string
+  /** The schema the notification trigger's function is kept in: the floor's,
+   * with the tenancy functions, unless public, where the connection's search
+   * path puts it. */
+  floorSchema?: string
   /** The one chain every use of `db` goes through: PGlite is one connection. */
   serialize: <T>(fn: () => Promise<T>) => Promise<T>
   serializeLow?: <T>(fn: () => Promise<T>) => Promise<T>
@@ -95,7 +103,12 @@ const ident = (s: string) => `"${s.replaceAll('"', '""')}"`
 const literal = (s: string) => `'${s.replaceAll("'", "''")}'`
 
 export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
-  const { db, serialize, serializeLow = serialize, fail } = cfg
+  const { db, serialize, serializeLow = serialize, fail, appSchema = 'public', floorSchema = 'public' } = cfg
+  // A table as a statement names it, and as `::regclass` reads it: bare in
+  // public, as it always was, and qualified in an app's schema of its own.
+  const rel = (table: string) => appSchema === 'public' ? ident(table) : `${ident(appSchema)}.${ident(table)}`
+  const regclass = (table: string) => appSchema === 'public' ? table : rel(table)
+  const notify = floorSchema === 'public' ? 'shape_notify' : `${ident(floorSchema)}.shape_notify`
   const logs = new Map<string, Log>()
   const bootId = crypto.randomUUID().slice(0, 8)
   for (const table of cfg.tables) {
@@ -103,18 +116,18 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
     // has no independent changes, primary key, or notification trigger.
     if (cfg.schema?.[table]?.durability === 'server') {
       const relation = await db.query<{ relkind: string }>(
-        'SELECT relkind FROM pg_class WHERE oid = $1::regclass', [table],
+        'SELECT relkind FROM pg_class WHERE oid = $1::regclass', [regclass(table)],
       )
       if (relation.rows[0]?.relkind === 'v') continue
     }
     const cols = await db.query<{ column_name: string; udt_name: string; is_nullable: string }>(
-      `SELECT column_name, udt_name, is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position`,
-      [table],
+      `SELECT column_name, udt_name, is_nullable FROM information_schema.columns WHERE table_schema = $2 AND table_name = $1 ORDER BY ordinal_position`,
+      [table, appSchema],
     )
     const pks = await db.query<{ attname: string }>(
       `SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
        WHERE i.indrelid = $1::regclass AND i.indisprimary ORDER BY array_position(i.indkey::int2[], a.attnum)`,
-      [table],
+      [regclass(table)],
     )
     // A shape keys every row by its primary key; a table without one has no
     // rows a client could tell apart.
@@ -136,7 +149,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
   // names a write's (postgrest-js); a snapshot's bounds below are too. A row's
   // own `txid` column is the 64-bit xid8 it is ordered by, which differs from
   // the xid once the epoch moves, so no message's txids read it.
-  await db.exec(`CREATE OR REPLACE FUNCTION shape_notify() RETURNS trigger LANGUAGE plpgsql AS $$
+  await db.exec(`CREATE OR REPLACE FUNCTION ${notify}() RETURNS trigger LANGUAGE plpgsql AS $$
     DECLARE r jsonb; k jsonb; c text; n integer;
       used integer := COALESCE(NULLIF(current_setting('mecha.shape_notifications', true), ''), '0')::integer;
       reset_key text := 'mecha.shape_reset_' || TG_RELID;
@@ -168,7 +181,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
   const installed = await db.query<{ schema: string; table: string; trigger: string }>(`
     SELECT n.nspname AS schema, c.relname AS table, t.tgname AS trigger
     FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
-    WHERE t.tgfoid='shape_notify()'::regprocedure AND NOT t.tgisinternal`)
+    WHERE t.tgfoid=${literal(`${notify}()`)}::regprocedure AND NOT t.tgisinternal`)
   for (const row of installed.rows) {
     await db.exec(`DROP TRIGGER ${ident(row.trigger)} ON ${ident(row.schema)}.${ident(row.table)}`)
   }
@@ -176,8 +189,8 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
     for (const op of ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) {
       const trigger = ident('shape_notify_' + op.toLowerCase())
       const transition = op === 'TRUNCATE' ? '' : `REFERENCING ${op === 'DELETE' ? 'OLD' : 'NEW'} TABLE AS shape_rows`
-      await db.exec(`CREATE TRIGGER ${trigger} AFTER ${op} ON ${ident(table)} ${transition}
-        FOR EACH STATEMENT EXECUTE FUNCTION shape_notify(${l.pk.map(literal).join(', ')});`)
+      await db.exec(`CREATE TRIGGER ${trigger} AFTER ${op} ON ${rel(table)} ${transition}
+        FOR EACH STATEMENT EXECUTE FUNCTION ${notify}(${l.pk.map(literal).join(', ')});`)
     }
   }
 
@@ -193,9 +206,9 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
    * already holds). */
   const rowMessage = (table: string, operation: string, row: Row, txid: number | null) => {
     const l = logs.get(table)!
-    const headers: Record<string, unknown> = { operation, relation: ['public', table] }
+    const headers: Record<string, unknown> = { operation, relation: [appSchema, table] }
     if (txid !== null) headers.txids = [txid]
-    return { key: `"public"."${table}"/${l.pk.map((c) => `"${String(row[c])}"`).join('/')}`, value: row, headers }
+    return { key: `"${appSchema}"."${table}"/${l.pk.map((c) => `"${String(row[c])}"`).join('/')}`, value: row, headers }
   }
 
   const wake = (l: Log, scope: string | null) => {
@@ -244,7 +257,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
       let row: Row = Object.fromEntries(Object.entries(key).map(([c, v]) => [c, v === null ? null : String(v)]))
       if (op !== 'DELETE') {
         const where = l.pk.map((c, i) => `${ident(c)} = $${i + 1}`).join(' AND ')
-        const r = await db.query<{ r: Row }>(`SELECT ${asText(table)} AS r FROM ${ident(table)} t WHERE ${where}`, l.pk.map((c) => key[c]))
+        const r = await db.query<{ r: Row }>(`SELECT ${asText(table)} AS r FROM ${rel(table)} t WHERE ${where}`, l.pk.map((c) => key[c]))
         if (l.handle !== generation) return
         if (r.rows.length === 0) {
           l.entries.splice(l.entries.length - (l.tail - l.filled), 1)
@@ -317,13 +330,16 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
 
   async function serve(req: Request, reachOf: () => Promise<string[]>, key?: ShapeKey): Promise<Response> {
     const p = new URL(req.url).searchParams
-    const table = p.get('table') ?? ''
+    const named = p.get('table') ?? ''
+    // A bare name is public's, as Electric reads one.
+    const prefix = appSchema === 'public' ? '' : `${appSchema}.`
+    const table = named.startsWith(prefix) ? named.slice(prefix.length) : ''
     const offset = p.get('offset') ?? '-1'
     const handle = p.get('handle')
     const live = p.get('live') === 'true'
     const changesOnly = p.get('log') === 'changes_only'
     const l = logs.get(table)
-    if (!l) return json(400, { error: `${table} is not a shape table` })
+    if (!l) return json(400, { error: `${named} is not a shape table` })
     if (key !== undefined && !(key.column in l.schema)) return json(400, { error: `${key.column} is not a column of ${table}` })
     const generation = l.handle
     // A 410, which Electric's client does not retry as it does a 500: its
@@ -360,7 +376,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
       // row's xmin can acknowledge the transaction after a reset.
       const { rows, seen } = await serializeLow(async () => ({
         seen: await visibility(),
-        rows: (await db.query<{ r: Row; x: string }>(`SELECT ${asText(table)} AS r, t.xmin::text AS x FROM ${ident(table)} t WHERE ${whereClause}`)).rows,
+        rows: (await db.query<{ r: Row; x: string }>(`SELECT ${asText(table)} AS r, t.xmin::text AS x FROM ${rel(table)} t WHERE ${whereClause}`)).rows,
       }))
       if (l.handle !== generation) return refetch(l)
       const msgs: unknown[] = rows.map((x) => rowMessage(table, 'insert', x.r, Number(x.x)))
@@ -446,7 +462,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
     const generation = l.handle
     const whereClause = key ? `${ident(key.column)} = ${literal(key.value)}` : shapeWhere(await reachOf())
     if (l.handle !== generation) return refetch(l)
-    const sql = `SELECT ${asText(table)} AS r FROM ${ident(table)} t WHERE (${whereClause})` +
+    const sql = `SELECT ${asText(table)} AS r FROM ${rel(table)} t WHERE (${whereClause})` +
       (where === null ? '' : ` AND (${where})`) + (order === null ? '' : ` ORDER BY ${order}`) + (limit === null ? '' : ` LIMIT ${limit}`)
     const read = await serializeLow(async () => {
       const seen = await visibility()

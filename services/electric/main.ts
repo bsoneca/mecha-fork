@@ -16,15 +16,15 @@ const DATABASE_URL = Deno.env.get("ADMIN_DATABASE_URL") || required("DATABASE_UR
 const ELECTRIC_SECRET = required("ELECTRIC_SECRET");
 const JWT_SECRET = required("PGRST_JWT_SECRET");
 const PORT = Number(Deno.env.get("PORT") || 3000);
-// This stand-in reads the app's tables, the publication and the floor in `public` alone: a cluster
-// that names its own schemas (meta.schema) would have it sync the wrong relations, so it refuses
-// to start rather than misauthorize.
-for (const name of ["MECHA_DB_SCHEMA", "MECHA_FLOOR_SCHEMA"]) {
-  const value = Deno.env.get(name);
-  if (value !== undefined && value !== "" && value !== "public") {
-    throw new Error(`${name} is ${value}: the host's Electric serves only public's tables and floor; run Electric's image for another schema`);
-  }
+// The schemas the cluster states (meta.schema): the app's tables and the publication's, and the
+// floor's functions. Each is a plain lowercase name, as auth holds them (services/auth/main.ts).
+function schema(name: string): string {
+  const value = Deno.env.get(name) || "public";
+  if (!/^[a-z_][a-z0-9_]{0,62}$/.test(value)) throw new Error(`${name} is ${value}, not a schema name`);
+  return value;
 }
+const DB_SCHEMA = schema("MECHA_DB_SCHEMA");
+const FLOOR_SCHEMA = schema("MECHA_FLOOR_SCHEMA");
 
 const sql = postgres(DATABASE_URL, {
   max: 8,
@@ -72,7 +72,7 @@ const db: ShapesDb = {
 const pubRows = await sql<{ tablename: string }[]>`
   SELECT tablename
   FROM pg_publication_tables
-  WHERE pubname = 'electric_publication_default' AND schemaname = 'public'
+  WHERE pubname = 'electric_publication_default' AND schemaname = ${DB_SCHEMA}
   ORDER BY tablename
 `;
 if (pubRows.length === 0) {
@@ -83,6 +83,8 @@ const tables = pubRows.map((r) => r.tablename);
 const shapes = await createShapes({
   db,
   tables,
+  appSchema: DB_SCHEMA,
+  floorSchema: FLOOR_SCHEMA,
   serialize,
   fail: (err) => {
     console.error("electric shape log failure:", err);
@@ -127,7 +129,7 @@ Deno.serve({ port: PORT, hostname: "127.0.0.1" }, async (req) => {
       : undefined;
     const reachOf = async (): Promise<string[]> => {
       if (whereParam === "scope_id IN ('public:')") return ["public:"];
-      const rows = await sql<{ s: string[] }[]>`SELECT public.subject_scopes(${sub}) AS s`;
+      const rows = await sql<{ s: string[] }[]>`SELECT ${sql(FLOOR_SCHEMA)}.subject_scopes(${sub}) AS s`;
       if (!rows[0]?.s) throw new Error(`subject_scopes returned no scopes for ${sub}`);
       return rows[0].s;
     };
