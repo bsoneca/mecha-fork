@@ -318,3 +318,47 @@ Deno.test('an app schema of its own serves its tables named qualified, keeping t
     await db.close()
   }
 })
+
+// Two apps in one database, each on a schema of its own over one floor: starting one leaves the
+// other's triggers, replaces its own tables' triggers wherever their function was, and a change to
+// the other's table of the same name never enters its log.
+Deno.test('an app schema keeps to its own triggers and notifications beside another app of the database', async () => {
+  const db = await PGlite.create()
+  try {
+    await db.exec(`CREATE SCHEMA app; CREATE SCHEMA other; CREATE SCHEMA floor;
+      CREATE TABLE app.item(id integer PRIMARY KEY, scope_id text NOT NULL DEFAULT 'public:');
+      CREATE TABLE other.item(LIKE app.item INCLUDING ALL);
+      CREATE FUNCTION public.shape_notify() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_notify('shape','legacy'); RETURN NULL; END $$;
+      CREATE TRIGGER shape_notify_insert AFTER INSERT ON app.item REFERENCING NEW TABLE AS shape_rows
+        FOR EACH STATEMENT EXECUTE FUNCTION public.shape_notify();`)
+    let tail: Promise<unknown> = Promise.resolve()
+    const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
+      const result = tail.then(fn)
+      tail = result.then(() => {}, () => {})
+      return result
+    }
+    const make = (appSchema: string) => createShapes({ db, tables: ['item'], appSchema, floorSchema: 'floor', serialize, fail: error => { throw error } })
+    const others = await make('other')
+    const apps = await make('app')
+    assert.deepEqual((await db.query(`SELECT n.nspname AS schema, p.oid::regprocedure::text AS fn, count(*)::integer AS triggers
+      FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_proc p ON p.oid=t.tgfoid
+      WHERE p.proname='shape_notify' AND NOT t.tgisinternal GROUP BY 1, 2 ORDER BY 1`)).rows,
+    [{ schema: 'app', fn: 'floor.shape_notify()', triggers: 4 }, { schema: 'other', fn: 'floor.shape_notify()', triggers: 4 }])
+    const reach = () => Promise.resolve(['public:'])
+    const from = async (shapes: typeof apps, table: string) => {
+      const r = await shapes.serve(new Request(`http://shape/?table=${table}&offset=-1`), reach)
+      await r.body?.cancel()
+      return `offset=${r.headers.get('electric-offset')}&handle=${r.headers.get('electric-handle')}`
+    }
+    const [appAt, otherAt] = [await from(apps, 'app.item'), await from(others, 'other.item')]
+    await serialize(() => db.exec('INSERT INTO other.item VALUES (1)'))
+    await serialize(async () => {})
+    const ids = async (shapes: typeof apps, query: string) =>
+      ((await (await shapes.serve(new Request('http://shape/?' + query), reach)).json()) as { value?: { id: string } }[]).filter(x => x.value).map(x => x.value!.id)
+    assert.deepEqual(await ids(others, `table=other.item&${otherAt}`), ['1'])
+    assert.deepEqual(await ids(apps, `table=app.item&${appAt}`), [])
+  } finally {
+    await db.close()
+  }
+})

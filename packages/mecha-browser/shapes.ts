@@ -161,7 +161,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
       END IF;
       IF TG_OP = 'TRUNCATE' OR used + n > ${RETAINED} THEN
         PERFORM set_config(reset_key, 'true', true);
-        PERFORM pg_notify('shape', json_build_object('table', TG_TABLE_NAME, 'op', 'RESET')::text);
+        PERFORM pg_notify('shape', json_build_object('schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'op', 'RESET')::text);
         RETURN NULL;
       END IF;
       PERFORM set_config('mecha.shape_notifications', (used + n)::text, true);
@@ -174,14 +174,18 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
           k := '{}'::jsonb;
           FOREACH c IN ARRAY TG_ARGV LOOP k := k || jsonb_build_object(c, r -> c); END LOOP;
         END IF;
-        PERFORM pg_notify('shape', json_build_object('table', TG_TABLE_NAME, 'op', TG_OP, 'key', k, 'scope', r -> 'scope_id', 'txid', pg_current_xact_id()::xid::text::bigint)::text);
+        PERFORM pg_notify('shape', json_build_object('schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'op', TG_OP, 'key', k, 'scope', r -> 'scope_id', 'txid', pg_current_xact_id()::xid::text::bigint)::text);
       END LOOP;
       RETURN NULL;
     END $$;`)
   const installed = await db.query<{ schema: string; table: string; trigger: string }>(`
     SELECT n.nspname AS schema, c.relname AS table, t.tgname AS trigger
     FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
-    WHERE t.tgfoid=${literal(`${notify}()`)}::regprocedure AND NOT t.tgisinternal`)
+    WHERE ${appSchema === 'public'
+      ? `t.tgfoid=${literal(`${notify}()`)}::regprocedure`
+      // An app's own schema drops its tables' triggers alone, wherever their
+      // function was kept: another app in the database keeps its own.
+      : `t.tgfoid IN (SELECT oid FROM pg_proc WHERE proname = 'shape_notify' AND pronargs = 0) AND n.nspname = ${literal(appSchema)}`} AND NOT t.tgisinternal`)
   for (const row of installed.rows) {
     await db.exec(`DROP TRIGGER ${ident(row.trigger)} ON ${ident(row.schema)}.${ident(row.table)}`)
   }
@@ -237,8 +241,9 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
   // as seen. Its row is read back by its key, in the order the notifications
   // came; a row already gone by then is left to the delete that follows it.
   await db.listen('shape', (payload: string) => {
-    const { table, op, key, scope, txid } = JSON.parse(payload) as { table: string; op: string; key: Row; scope: string | null; txid: number }
-    const l = logs.get(table)
+    const { schema, table, op, key, scope, txid } = JSON.parse(payload) as { schema: string; table: string; op: string; key: Row; scope: string | null; txid: number }
+    // The channel is the database's: another schema's table of the same name is not this one.
+    const l = schema === appSchema ? logs.get(table) : undefined
     if (!l) return
     if (op === 'RESET') {
       l.handle = `${table}-${crypto.randomUUID().slice(0, 8)}`
