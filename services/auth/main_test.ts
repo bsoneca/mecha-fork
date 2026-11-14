@@ -13,7 +13,7 @@ import {
 } from "jsr:@std/assert@1.0.13";
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
 import { androidOrigin } from "./origins.ts";
-import { admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, keyExchangedHook, links, MAX_LIVE_KEYS, migrate, searchPath, shapeTable, signJwt, sql, upgradeTtlOf, verifyJwt } from "./main.ts";
+import { adoptableGuest, admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, keyExchangedHook, links, MAX_LIVE_KEYS, migrate, searchPath, shapeTable, signJwt, sql, upgradeTtlOf, verifyJwt } from "./main.ts";
 import { handoffSpentSql } from "./schema.ts";
 import postgres from "postgres";
 import { PUBLIC_WHERE, signJwt as signWith } from "./jwt.ts";
@@ -436,6 +436,9 @@ Deno.test({
     assertEquals(await refused(await signWith("another-secret-entirely-0000000000", { role: "app_user", sub, exp: nowS() + 600 })), 401);
     // A service's token, a shape's and a ceremony's state are no person's session.
     assertEquals(await refused(await serviceToken()), 403);
+    // A session whose end is no time bounds nothing: none is no live token at all, a fraction is refused.
+    assertEquals(await refused(await signJwt({ role: "app_user", sub, guest: true })), 401);
+    assertEquals(await refused(await signJwt({ role: "app_user", sub, guest: true, exp: nowS() + 600.5 })), 403);
     assertEquals(await refused(await signJwt({ typ: "shape", table: "article", where: "false", sub, exp: nowS() + 600 })), 403);
     assertEquals(await refused(await signJwt({ purpose: "login", challenge: "c", exp: nowS() + 600 })), 403);
     // A key's token is scoped to its key, which an upgrade would drop.
@@ -546,6 +549,28 @@ Deno.test({
 });
 
 Deno.test({
+  name: "an upgraded session mints nothing that outlives it: no passkey, no key, no adoption",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    const up = (await upgraded(upgradeOf(guest.token))).body.token as string;
+    // A passkey: promoting the guest would outlive the operation's cap.
+    const reg = await handler(post("/auth/register/start", {}, up));
+    assertEquals([reg.status, (await reg.json()).error], [403, "upgraded token"]);
+    assertEquals((await handler(post("/auth/register/start", {}, guest.token))).status, 200);
+    // An adoption by a provider's sign-in.
+    const bearer = (t: string) => new Request("http://auth:9999/auth/oidc/adopt", { method: "POST", headers: { authorization: `Bearer ${t}` } });
+    assertEquals(await adoptableGuest(bearer(up)), null);
+    assertEquals(await adoptableGuest(bearer(guest.token)), { id: guest.user.id, handle: guest.user.handle });
+    // An API key, for an account's upgraded session.
+    const a = await account();
+    const accountUp = (await upgraded(upgradeOf(a.token))).body.token as string;
+    assertEquals(await created(accountUp), { status: 403, body: { error: "upgraded token" } });
+    assertEquals((await created(a.token)).status, 201);
+  }),
+});
+
+Deno.test({
   name: "an upgraded guest token is not refreshed, before its end or after it",
   ...opts,
   async fn() {
@@ -606,6 +631,29 @@ async function mint(table: string) {
   );
   return { res, userToken, uid: user[0].id as string };
 }
+
+// A shape minted from an upgraded session ends no later than that session; one from a plain session
+// lives its own fifteen minutes.
+Deno.test({
+  name: "an upgraded session's shape token ends with the session",
+  ...opts,
+  async fn() {
+    const { res: plain, userToken, uid } = await mint("scoped_article");
+    assertEquals((await plain.json()).expires_in, 900);
+    const t = nowS();
+    const up = await signJwt({ role: "app_user", sub: uid, handle: "x", guest: false, ...operation, exp: t + 120 });
+    const res = await handler(new Request("http://auth:9999/auth/shape", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${up}` },
+      body: JSON.stringify({ table: "scoped_article" }),
+    }));
+    assertEquals(res.status, 200);
+    const body = await res.json();
+    assertEquals((await verifyJwt(body.token))!.exp, t + 120);
+    assert(body.expires_in <= 120);
+    assert(userToken !== up);
+  },
+});
 
 Deno.test({
   name: "the shape token carries the subject's scopes, not the client's request",

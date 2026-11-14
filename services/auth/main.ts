@@ -372,6 +372,9 @@ async function shapeToken(req: Request): Promise<Response> {
     // Only a proven public leaf can omit the subject's irrelevant scopes.
     where = shapeWhere(scope.publicOnly ? scopes.filter((scope) => scope === "public:") : scopes);
   }
+  // A shape minted from an upgraded session ends no later than it does (its cap, POST /auth/upgrade).
+  const now = Math.floor(Date.now() / 1000);
+  const exp = isUpgraded(subject.claims) ? Math.min(now + SHAPE_TOKEN_TTL_S, subject.claims.exp as number) : now + SHAPE_TOKEN_TTL_S;
   const token = await signJwt({
     typ: "shape",
     // Qualified where the app's tables are not public's, so a token never reaches a table of the same
@@ -379,12 +382,12 @@ async function shapeToken(req: Request): Promise<Response> {
     table: shapeTable(DB_SCHEMA, body.table),
     where,
     sub,
-    exp: Math.floor(Date.now() / 1000) + SHAPE_TOKEN_TTL_S,
+    exp,
   });
   // `where` goes back so the client sends exactly what was authorized: the
   // check below is equality, and a client that rebuilds the string differently
   // is refused for a reason it cannot see.
-  return json(200, { token, table: body.table, where, expires_in: SHAPE_TOKEN_TTL_S });
+  return json(200, { token, table: body.table, where, expires_in: exp - now });
 }
 
 // The parameters a shape request may carry besides the two the token names:
@@ -506,7 +509,8 @@ async function shapeVerify(req: Request): Promise<Response> {
   // A missing parameter is not a matching one. `??` would let an absent `where`
   // read as authorized against a claim that named a predicate.
   if (claims.typ === "shape") {
-    // The request names the bare table (the door qualifies it for Electric after this gate).
+    // The request names the bare table; the door qualifies it for Electric after this gate
+    // (ELECTRIC_TABLE_PREFIX, services/proxy/Caddyfile), as it does the public shape's below.
     if (shapeTable(DB_SCHEMA, get("table") ?? "") !== claims.table) return jsonError(403, "table not authorized");
     if (get("where") !== claims.where) return jsonError(403, "where not authorized");
   } else {
@@ -572,6 +576,7 @@ async function registerStart(req: Request): Promise<Response> {
   // outlive the token and its sign-out. With no session, a new identity —
   // usernameless by doctrine: no identifier is ever collected.
   if (claims !== null && claims.guest !== true) return jsonError(409, "already an account");
+  if (claims !== null && isUpgraded(claims)) return jsonError(403, "upgraded token");
   const promote = claims !== null;
   const handle = claims ? claims.handle as string : generateHandle();
   const userId = claims ? claims.sub as string : crypto.randomUUID();
@@ -747,7 +752,7 @@ async function guestRefresh(req: Request): Promise<Response> {
   }
   // An upgraded token is scoped to one operation and capped (POST /auth/upgrade): refreshed, it would
   // outlive its cap as a plain session. Its holder refreshes the session it was upgraded from.
-  if (UPGRADE_CLAIMS.some((k) => Object.hasOwn(c, k))) return jsonError(403, "upgraded token");
+  if (isUpgraded(c)) return jsonError(403, "upgraded token");
   const [u] = await sql`select u.handle,
       exists (select 1 from mecha_auth.webauthn_credential w where w.user_id = u.id)
       or exists (select 1 from mecha_auth.identity_link l where l.user_id = u.id) as promoted
@@ -807,6 +812,7 @@ async function keyHolder(req: Request): Promise<{ id: string } | Response> {
   }
   if (subject.claims.guest === true) return jsonError(403, "guest");
   if (subject.claims.kid !== undefined) return jsonError(403, "key token");
+  if (isUpgraded(subject.claims)) return jsonError(403, "upgraded token");
   return { id: subject.claims.sub };
 }
 
@@ -901,6 +907,19 @@ async function exchangeKey(req: Request): Promise<Response> {
 const UPGRADE_CLAIMS = ["operation_kind", "operation_id", "amr", "idp"];
 /** A session's own claims, kept from the token upgraded and never asked for. */
 const SESSION_CLAIMS = ["role", "sub", "handle", "guest"];
+/**
+ * Whether claims are an upgraded session's. One is scoped to an operation and capped: it mints
+ * nothing that outlives it (a passkey, an API key, a guest's promotion or adoption, a refresh).
+ */
+export const isUpgraded = (claims: Record<string, unknown>) => UPGRADE_CLAIMS.some((k) => Object.hasOwn(claims, k));
+
+/** The guest a bearer names for an adoption: a guest's own session, never an account's or an upgraded one's. */
+export async function adoptableGuest(req: Request): Promise<{ id: string; handle: string } | null> {
+  const c = await bearerClaims(req);
+  return c !== null && c.role === "app_user" && c.guest === true && !isUpgraded(c) && typeof c.sub === "string" && typeof c.handle === "string"
+    ? { id: c.sub, handle: c.handle }
+    : null;
+}
 const CLAIM_MAX = 200;
 
 const claimText = (v: unknown) => typeof v === "string" && v !== "" && v.length <= CLAIM_MAX;
@@ -941,6 +960,8 @@ async function upgrade(req: Request): Promise<Response> {
   const session = await verifyJwt(body.token);
   if (!session) return jsonError(401, "invalid user token");
   if (session.role !== "app_user" || typeof session.sub !== "string") return jsonError(403, "not a user session");
+  // Its end bounds the upgraded token's, so it is a time, never absent or 1e400.
+  if (!Number.isSafeInteger(session.exp)) return jsonError(403, "not a user session");
   // A key's token is scoped to the key (kid, scp), which an upgrade would drop.
   if (Object.hasOwn(session, "kid") || Object.hasOwn(session, "scp")) return jsonError(403, "key token");
   if (UPGRADE_CLAIMS.some((k) => Object.hasOwn(session, k))) return jsonError(409, "already upgraded");
@@ -1032,12 +1053,7 @@ const providerSignIn = oidc({
   spend: handoffSpender(sql),
   issue: (user) => issueUserToken(user.id, user.handle),
   // The guest a bearer names, for POST /auth/oidc/adopt: a guest token only, never an account's.
-  guestOf: async (req) => {
-    const c = await bearerClaims(req);
-    return c !== null && c.role === "app_user" && c.guest === true && typeof c.sub === "string" && typeof c.handle === "string"
-      ? { id: c.sub, handle: c.handle }
-      : null;
-  },
+  guestOf: adoptableGuest,
   // An origin new since the __Host- session cookie sets this "off": a bare mecha_oidc there could
   // only be a sibling host's (oidc.ts, LEGACY_SESSION_COOKIE).
   legacyCookie: Deno.env.get("OIDC_LEGACY_COOKIE") !== "off",
