@@ -1078,3 +1078,25 @@ Deno.test("the tenancy floor makes each schema before it grants on or creates in
     }
   }
 });
+
+// The door's settings a caller adds (meta.doorEnvironment) reach caddy beside the cluster's own; one
+// the cluster sets itself, or a name that is no variable's, is refused.
+const doorEnv = async (doorEnvironment: Record<string, string>) =>
+  await evaluated(`(#Cluster & {meta: {app: "t", images: [string]: name: "img", bounds: {authStatementMs: 5000, tickerCallMs: 35000}, doorEnvironment: ${JSON.stringify(doorEnvironment)}}, state: {migrations: [], pipelines: [], schedules: [], computations: []}, capabilities: {}}).surface.targets.caddy`);
+
+Deno.test("a caller's door settings reach caddy, and never replace the cluster's", async () => {
+  const got = await doorEnv({ SITES_MODE: "on", SITES: "localhost {env.ORIGIN} main -" });
+  assert.equal(got.ok, true, got.stderr);
+  const env = got.value.compose.environment;
+  assert.equal(env.SITES_MODE, "on");
+  assert.equal(env.SITES, "localhost {env.ORIGIN} main -");
+  assert.equal(env.ORIGIN, "${ORIGIN:-https://localhost:${CADDY_TLS_HOST_PORT}}");
+  for (const k of ["ORIGIN", "ELECTRIC_SECRET", "PRONTO_UPSTREAM_CRUD"]) {
+    const set = await doorEnv({ [k]: "x" });
+    assert.equal(set.ok, false, k);
+    assert.match(set.stderr, new RegExp(`meta.doorEnvironment sets ${k}, which the cluster sets itself`), k);
+  }
+  const bad = await doorEnv({ "sites-mode": "on" });
+  assert.equal(bad.ok, false);
+  assert.match(bad.stderr, /meta.doorEnvironment names sites-mode, not a variable/);
+});

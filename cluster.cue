@@ -1308,6 +1308,13 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 						// service reads, and both are overridden together or neither.
 						ELECTRIC_SECRET: "${ELECTRIC_SECRET:-\(_devElectricSecret)}"
 						ORIGIN:          ["${ORIGIN:-\(X.meta.door.scheme)://", {port: "door", host: "localhost"}, "}"]
+						// The door's settings the caller adds (meta.doorEnvironment).
+						// A variable's name, as compose and a shell spell one.
+						for k, v in X.meta.doorEnvironment {(k): [
+							if k !~ "^[A-Z][A-Z0-9_]*$" {error("meta.doorEnvironment names \(k), not a variable")},
+							if k == "ORIGIN" || k == "ELECTRIC_SECRET" || strings.HasPrefix(k, "PRONTO_UPSTREAM_") {error("meta.doorEnvironment sets \(k), which the cluster sets itself")},
+							v,
+						][0]}
 						if X.capabilities.server {
 							PRONTO_UPSTREAM_CRUD:     {peer: "crud", port: "http"}
 							PRONTO_UPSTREAM_ELECTRIC: {peer: "electric", port: "http"}
@@ -2278,6 +2285,10 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 		// `<name>=<port>` (a renderer behind it): a host launch proxies to
 		// them at their host addresses too.
 		hostPeers: *[] | [...=~"^[a-z][a-z0-9-]*=[0-9]+$"]
+		// The door's settings the caller adds to the cluster's own, as compose
+		// and a host launch give it (its several sites on a laptop's stack,
+		// docs/proxy.md): one the cluster sets itself is a conflict.
+		doorEnvironment: [Name=string]: string
 		// The database's schemas: `app` holds the caller's tables and is the one
 		// PostgREST serves; `floor` the tenancy floor's functions (rls.sql's
 		// current_scopes, auth_uid, rls_protect, app_pre_request); `mecha` its

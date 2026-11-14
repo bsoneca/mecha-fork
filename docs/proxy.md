@@ -179,6 +179,41 @@ instead would be the hole this closes. `WEBAUTHN_ORIGIN`'s default,
 `https://localhost:*`, admits any port of that door, so a passkey ceremony
 also works where the browser reaches it some other way.
 
+## Several sites
+
+One deployment can answer several hosts, each a site with its own origin, its
+template and, where the site reads a client's data, its client. The deployment
+still states every origin: with `SITES_MODE=on`, `SITES` lists one
+site per line, `host origin template client`, `-` where a site has no client.
+The Host only picks a line; one it does not name is answered 421 before any
+route runs, so nothing is ever spelled after a Host the deployment did not list.
+A line names a host without its port, so a site answers on whatever port the
+door is reached at. A deployment that moves its own port (a laptop's stack, on
+whichever port is free) writes its site's origin as `{env.ORIGIN}`: the
+deployment's own origin, read when the line is matched, so the site's origin
+follows the door wherever it binds and is still the deployment's, never the
+request's.
+
+Every upstream is sent the site's origin as `X-Pronto-Origin` and its client as
+`X-Client-Id`, replacing what the request carried, so a reader chooses neither;
+a site without a client sends no `X-Client-Id`.
+
+A brand's files sit on one assets host, `BRAND_ASSETS_ORIGIN`, under
+`brand/<kind>/<directory>/<file>`, and `BRAND_DIRS` names each
+template's directory (`template directory`). The door answers
+`/brand/<kind>/<directory>/<file>` from that host, at the same path, only for
+the site's own directory and a kind among `logo`, `favicon` and `font`; any
+other `/brand/` path is 404. Same origin, so the page's own policy admits it,
+under `sandbox` and `nosniff`, with no cookie, credential or client sent to the
+assets host. A missing file is 404; the assets host refusing or down is 502.
+
+A cluster's own door takes these settings from its caller, `meta.doorEnvironment`
+(`cluster.cue`), in compose and a host launch alike; a name the cluster sets
+itself is a conflict. Without the mode the door is the one-site door above, and
+it too sends every upstream the deployment's `ORIGIN` as `X-Pronto-Origin` and no
+`X-Client-Id`, whatever the request carried, so a reader trusts both in either
+mode. The contract is `caddy-sites.integration.test.ts` in pronto.
+
 ## Rejected
 
 - **A second origin for sync.** The cap is per origin, and serving `/electric/*`
