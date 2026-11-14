@@ -28,7 +28,7 @@ import {
 } from "./jwt.ts";
 import { type Links, oidc, type Profile, providersFrom } from "./oidc.ts";
 import { androidOrigins } from "./origins.ts";
-import { API_KEYS_SQL, HANDOFF_SPENT_GRACE, HANDOFF_SPENT_SQL, prepareAuthTables, sealAuthTables } from "./schema.ts";
+import { apiKeysSql, HANDOFF_SPENT_GRACE, handoffSpentSql, prepareAuthTables, sealAuthTables } from "./schema.ts";
 export { shapeWhere };
 
 function required(name: string): string {
@@ -42,6 +42,26 @@ const DATABASE_URL = required("DATABASE_URL");
 const STATEMENT_TIMEOUT_MS = Number(required("AUTH_STATEMENT_TIMEOUT_MS"));
 if (!(STATEMENT_TIMEOUT_MS > 0)) throw new Error(`AUTH_STATEMENT_TIMEOUT_MS is ${STATEMENT_TIMEOUT_MS}, not milliseconds`);
 const JWT_SECRET = required("PGRST_JWT_SECRET");
+// The database's schemas, as the cluster states them (cluster.cue, meta.schema): the tables', the
+// tenancy floor's functions' and its lists'. Spliced into statements, so held to a plain name.
+function schema(name: string, fallback: string): string {
+  const value = Deno.env.get(name) || fallback;
+  // A schema's name is spelled as a table's (validTable): a plain lowercase identifier.
+  if (!validTable(value)) throw new Error(`${name} is ${value}, not a schema name`);
+  return value;
+}
+const DB_SCHEMA = schema("MECHA_DB_SCHEMA", "public");
+const FLOOR_SCHEMA = schema("MECHA_FLOOR_SCHEMA", "public");
+const MECHA_SCHEMA = schema("MECHA_SCHEMA", "mecha");
+const SCHEMAS = { app: DB_SCHEMA, mecha: MECHA_SCHEMA };
+/** The session's search_path under the app's schema: it, the floor's, then public. */
+export function searchPath(app: string, floor: string): string {
+  return [...new Set([app, floor, "public"])].join(", ");
+}
+/** The relation a shape token names: the table, qualified by the app's schema unless that is public. */
+export function shapeTable(app: string, table: string): string {
+  return app === "public" ? table : `${app}.${table}`;
+}
 /** The dev cluster's door: localhost, on whatever port the host published. */
 const DEV_DOOR = "https://localhost:*";
 
@@ -105,6 +125,23 @@ function seconds(name: string, fallback: number): number {
   return n;
 }
 const USER_TOKEN_TTL_S = seconds("USER_TOKEN_TTL_S", 7 * 24 * 3600);
+/** The least an upgraded token lives, in seconds. */
+const UPGRADE_MIN_TTL_S = 5;
+/**
+ * The longest an upgraded session lives (`POST /auth/upgrade`), whatever its
+ * caller asks: one hour unless the deployment names its own, in seconds, and
+ * never under the least it must live, where every upgrade would be refused.
+ */
+export function upgradeTtlOf(value: string | undefined): number {
+  if (value === undefined || value === "") return 3600;
+  const ttl = Number(value);
+  if (!Number.isSafeInteger(ttl) || ttl <= 0) throw new Error(`UPGRADE_TOKEN_TTL_S is ${value}, not a number of seconds`);
+  if (ttl < UPGRADE_MIN_TTL_S) {
+    throw new Error(`UPGRADE_TOKEN_TTL_S is ${value}, under the ${UPGRADE_MIN_TTL_S}s an upgraded token must live`);
+  }
+  return ttl;
+}
+const UPGRADE_TOKEN_TTL_S = upgradeTtlOf(Deno.env.get("UPGRADE_TOKEN_TTL_S"));
 // How long after its token expired a guest may still trade it for a new one (POST /auth/guest/refresh):
 // a guest token is the only way back to a guest's account, so a guest away for longer than a week
 // comes back as itself; 90 days by default.
@@ -162,14 +199,19 @@ export const MAX_LIVE_KEYS = 5;
 const SHAPE_TOKEN_TTL_S = 900;
 const STATE_TTL_S = 300;
 
-export const sql = postgres(DATABASE_URL, { connection: { statement_timeout: STATEMENT_TIMEOUT_MS } });
+// app_user, which it reads unqualified, is where the app's tables are.
+// The floor's after it, and public last, where extensions keep their functions (a schema the role may
+// not use is skipped).
+export const sql = postgres(DATABASE_URL, {
+  connection: { statement_timeout: STATEMENT_TIMEOUT_MS, ...(DB_SCHEMA === "public" ? {} : { search_path: searchPath(DB_SCHEMA, FLOOR_SCHEMA) }) },
+});
 
 export async function migrate(): Promise<void> {
   // One instance at a time: replicas starting together (a rollout) would race
   // each step below. Where the tables live and why: schema.ts.
   await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(hashtext('mecha auth: migrate'))`;
-    await tx.unsafe(prepareAuthTables(["webauthn_credential", "identity_link"]));
+    await tx.unsafe(prepareAuthTables(["webauthn_credential", "identity_link"], SCHEMAS));
     await tx`ALTER TABLE mecha_auth.identity_link ADD COLUMN IF NOT EXISTS issuer text,
       ADD COLUMN IF NOT EXISTS name text, ADD COLUMN IF NOT EXISTS picture text,
       ADD COLUMN IF NOT EXISTS email text`;
@@ -187,10 +229,10 @@ export async function migrate(): Promise<void> {
       END IF;
     END $$`;
     // The keys' table only where the program turned keys on: an app that did not gets nothing new.
-    if (apiKeysOn()) await tx.unsafe(API_KEYS_SQL);
+    if (apiKeysOn()) await tx.unsafe(apiKeysSql(SCHEMAS));
     // The handoff codes spent, only where provider sign-in is on (schema.ts, PRONTO-368).
-    if (Object.keys(OIDC_PROVIDERS).length > 0) await tx.unsafe(HANDOFF_SPENT_SQL);
-    await tx.unsafe(sealAuthTables(["webauthn_credential", "identity_link"]));
+    if (Object.keys(OIDC_PROVIDERS).length > 0) await tx.unsafe(handoffSpentSql(SCHEMAS));
+    await tx.unsafe(sealAuthTables(["webauthn_credential", "identity_link"], SCHEMAS));
   });
 }
 
@@ -233,11 +275,11 @@ export function issueUserToken(id: string, handle: string, guest = false): Promi
 async function tableScope(table: string): Promise<{ floored: boolean; publicOnly: boolean }> {
   // The floor's own precondition (has_scope in rls.sql); to_regclass is NULL
   // for a table that does not exist, and NULL has no scope.
-  const rows = await sql`SELECT public.has_scope(to_regclass(${"public." + table})) AS floored,
+  const rows = await sql`SELECT ${sql(FLOOR_SCHEMA)}.has_scope(to_regclass(${DB_SCHEMA + "." + table})) AS floored,
     EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
       JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
       JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-      WHERE a.attrelid = to_regclass(${"public." + table}) AND a.attname = 'scope_id'
+      WHERE a.attrelid = to_regclass(${DB_SCHEMA + "." + table}) AND a.attname = 'scope_id'
         AND a.attnotnull AND NOT a.attisdropped AND a.attgenerated = 's'
         AND c.relkind = 'r'
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = a.attrelid)
@@ -246,7 +288,7 @@ async function tableScope(table: string): Promise<{ floored: boolean; publicOnly
 }
 
 async function subjectScopes(uid: string | null): Promise<string[]> {
-  const rows = await sql`SELECT public.subject_scopes(${uid}) AS scopes`;
+  const rows = await sql`SELECT ${sql(FLOOR_SCHEMA)}.subject_scopes(${uid}) AS scopes`;
   return rows[0].scopes as string[];
 }
 
@@ -268,8 +310,8 @@ async function rowReach(uid: string, table: string, column: string, value: strin
   return await sql.begin(async (tx) => {
     await tx`SET LOCAL ROLE app_user`;
     await tx`SELECT set_config('request.jwt.claims', ${JSON.stringify({ sub: uid, role: "app_user" })}, true)`;
-    await tx`SELECT public.app_pre_request()`;
-    const rows = await tx`SELECT mecha.shape_reach(${"public." + table}, ${column}, ${value}) AS ok`;
+    await tx`SELECT ${tx(FLOOR_SCHEMA)}.app_pre_request()`;
+    const rows = await tx`SELECT ${tx(MECHA_SCHEMA)}.shape_reach(${DB_SCHEMA + "." + table}, ${column}, ${value}) AS ok`;
     return rows[0].ok as boolean;
   });
 }
@@ -330,17 +372,22 @@ async function shapeToken(req: Request): Promise<Response> {
     // Only a proven public leaf can omit the subject's irrelevant scopes.
     where = shapeWhere(scope.publicOnly ? scopes.filter((scope) => scope === "public:") : scopes);
   }
+  // A shape minted from an upgraded session ends no later than it does (its cap, POST /auth/upgrade).
+  const now = Math.floor(Date.now() / 1000);
+  const exp = isUpgraded(subject.claims) ? Math.min(now + SHAPE_TOKEN_TTL_S, subject.claims.exp as number) : now + SHAPE_TOKEN_TTL_S;
   const token = await signJwt({
     typ: "shape",
-    table: body.table,
+    // Qualified where the app's tables are not public's, so a token never reaches a table of the same
+    // name in another schema.
+    table: shapeTable(DB_SCHEMA, body.table),
     where,
     sub,
-    exp: Math.floor(Date.now() / 1000) + SHAPE_TOKEN_TTL_S,
+    exp,
   });
   // `where` goes back so the client sends exactly what was authorized: the
   // check below is equality, and a client that rebuilds the string differently
   // is refused for a reason it cannot see.
-  return json(200, { token, table: body.table, where, expires_in: SHAPE_TOKEN_TTL_S });
+  return json(200, { token, table: body.table, where, expires_in: exp - now });
 }
 
 // The parameters a shape request may carry besides the two the token names:
@@ -462,7 +509,9 @@ async function shapeVerify(req: Request): Promise<Response> {
   // A missing parameter is not a matching one. `??` would let an absent `where`
   // read as authorized against a claim that named a predicate.
   if (claims.typ === "shape") {
-    if (get("table") !== claims.table) return jsonError(403, "table not authorized");
+    // The request names the bare table; the door qualifies it for Electric after this gate
+    // (ELECTRIC_TABLE_PREFIX, services/proxy/Caddyfile), as it does the public shape's below.
+    if (shapeTable(DB_SCHEMA, get("table") ?? "") !== claims.table) return jsonError(403, "table not authorized");
     if (get("where") !== claims.where) return jsonError(403, "where not authorized");
   } else {
     if (!validTable(get("table"))) return jsonError(403, "table not authorized");
@@ -527,6 +576,7 @@ async function registerStart(req: Request): Promise<Response> {
   // outlive the token and its sign-out. With no session, a new identity —
   // usernameless by doctrine: no identifier is ever collected.
   if (claims !== null && claims.guest !== true) return jsonError(409, "already an account");
+  if (claims !== null && isUpgraded(claims)) return jsonError(403, "upgraded token");
   const promote = claims !== null;
   const handle = claims ? claims.handle as string : generateHandle();
   const userId = claims ? claims.sub as string : crypto.randomUUID();
@@ -692,13 +742,17 @@ async function guest(_req: Request): Promise<Response> {
 // A guest's token for a new one of the same id and handle, so a guest who keeps coming back keeps its
 // account: the bearer must be a guest's, live or expired within GUEST_REFRESH_GRACE_S, and the account
 // still a guest (no passkey, no provider): an account's way back is its own sign-in. A refreshed
-// token is a bearer of a guest account only (no passkey, no payment, no friends).
+// token is a bearer of a guest account only (no passkey, no payment, no friends). An upgraded token is
+// refused.
 async function guestRefresh(req: Request): Promise<Response> {
   const auth = req.headers.get("authorization");
   const c = auth?.startsWith("Bearer ") ? await verifyJwt(auth.slice("Bearer ".length), GUEST_REFRESH_GRACE_S) : null;
   if (c === null || c.role !== "app_user" || c.guest !== true || typeof c.sub !== "string" || !UUID.test(c.sub)) {
     return jsonError(401, "invalid token");
   }
+  // An upgraded token is scoped to one operation and capped (POST /auth/upgrade): refreshed, it would
+  // outlive its cap as a plain session. Its holder refreshes the session it was upgraded from.
+  if (isUpgraded(c)) return jsonError(403, "upgraded token");
   const [u] = await sql`select u.handle,
       exists (select 1 from mecha_auth.webauthn_credential w where w.user_id = u.id)
       or exists (select 1 from mecha_auth.identity_link l where l.user_id = u.id) as promoted
@@ -758,6 +812,7 @@ async function keyHolder(req: Request): Promise<{ id: string } | Response> {
   }
   if (subject.claims.guest === true) return jsonError(403, "guest");
   if (subject.claims.kid !== undefined) return jsonError(403, "key token");
+  if (isUpgraded(subject.claims)) return jsonError(403, "upgraded token");
   return { id: subject.claims.sub };
 }
 
@@ -838,6 +893,97 @@ async function exchangeKey(req: Request): Promise<Response> {
   return json(200, { token, expires_in: KEY_TOKEN_TTL_S });
 }
 
+// --- Upgrade: a session issued again, scoped to one operation ---
+//
+// A service that has proven something about a session's person (another
+// issuer's token, say, checked on its own) asks for that session's token
+// again, with the operation it was proven for. The service holds no key: it
+// upgrades only a token it was handed, never one already upgraded, and for no
+// longer than that token lives; the session keeps its own subject, so what it
+// reads by subject it reads still. A caller that wants one upgrade per proof
+// keeps that itself: the same session can be upgraded again.
+
+/** The claims an upgrade adds, all of them, and nothing else. */
+const UPGRADE_CLAIMS = ["operation_kind", "operation_id", "amr", "idp"];
+/** A session's own claims, kept from the token upgraded and never asked for. */
+const SESSION_CLAIMS = ["role", "sub", "handle", "guest"];
+/**
+ * Whether claims are an upgraded session's. One is scoped to an operation and capped: it mints
+ * nothing that outlives it (a passkey, an API key, a guest's promotion or adoption, a refresh).
+ */
+export const isUpgraded = (claims: Record<string, unknown>) => UPGRADE_CLAIMS.some((k) => Object.hasOwn(claims, k));
+
+/** The guest a bearer names for an adoption: a guest's own session, never an account's or an upgraded one's. */
+export async function adoptableGuest(req: Request): Promise<{ id: string; handle: string } | null> {
+  const c = await bearerClaims(req);
+  return c !== null && c.role === "app_user" && c.guest === true && !isUpgraded(c) && typeof c.sub === "string" && typeof c.handle === "string"
+    ? { id: c.sub, handle: c.handle }
+    : null;
+}
+const CLAIM_MAX = 200;
+
+const claimText = (v: unknown) => typeof v === "string" && v !== "" && v.length <= CLAIM_MAX;
+const instant = (v: unknown, now: number): v is number => Number.isSafeInteger(v) && (v as number) > now;
+
+/** Why the claims asked for are not the closed list's, or null when they are. */
+function upgradeRefusal(claims: unknown): string | null {
+  if (typeof claims !== "object" || claims === null || Array.isArray(claims)) return "claims must be an object";
+  const asked = claims as Record<string, unknown>;
+  for (const k of Object.keys(asked)) {
+    if (SESSION_CLAIMS.includes(k)) return `${k} is the session's own, kept from its token`;
+    if (!UPGRADE_CLAIMS.includes(k)) return `${k} is not a claim an upgrade adds`;
+  }
+  for (const k of ["operation_kind", "operation_id", "idp"]) {
+    if (!claimText(asked[k])) return `${k} must be text of 1 to ${CLAIM_MAX} characters`;
+  }
+  const amr = asked.amr;
+  if (!Array.isArray(amr) || amr.length === 0 || amr.length > 8 || !amr.every(claimText)) {
+    return "amr must be a list of 1 to 8 methods";
+  }
+  return null;
+}
+
+async function upgrade(req: Request): Promise<Response> {
+  const caller = await bearerClaims(req);
+  if (!caller) return jsonError(401, "invalid token");
+  if (caller.role !== "service") return jsonError(403, "service only");
+  const body = await readBody(req);
+  if (!body) return jsonError(400, "invalid json body");
+  const refusal = upgradeRefusal(body.claims);
+  if (refusal !== null) return jsonError(400, refusal);
+  const now = Math.floor(Date.now() / 1000);
+  // The caller's wish and its family's end; the deployment's ceiling and the
+  // end of the token handed over cut both.
+  if (!instant(body.exp, now)) return jsonError(400, "exp must be a time in seconds after now");
+  if (!instant(body.cap, now)) return jsonError(400, "cap must be a time in seconds after now");
+  if (typeof body.token !== "string") return jsonError(400, "token required");
+  const session = await verifyJwt(body.token);
+  if (!session) return jsonError(401, "invalid user token");
+  if (session.role !== "app_user" || typeof session.sub !== "string") return jsonError(403, "not a user session");
+  // Its end bounds the upgraded token's, so it is a time, never absent or 1e400.
+  if (!Number.isSafeInteger(session.exp)) return jsonError(403, "not a user session");
+  // A key's token is scoped to the key (kid, scp), which an upgrade would drop.
+  if (Object.hasOwn(session, "kid") || Object.hasOwn(session, "scp")) return jsonError(403, "key token");
+  if (UPGRADE_CLAIMS.some((k) => Object.hasOwn(session, k))) return jsonError(409, "already upgraded");
+  const exp = Math.min(body.exp, body.cap, now + UPGRADE_TOKEN_TTL_S, session.exp as number);
+  // A token that ends before its holder can use it is no upgrade.
+  if (exp < now + UPGRADE_MIN_TTL_S) return jsonError(400, `the upgraded token would end within ${UPGRADE_MIN_TTL_S}s`);
+  const asked = body.claims as Record<string, unknown>;
+  const token = await signJwt({
+    role: session.role,
+    sub: session.sub,
+    ...(Object.hasOwn(session, "handle") ? { handle: session.handle } : {}),
+    ...(Object.hasOwn(session, "guest") ? { guest: session.guest } : {}),
+    operation_kind: asked.operation_kind,
+    operation_id: asked.operation_id,
+    amr: asked.amr,
+    idp: asked.idp,
+    exp,
+  });
+  return json(200, { token });
+}
+
+
 export const links: Links = {
   userFor(p: Profile, adopt?: string) {
     return sql.begin(async (tx) => {
@@ -907,12 +1053,7 @@ const providerSignIn = oidc({
   spend: handoffSpender(sql),
   issue: (user) => issueUserToken(user.id, user.handle),
   // The guest a bearer names, for POST /auth/oidc/adopt: a guest token only, never an account's.
-  guestOf: async (req) => {
-    const c = await bearerClaims(req);
-    return c !== null && c.role === "app_user" && c.guest === true && typeof c.sub === "string" && typeof c.handle === "string"
-      ? { id: c.sub, handle: c.handle }
-      : null;
-  },
+  guestOf: adoptableGuest,
   // An origin new since the __Host- session cookie sets this "off": a bare mecha_oidc there could
   // only be a sibling host's (oidc.ts, LEGACY_SESSION_COOKIE).
   legacyCookie: Deno.env.get("OIDC_LEGACY_COOKIE") !== "off",
@@ -950,6 +1091,9 @@ export async function handler(req: Request): Promise<Response> {
     }
     if (req.method === "GET" && path === "/auth/whoami") {
       return await whoami(req);
+    }
+    if (req.method === "POST" && path === "/auth/upgrade") {
+      return await upgrade(req);
     }
     if (req.method === "GET" && path === "/auth/door") {
       return await door(req);

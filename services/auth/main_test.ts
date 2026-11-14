@@ -13,10 +13,10 @@ import {
 } from "jsr:@std/assert@1.0.13";
 import { isoBase64URL, isoCBOR, isoUint8Array, toHash } from "@simplewebauthn/server/helpers";
 import { androidOrigin } from "./origins.ts";
-import { admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, keyExchangedHook, links, MAX_LIVE_KEYS, migrate, signJwt, sql, verifyJwt } from "./main.ts";
-import { HANDOFF_SPENT_SQL } from "./schema.ts";
+import { adoptableGuest, admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, keyExchangedHook, links, MAX_LIVE_KEYS, migrate, searchPath, shapeTable, signJwt, sql, upgradeTtlOf, verifyJwt } from "./main.ts";
+import { handoffSpentSql } from "./schema.ts";
 import postgres from "postgres";
-import { PUBLIC_WHERE } from "./jwt.ts";
+import { PUBLIC_WHERE, signJwt as signWith } from "./jwt.ts";
 import { PUBLIC_WHERE as CLIENT_PUBLIC_WHERE } from "../../packages/client/src/public-where.ts";
 
 await sql`CREATE TABLE IF NOT EXISTS app_user (
@@ -385,6 +385,223 @@ Deno.test({
   },
 });
 
+// --- upgrade ---
+//
+// A service asks for a session's token again, scoped to one operation. The
+// refusals are the substance: who may ask, which token it hands over, which
+// claims it adds, and for how long.
+
+const serviceToken = () => signJwt({ role: "service", sub: "00000000-0000-0000-0000-000000000000", exp: nowS() + 3600 });
+const operation = { operation_kind: "ORDER", operation_id: "op-1", amr: ["otp"], idp: "issuer-a" };
+const upgradeOf = (token: unknown, over: Record<string, unknown> = {}) => ({
+  token,
+  claims: operation,
+  exp: nowS() + 600,
+  cap: nowS() + 3600,
+  ...over,
+});
+async function upgraded(body: unknown, caller?: string) {
+  const res = await handler(post("/auth/upgrade", body, caller ?? await serviceToken()));
+  return { status: res.status, body: await res.json() };
+}
+
+Deno.test({
+  name: "upgrade is the service's alone",
+  ...opts,
+  async fn() {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    const body = upgradeOf(guest.token);
+    const res = await handler(post("/auth/upgrade", body));
+    assertEquals([res.status, (await res.json()).error], [401, "invalid token"]);
+    assertEquals((await upgraded(body, "garbage")).status, 401);
+    // A service's token of another key, or one expired, is no service's.
+    const foreign = await signWith("another-secret-entirely-0000000000", { role: "service", exp: nowS() + 3600 });
+    assertEquals((await upgraded(body, foreign)).status, 401);
+    assertEquals((await upgraded(body, await signJwt({ role: "service", exp: nowS() - 1 }))).status, 401);
+    // A person's session cannot upgrade itself, nor another's.
+    assertEquals(await upgraded(body, guest.token), { status: 403, body: { error: "service only" } });
+  },
+});
+
+Deno.test({
+  name: "upgrade takes only a live session of a person, never one already upgraded",
+  ...opts,
+  async fn() {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    const sub = guest.user.id;
+    const refused = async (token: unknown) => (await upgraded(upgradeOf(token))).status;
+    assertEquals(await refused(undefined), 400);
+    assertEquals(await refused("garbage"), 401);
+    assertEquals(await refused(await signJwt({ role: "app_user", sub, handle: "x", guest: true, exp: nowS() - 1 })), 401);
+    assertEquals(await refused(await signWith("another-secret-entirely-0000000000", { role: "app_user", sub, exp: nowS() + 600 })), 401);
+    // A service's token, a shape's and a ceremony's state are no person's session.
+    assertEquals(await refused(await serviceToken()), 403);
+    // A session whose end is no time bounds nothing: none is no live token at all, a fraction is refused.
+    assertEquals(await refused(await signJwt({ role: "app_user", sub, guest: true })), 401);
+    assertEquals(await refused(await signJwt({ role: "app_user", sub, guest: true, exp: nowS() + 600.5 })), 403);
+    assertEquals(await refused(await signJwt({ typ: "shape", table: "article", where: "false", sub, exp: nowS() + 600 })), 403);
+    assertEquals(await refused(await signJwt({ purpose: "login", challenge: "c", exp: nowS() + 600 })), 403);
+    // A key's token is scoped to its key, which an upgrade would drop.
+    const keyToken = await signJwt({ role: "app_user", sub, handle: "x", guest: false, kid: crypto.randomUUID(), scp: ["read"], exp: nowS() + 600 });
+    assertEquals(await upgraded(upgradeOf(keyToken)), { status: 403, body: { error: "key token" } });
+    // A session already scoped to an operation, or carrying any claim an
+    // upgrade adds, is not scoped again.
+    const once = await upgraded(upgradeOf(guest.token));
+    assertEquals(once.status, 200);
+    assertEquals(await upgraded(upgradeOf(once.body.token)), { status: 409, body: { error: "already upgraded" } });
+    for (const k of Object.keys(operation)) {
+      const marked = await signJwt({ role: "app_user", sub, guest: true, [k]: (operation as Record<string, unknown>)[k], exp: nowS() + 600 });
+      assertEquals(await refused(marked), 409, k);
+    }
+  },
+});
+
+Deno.test({
+  name: "upgrade refuses a session's own claim, and any claim off its list",
+  ...opts,
+  async fn() {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    for (const k of ["role", "sub", "handle", "guest"]) {
+      const res = await upgraded(upgradeOf(guest.token, { claims: { ...operation, [k]: "x" } }));
+      assertEquals(res.status, 400, k);
+      assertStringIncludes(res.body.error, `${k} is the session's own`);
+    }
+    // A computed key is an own property, `__proto__` included, as JSON makes it.
+    for (const k of ["scope_id", "exp", "aud", "iss", "typ", "__proto__"]) {
+      const res = await upgraded(upgradeOf(guest.token, { claims: { ...operation, [k]: "x" } }));
+      assertEquals(res.status, 400, k);
+      assertStringIncludes(res.body.error, `${k} is not a claim an upgrade adds`);
+    }
+    // Every claim on the list, each of its shape.
+    const { operation_id: _, ...partial } = operation;
+    for (
+      const claims of [
+        partial,
+        { ...operation, operation_id: "" },
+        { ...operation, operation_kind: 7 },
+        { ...operation, idp: "x".repeat(201) },
+        { ...operation, amr: [] },
+        { ...operation, amr: "otp" },
+        { ...operation, amr: [""] },
+        null,
+        ["operation_id"],
+      ]
+    ) {
+      assertEquals((await upgraded(upgradeOf(guest.token, { claims }))).status, 400, JSON.stringify(claims));
+    }
+  },
+});
+
+Deno.test({
+  name: "an upgraded session keeps its person and adds the operation, under the auth key",
+  ...opts,
+  async fn() {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    const res = await upgraded(upgradeOf(guest.token));
+    assertEquals(res.status, 200);
+    const claims = await verifyJwt(res.body.token);
+    assert(claims !== null, "signed with the key every reader verifies");
+    const { exp: _, ...rest } = claims;
+    assertEquals(rest, { role: "app_user", sub: guest.user.id, handle: guest.user.handle, guest: true, ...operation });
+    // whoami reads it as the same person.
+    const who = await handler(new Request("http://auth:9999/auth/whoami", { headers: { authorization: `Bearer ${res.body.token}` } }));
+    assertEquals(await who.json(), { id: guest.user.id, handle: guest.user.handle });
+    // An account's session stays an account's.
+    const account = await upgraded(upgradeOf(await issueUserToken(guest.user.id, guest.user.handle)));
+    assertEquals((await verifyJwt(account.body.token))?.guest, false);
+  },
+});
+
+Deno.test({
+  name: "upgrade cuts exp at the deployment's ceiling and at the family's cap",
+  ...opts,
+  async fn() {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    const expOf = async (over: Record<string, unknown>) => {
+      const res = await upgraded(upgradeOf(guest.token, over));
+      assertEquals(res.status, 200, JSON.stringify(over));
+      return (await verifyJwt(res.body.token))!.exp as number;
+    };
+    const t = nowS();
+    // A week asked for is the ceiling, an hour by default.
+    assert(Math.abs(await expOf({ exp: t + 7 * 24 * 3600, cap: t + 8 * 24 * 3600 }) - (t + 3600)) < 5);
+    assertEquals(await expOf({ exp: t + 1800, cap: t + 900 }), t + 900);
+    assertEquals(await expOf({ exp: t + 900, cap: t + 1800 }), t + 900);
+    // Nor past the token it came from.
+    const brief = await signJwt({ role: "app_user", sub: guest.user.id, handle: guest.user.handle, guest: true, exp: t + 120 });
+    const res = await upgraded(upgradeOf(brief, { exp: t + 1800, cap: t + 3600 }));
+    assertEquals(res.status, 200);
+    assertEquals((await verifyJwt(res.body.token))!.exp, t + 120);
+    // A token that would end within seconds is refused, whichever bound ends it.
+    const dying = await signJwt({ role: "app_user", sub: guest.user.id, handle: guest.user.handle, guest: true, exp: t + 3 });
+    for (const [token, over] of [[guest.token, { exp: t + 3 }], [guest.token, { cap: t + 3 }], [dying, {}]] as const) {
+      const refused = await upgraded(upgradeOf(token, over));
+      assertEquals([refused.status, refused.body.error], [400, "the upgraded token would end within 5s"], JSON.stringify(over));
+    }
+    assertEquals(await expOf({ exp: t + 30, cap: t + 60 }), t + 30);
+    // The same session can be upgraded again: once per proof is the caller's to keep.
+    assertEquals((await upgraded(upgradeOf(guest.token))).status, 200);
+    assertEquals((await upgraded(upgradeOf(guest.token))).status, 200);
+    for (const over of [{ exp: t - 1 }, { cap: t - 1 }, { exp: t + 0.5 }, { exp: String(t + 600) }, { cap: undefined }, { exp: undefined }]) {
+      assertEquals((await upgraded(upgradeOf(guest.token, over))).status, 400, JSON.stringify(over));
+    }
+  },
+});
+
+Deno.test({
+  name: "an upgraded session mints nothing that outlives it: no passkey, no key, no adoption",
+  ...opts,
+  fn: () => withKeys(true, async () => {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    const up = (await upgraded(upgradeOf(guest.token))).body.token as string;
+    // A passkey: promoting the guest would outlive the operation's cap.
+    const reg = await handler(post("/auth/register/start", {}, up));
+    assertEquals([reg.status, (await reg.json()).error], [403, "upgraded token"]);
+    assertEquals((await handler(post("/auth/register/start", {}, guest.token))).status, 200);
+    // An adoption by a provider's sign-in.
+    const bearer = (t: string) => new Request("http://auth:9999/auth/oidc/adopt", { method: "POST", headers: { authorization: `Bearer ${t}` } });
+    assertEquals(await adoptableGuest(bearer(up)), null);
+    assertEquals(await adoptableGuest(bearer(guest.token)), { id: guest.user.id, handle: guest.user.handle });
+    // An API key, for an account's upgraded session.
+    const a = await account();
+    const accountUp = (await upgraded(upgradeOf(a.token))).body.token as string;
+    assertEquals(await created(accountUp), { status: 403, body: { error: "upgraded token" } });
+    assertEquals((await created(a.token)).status, 201);
+  }),
+});
+
+Deno.test({
+  name: "an upgraded guest token is not refreshed, before its end or after it",
+  ...opts,
+  async fn() {
+    const guest = await (await handler(post("/auth/guest", {}))).json();
+    const t = nowS();
+    const live = await upgraded(upgradeOf(guest.token));
+    assertEquals(live.status, 200);
+    assertEquals(await refresh(live.body.token), { status: 403, body: { error: "upgraded token" } });
+    // Expired within the refresh's grace, as a guest's own token would still be refreshed.
+    const ended = await signJwt({ role: "app_user", sub: guest.user.id, handle: guest.user.handle, guest: true, ...operation, exp: t - 60 });
+    assertEquals(await refresh(ended), { status: 403, body: { error: "upgraded token" } });
+    // The session it was upgraded from is still refreshed.
+    assertEquals((await refresh(guest.token)).status, 200);
+  },
+});
+
+Deno.test("the upgrade ceiling is an hour unless the deployment names one, and refuses to start on another value", async () => {
+  assertEquals([upgradeTtlOf(undefined), upgradeTtlOf(""), upgradeTtlOf("600"), upgradeTtlOf("5")], [3600, 3600, 600, 5]);
+  for (const v of ["0", "-1", "1.5", "1h", "NaN"]) assertThrows(() => upgradeTtlOf(v), Error, "UPGRADE_TOKEN_TTL_S", v);
+  // A ceiling under the least an upgraded token lives would refuse every upgrade.
+  for (const v of ["1", "4"]) assertThrows(() => upgradeTtlOf(v), Error, "under the 5s an upgraded token must live", v);
+  const { success, stderr } = await new Deno.Command(Deno.execPath(), {
+    args: ["run", "-A", "--frozen", fileURLToPath(new URL("./main.ts", import.meta.url))],
+    env: { UPGRADE_TOKEN_TTL_S: "1h" },
+    stdout: "null",
+    stderr: "piped",
+  }).output();
+  assert(!success);
+  assertStringIncludes(new TextDecoder().decode(stderr), "UPGRADE_TOKEN_TTL_S is 1h");
+});
+
 // --- the sync path's gatekeeper ---
 //
 // The refusals are the substance. A mint that works proves the happy path; what
@@ -414,6 +631,29 @@ async function mint(table: string) {
   );
   return { res, userToken, uid: user[0].id as string };
 }
+
+// A shape minted from an upgraded session ends no later than that session; one from a plain session
+// lives its own fifteen minutes.
+Deno.test({
+  name: "an upgraded session's shape token ends with the session",
+  ...opts,
+  async fn() {
+    const { res: plain, userToken, uid } = await mint("scoped_article");
+    assertEquals((await plain.json()).expires_in, 900);
+    const t = nowS();
+    const up = await signJwt({ role: "app_user", sub: uid, handle: "x", guest: false, ...operation, exp: t + 120 });
+    const res = await handler(new Request("http://auth:9999/auth/shape", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${up}` },
+      body: JSON.stringify({ table: "scoped_article" }),
+    }));
+    assertEquals(res.status, 200);
+    const body = await res.json();
+    assertEquals((await verifyJwt(body.token))!.exp, t + 120);
+    assert(body.expires_in <= 120);
+    assert(userToken !== up);
+  },
+});
 
 Deno.test({
   name: "the shape token carries the subject's scopes, not the client's request",
@@ -731,6 +971,32 @@ Deno.test({
       assertEquals((await handler(shapeReq(token, `/v1/shape?table=article&where=${raw}`))).status, 403, raw);
     }
   },
+});
+
+// A shape token names the relation it was minted for: under an app schema of its own, the table
+// qualified by it, so a token for one schema's table never reaches a table of the same name in
+// another. The gate qualifies the bare table the request names the same way.
+Deno.test({
+  name: "a shape token for a table of the same name in another schema is refused",
+  ...opts,
+  async fn() {
+    assertEquals([shapeTable("public", "article"), shapeTable("shop", "article"), shapeTable("archive", "article")], ["article", "shop.article", "archive.article"]);
+    const where = `"title" = 'a'`;
+    const uri = `/v1/shape?table=article&where=${encodeURIComponent(where)}`;
+    const exp = Math.floor(Date.now() / 1000) + 60;
+    assertEquals((await handler(shapeReq(await signJwt({ typ: "shape", table: "article", where, exp }), uri))).status, 200);
+    for (const table of ["shop.article", "archive.article", "public.article"]) {
+      assertEquals((await handler(shapeReq(await signJwt({ typ: "shape", table, where, exp }), uri))).status, 403, table);
+    }
+  },
+});
+
+// Under an app schema, a session reads it first, then the floor's, then public's, where extensions
+// keep their functions; one schema named twice is named once.
+Deno.test("the session's search_path keeps public after the app's and the floor's", () => {
+  assertEquals(searchPath("shop", "mecha"), "shop, mecha, public");
+  assertEquals(searchPath("shop", "public"), "shop, public");
+  assertEquals(searchPath("shop", "shop"), "shop, public");
 });
 
 Deno.test({
@@ -1338,7 +1604,7 @@ Deno.test({
   sanitizeOps: false,
   async fn() {
     // Made by migrate where provider sign-in is on; this file's environment names no provider.
-    await sql.unsafe(HANDOFF_SPENT_SQL);
+    await sql.unsafe(handoffSpentSql());
     // Two instances: each its own connection pool, as two pods would hold.
     const other = postgres(Deno.env.get("DATABASE_URL")!);
     try {

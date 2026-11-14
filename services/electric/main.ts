@@ -16,6 +16,15 @@ const DATABASE_URL = Deno.env.get("ADMIN_DATABASE_URL") || required("DATABASE_UR
 const ELECTRIC_SECRET = required("ELECTRIC_SECRET");
 const JWT_SECRET = required("PGRST_JWT_SECRET");
 const PORT = Number(Deno.env.get("PORT") || 3000);
+// This stand-in reads the app's tables, the publication and the floor in `public` alone: a cluster
+// that names its own schemas (meta.schema) would have it sync the wrong relations, so it refuses
+// to start rather than misauthorize.
+for (const name of ["MECHA_DB_SCHEMA", "MECHA_FLOOR_SCHEMA"]) {
+  const value = Deno.env.get(name);
+  if (value !== undefined && value !== "" && value !== "public") {
+    throw new Error(`${name} is ${value}: the host's Electric serves only public's tables and floor; run Electric's image for another schema`);
+  }
+}
 
 const sql = postgres(DATABASE_URL, {
   max: 8,

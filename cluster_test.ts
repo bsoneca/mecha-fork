@@ -961,3 +961,150 @@ Deno.test("a provider with no preset signs in through the issuer the program nam
 Deno.test("a sign-in provider's name is a lowercase word", async () => {
   assert.equal((await exported({}, "capabilities", { signIn: { "My-Space": { issuer: "https://id.example.com" } } })).ok, false);
 });
+
+// The database's schemas (meta.schema): the defaults leave every service as it
+// was, and a cluster naming its own tells PostgREST, auth and the runner.
+const schemaTargets = async (schema: { app?: string; floor?: string; mecha?: string }) =>
+  await evaluated(`(#Cluster & {meta: {app: "t", images: [string]: name: "img", bounds: {authStatementMs: 5000, tickerCallMs: 35000}, schema: ${JSON.stringify(schema)}}, state: {migrations: [], pipelines: [], schedules: [], computations: [], pgroll: {"01_a": {operations: []}}}, capabilities: {auth: true}}).surface.targets`);
+
+Deno.test("the default schemas leave PostgREST, auth and the runner as they were", async () => {
+  const got = await schemaTargets({});
+  assert.equal(got.ok, true, got.stderr);
+  const crud = got.value.crud.compose.environment;
+  assert.equal(crud.PGRST_DB_SCHEMA, "public");
+  assert.equal(crud.PGRST_DB_PRE_REQUEST, "public.app_pre_request");
+  assert.equal(crud.PGRST_DB_EXTRA_SEARCH_PATH, undefined);
+  const auth = got.value.auth.compose.environment;
+  for (const k of ["MECHA_DB_SCHEMA", "MECHA_FLOOR_SCHEMA", "MECHA_SCHEMA"]) assert.equal(auth[k], undefined, k);
+  assert.equal(got.value.migrate.compose.environment.PGROLL_SCHEMA, undefined);
+  assert.equal(got.value.electric.compose.environment.MECHA_DB_SCHEMA, undefined);
+  assert.equal(got.value.caddy.compose.environment.ELECTRIC_TABLE_PREFIX, undefined);
+});
+
+Deno.test("a cluster's own schemas reach PostgREST, auth and the runner", async () => {
+  const got = await schemaTargets({ app: "shop", floor: "mecha", mecha: "mecha" });
+  assert.equal(got.ok, true, got.stderr);
+  const crud = got.value.crud.compose.environment;
+  assert.equal(crud.PGRST_DB_SCHEMA, "shop");
+  assert.equal(crud.PGRST_DB_PRE_REQUEST, "mecha.app_pre_request");
+  // PostgREST's own default is public; naming the floor keeps it, where extensions keep their functions.
+  assert.equal(crud.PGRST_DB_EXTRA_SEARCH_PATH, "mecha,public");
+  const auth = got.value.auth.compose.environment;
+  assert.equal(auth.MECHA_DB_SCHEMA, "shop");
+  assert.equal(auth.MECHA_FLOOR_SCHEMA, "mecha");
+  assert.equal(auth.MECHA_SCHEMA, undefined);
+  assert.equal(got.value.migrate.compose.environment.PGROLL_SCHEMA, "shop");
+  // The host's Electric stand-in is told, so it refuses them (services/electric/main.ts).
+  assert.equal(got.value.electric.compose.environment.MECHA_DB_SCHEMA, "shop");
+  assert.equal(got.value.electric.compose.environment.MECHA_FLOOR_SCHEMA, "mecha");
+  // The door names the table for Electric (services/proxy/Caddyfile).
+  assert.equal(got.value.caddy.compose.environment.ELECTRIC_TABLE_PREFIX, "shop.");
+});
+
+Deno.test("a schema name that is no plain identifier, or lists the served schema reaches, is refused", async () => {
+  for (const schema of [{ app: "Shop" }, { app: "select" }, { floor: "pg_floor" }, { mecha: "public" }, { app: "shop", mecha: "shop" }, { app: "mecha_auth" }, { floor: "mecha_auth" }, { mecha: "mecha_auth" }, { app: "airlock" }, { app: "pgroll" }]) {
+    assert.equal((await schemaTargets(schema)).ok, false, JSON.stringify(schema));
+  }
+  // An app in `mecha` leaves the lists no default: they would share its schema, and the app's grants
+  // ON ALL TABLES would reach rls_exempt and shape_key. Named elsewhere, they are apart.
+  const schemaOf = (schema: { app?: string; mecha?: string }) =>
+    evaluated(`(#Cluster & {meta: {app: "t", images: [string]: name: "img", bounds: {authStatementMs: 5000, tickerCallMs: 35000}, schema: ${JSON.stringify(schema)}}, state: {migrations: [], pipelines: [], schedules: [], computations: []}, capabilities: {}}).meta.schema`);
+  for (const schema of [{ app: "mecha" }, { app: "mecha", mecha: "mecha" }]) {
+    assert.equal((await schemaOf(schema)).ok, false, JSON.stringify(schema));
+  }
+  assert.deepEqual((await schemaOf({ app: "mecha", mecha: "lists" })).value, { app: "mecha", floor: "public", mecha: "lists" });
+  const apart = await schemaTargets({ app: "mecha", mecha: "lists" });
+  assert.equal(apart.ok, true, apart.stderr);
+  assert.equal(apart.value.crud.compose.environment.PGRST_DB_SCHEMA, "mecha");
+});
+
+// #Tenancy renames every spelling of the floor's and the lists' schemas: for a layout of its own,
+// nothing of `public.` or `mecha.` is left but the lines kept on purpose (the trace setting, which
+// is a setting, and the drops of objects an older file made in public).
+Deno.test("the tenancy floor for schemas of its own spells neither public nor mecha but where it means them", async () => {
+  const got = await evaluated(`(#Tenancy & {schema: {app: "shop", floor: "floor", mecha: "lists"}}).out`);
+  assert.equal(got.ok, true, got.stderr);
+  const kept = [/'mecha\.traceparent'/g, /LOCAL mecha\.traceparent/g, /DROP VIEW IF EXISTS public\.rls_unprotected;/g, /DROP FUNCTION IF EXISTS public\.rls_audit\(\);/g];
+  const statements = kept.reduce((sql, k) => sql.replace(k, ""), (got.value as string).replace(/--[^\n]*/g, ""));
+  const left = [...statements.matchAll(/\b(public|mecha)\.[a-z_]+/g)].map((m) => m[0]);
+  assert.deepEqual(left, []);
+  assert.ok(/LOCAL mecha\.traceparent|'mecha\.traceparent'/.test(got.value as string), "the trace setting keeps its name");
+});
+
+Deno.test("the tenancy floor on the default schemas is the file itself", async () => {
+  const got = await evaluated(`(#Tenancy & {schema: {app: "public", floor: "public", mecha: "mecha"}}).out`);
+  assert.equal(got.ok, true, got.stderr);
+  assert.equal(got.value, await Deno.readTextFile(`${MECHA}services/database/rls/rls.sql`));
+});
+
+Deno.test("the tenancy floor for other schemas renames its functions and lists, not its setting nor its legacy drops", async () => {
+  const got = await evaluated(`#Tenancy & {schema: {app: "shop", floor: "floor", mecha: "lists"}}`);
+  assert.equal(got.ok, true, got.stderr);
+  const sql: string = got.value.out;
+  assert.ok(sql.startsWith("CREATE SCHEMA IF NOT EXISTS floor;\nGRANT USAGE ON SCHEMA floor TO PUBLIC;\n"));
+  // The lists' schema is made before anything is granted on it or made in it.
+  const made = sql.indexOf("CREATE SCHEMA IF NOT EXISTS lists;");
+  assert.ok(made >= 0, "the lists' schema is made");
+  assert.ok(made < sql.indexOf("GRANT USAGE ON SCHEMA lists TO PUBLIC;"));
+  assert.ok(made < sql.indexOf("lists.rls_exempt"));
+  assert.equal(/SCHEMA (IF NOT EXISTS )?mecha\b/.test(sql), false);
+  assert.match(sql, /CREATE OR REPLACE FUNCTION floor\.app_pre_request\(/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS lists\.rls_exempt/);
+  assert.match(sql, /current_setting\('mecha\.traceparent', true\)/);
+  assert.match(sql, /DROP VIEW IF EXISTS public\.rls_unprotected;/);
+  assert.match(sql, /DROP FUNCTION IF EXISTS public\.rls_audit\(\);/);
+  assert.equal(/\bmecha\.(?!traceparent\b)[a-z_]+/.test(sql), false);
+  assert.ok(got.value.names.floor.includes("app_pre_request"));
+  assert.ok(got.value.names.mecha.includes("rls_exempt"));
+});
+
+// Every schema the rendered floor grants on or makes an object in is one it
+// made first, or the app's (the caller makes it) or public, for every layout a
+// cluster may state: the floor apart, the floor with the lists, the floor with
+// the app's tables.
+Deno.test("the tenancy floor makes each schema before it grants on or creates in it", async () => {
+  for (const schema of [
+    { app: "shop", floor: "floor", mecha: "lists" },
+    { app: "shop", floor: "lists", mecha: "lists" },
+    { app: "shop", floor: "shop", mecha: "lists" },
+    { app: "shop", floor: "public", mecha: "mecha" },
+    { app: "public", floor: "public", mecha: "mecha" },
+  ]) {
+    const got = await evaluated(`(#Tenancy & {schema: ${JSON.stringify(schema)}}).out`);
+    assert.equal(got.ok, true, got.stderr);
+    // Comments name schemas loosely; only statements count.
+    const sql = (got.value as string).replace(/--[^\n]*/g, "");
+    const made = (s: string) => sql.indexOf(`CREATE SCHEMA IF NOT EXISTS ${s};`);
+    const uses = [
+      ...sql.matchAll(/ON SCHEMA ([a-z_]+)/g),
+      ...sql.matchAll(/CREATE (?:OR REPLACE )?(?:FUNCTION|PROCEDURE|TABLE IF NOT EXISTS|VIEW) ([a-z_]+)\./g),
+    ];
+    for (const use of uses) {
+      const s = use[1];
+      if (s === schema.app || s === "public") continue;
+      assert.ok(made(s) >= 0 && made(s) < use.index!, `${JSON.stringify(schema)}: ${s} used at ${use.index} before it is made`);
+    }
+  }
+});
+
+// The door's settings a caller adds (meta.doorEnvironment) reach caddy beside the cluster's own; one
+// the cluster sets itself, or a name that is no variable's, is refused.
+const doorEnv = async (doorEnvironment: Record<string, string>) =>
+  await evaluated(`(#Cluster & {meta: {app: "t", images: [string]: name: "img", bounds: {authStatementMs: 5000, tickerCallMs: 35000}, doorEnvironment: ${JSON.stringify(doorEnvironment)}}, state: {migrations: [], pipelines: [], schedules: [], computations: []}, capabilities: {}}).surface.targets.caddy`);
+
+Deno.test("a caller's door settings reach caddy, and never replace the cluster's", async () => {
+  const got = await doorEnv({ SITES_MODE: "on", SITES: "localhost {env.ORIGIN} main -" });
+  assert.equal(got.ok, true, got.stderr);
+  const env = got.value.compose.environment;
+  assert.equal(env.SITES_MODE, "on");
+  assert.equal(env.SITES, "localhost {env.ORIGIN} main -");
+  assert.equal(env.ORIGIN, "${ORIGIN:-https://localhost:${CADDY_TLS_HOST_PORT}}");
+  for (const k of ["ORIGIN", "ELECTRIC_SECRET", "PRONTO_UPSTREAM_CRUD", "PORT", "CADDY_DOOR_PORT", "PRONTO_SRV_ROOT"]) {
+    const set = await doorEnv({ [k]: "x" });
+    assert.equal(set.ok, false, k);
+    assert.match(set.stderr, new RegExp(`meta.doorEnvironment sets ${k}, which the cluster sets itself`), k);
+  }
+  const bad = await doorEnv({ "sites-mode": "on" });
+  assert.equal(bad.ok, false);
+  assert.match(bad.stderr, /meta.doorEnvironment names sites-mode, not a variable/);
+});
