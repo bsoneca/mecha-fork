@@ -139,6 +139,11 @@ The stream tier's webhook sink has neither ([streaming joins](streaming-joins.md
   table in `conduit_pub` (`FOR ALL TABLES`) whatever its policies
   ([a credential in a column](../services/ticker/README.md#reading-a-restricted-table-from-the-pipeline)).
 - **A stalled feed holds WAL**: `pg_wal` grows while Conduit is down.
+- **`cdc-events` is bounded, so a consumer that lags too far loses entries.** The `redis-streams` component trims the stream to
+  about `maxLenApprox` (100000) entries on each publish, because the redis here keeps everything in memory and has no
+  `maxmemory`: a stream with no bound grows until the host is out of memory, whatever the consumers do. A consumer
+  whose lag passes the cap (one replaying a refused entry for ever, or one down for hours of a busy stack) misses the
+  oldest entries; size the cap to the slowest consumer's lag, in `services/mesh/dapr/components/redis-streams.yaml`.
 - **Reset the database and Conduit together.** Conduit keeps its position in
   memory (`CONDUIT_DB_TYPE: inmemory`); under a running Conduit, a reset
   database is asked for WAL it never had, and the feed dies silently. Compose
