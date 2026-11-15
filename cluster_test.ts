@@ -1108,3 +1108,17 @@ Deno.test("a caller's door settings reach caddy, and never replace the cluster's
   assert.equal(bad.ok, false);
   assert.match(bad.stderr, /meta.doorEnvironment names sites-mode, not a variable/);
 });
+
+Deno.test("the cdc-events stream is bounded on the bus's Dapr component, and the mesh-events service carries the bound", async () => {
+  // Redis here keeps everything in memory with no maxmemory, so a stream with no cap grows until the host is out of
+  // memory whatever the consumers do (PRONTO-535: Codex's finding on the first schedule that turned the feed on).
+  const file = await Deno.readTextFile(`${MECHA}services/mesh/dapr/components/redis-streams.yaml`);
+  const cap = file.match(/- name: maxLenApprox\n\s+value: "(\d+)"/);
+  assert.ok(cap, "the redis-streams component sets maxLenApprox");
+  assert.ok(Number(cap[1]) >= 10000, `a cap of ${cap[1]} would drop entries of an ordinary lag`);
+  assert.ok(Number(cap[1]) <= 1000000, `a cap of ${cap[1]} no longer bounds redis's memory`);
+  const got = await exported({ pipelines: [{ name: "p", file: "p.yaml" }] }, "surface.targets", { capture: true });
+  assert.equal(got.ok, true, got.stderr);
+  const preamble = JSON.stringify(got.value["mesh-events"]?.dockerfile?.preamble ?? got.value.mesh?.dockerfile?.preamble ?? got.value);
+  assert.match(preamble, /maxLenApprox/, "the service the stream is published through ships the component with the cap");
+});
