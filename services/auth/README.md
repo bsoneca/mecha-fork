@@ -13,6 +13,8 @@ the emitter writes the policies that call `auth_uid()`.
   account is still a guest: 401 for anything else, 409 once it has a passkey or
   a provider's link (its way back is its own sign-in), 404 for no such user.
   `USER_TOKEN_TTL_S` (a week by default) is a token's life.
+- **A Studio play token's session** (`POST /auth/studio`, below) is a user token
+  with `guest: false` that lives 12 hours, whatever `USER_TOKEN_TTL_S` is.
 - **A service token** carries role `service` and the nil uuid, pre-signed
   against the dev secret and delivered as a compose env default. It exists so a
   transform can write without a reader, which is the only caller that has no
@@ -200,3 +202,60 @@ The table is in `mecha_auth` with the passkeys and links (schema.ts): no app
 role reaches it, and the one reader by hash is `mecha_auth.api_key_owner`,
 `SECURITY DEFINER`, whose execute no one but its owner holds. The signing
 secret stays in this service: no other process mints a key's token.
+
+## Studio play tokens
+
+A game played only inside Studio takes no sign-in of its own: Studio signs the
+player in, and hands the game a one-minute token for that game alone
+(`studio.ts`). `POST /auth/studio {token}` trades it for the game's session,
+`{token, user: {id, handle, guest: false}}`, as `/auth/guest` answers one.
+Off (404) unless `STUDIO_JWKS_URL`, `STUDIO_ISS` and `PUBLIC_ORIGIN` are all
+set. Some set and not all is refused at startup, as is an `STUDIO_ISS` or
+`PUBLIC_ORIGIN` that is not an origin (`scheme://host[:port]`, nothing after)
+or a `STUDIO_JWKS_URL` that is not https (`localhost` is exempt).
+
+- **The token** is a JWS with `alg` ES256 and nothing else, and a `kid`.
+  Its claims are checked in this order, each with its error code: `iss` equals
+  `STUDIO_ISS` (`iss`); `aud` equals `PUBLIC_ORIGIN` (`aud`); `exp` and `iat`
+  are numbers (`claims`); `exp` is in the future, with no leeway (`expired`);
+  `iat` is at most 30 s ahead (`iat`); `exp - iat` is at most 120 s
+  (`lifetime`); `sub` is a uuid (`sub`); `handle` is a non-empty string of at
+  most 120 characters (`handle`); `jti` is a string of at most 128 (`jti`).
+  A `handle` or `jti` holding a NUL is `claims`: Postgres stores none.
+- **The keys** come from `STUDIO_JWKS_URL` alone, never from the token's `iss`
+  or a header. A key must be `kty` EC, `crv` P-256 and `use` sig; any other is
+  not a key. The fetch takes no redirect (a 3xx fails), at most 64 KB and 3 s,
+  and callers that arrive during one wait for it. Keys are held 10 minutes; a
+  `kid` not held fetches again, and so does a fetch that failed, each at most
+  once a minute; when a fetch fails the keys held serve for up to 1 hour, and
+  with none held every token is refused.
+- **Spent once**: in one transaction the `jti` is inserted into
+  `mecha_auth.studio_jti (jti, exp)` and `app_user (id = sub, handle)` is
+  upserted. A `jti` already there is 409 `replay`. A handle another account
+  holds becomes `<handle>-<first 8 of sub>` (the session and the row say which);
+  when that is held too, 409 `handle_taken`. Any other failed upsert rolls the
+  `jti` back, so the token is not spent. At each call that verified a token,
+  rows more than 5 minutes past `exp` are deleted: `exp` has no leeway, so such
+  a `jti` can never pass again, and the 5 minutes cover a database clock that
+  differs from this service's.
+- **Errors** are 401 `{reason}`: `malformed`, `alg` (any alg but ES256,
+  `none` included), `kid` (none, unknown, or not a usable key), `signature`,
+  `jwks` (the keys could not be had), and the claims' above. The token is never
+  echoed.
+- **The limit** is 60 calls a minute per address, then 429, counted in each
+  process (replicas do not share it). The address is the entry
+  `AUTH_TRUSTED_HOPS` from the end of `X-Forwarded-For`: the number of proxies
+  in front of the service, each appending the address it saw, 1 by default
+  (entries before them are the client's own and are never trusted); a whole
+  number from 1, anything else refused at startup. With too few entries, or
+  none, the socket's address. A deployment with more hops than it says shares
+  its proxy's one bucket; with fewer, a client chooses its own.
+
+`AUTH_GUESTS=off` closes the game's own ways in: `POST /auth/guest`,
+`/auth/guest/refresh`, `/auth/register/{start,verify}`,
+`/auth/login/{start,verify}` and everything under `/auth/oidc/` answer 403.
+Unset (or `on`), the service behaves as it always has, so no app changes by a
+pin bump alone; any other value is refused at startup. It mints nothing from
+then on, but sessions minted before it stay valid until their `exp` (a guest's
+for up to `USER_TOKEN_TTL_S`). With `AUTH_API_KEYS=true`, a Studio session can
+still make keys, as any non-guest session can: unchanged here.

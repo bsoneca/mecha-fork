@@ -1453,7 +1453,7 @@ Deno.test({
   fn: async () => {
     const guest = (await (await handler(post("/auth/guest", {}))).json()).user;
     const taken = await links.userFor({ ...alice, sub: "g-adopts" }, guest.id);
-    assertEquals(taken, { id: guest.id, handle: guest.handle });
+    assertEquals(taken, { id: guest.id, handle: guest.handle, name: alice.name, email: alice.email });
     assertEquals((await sql`select user_id from mecha_auth.identity_link where sub = 'g-adopts'`)[0].user_id, guest.id);
     // Signing in again is the same person, the guest named or not.
     assertEquals((await links.userFor({ ...alice, sub: "g-adopts" })).id, guest.id);

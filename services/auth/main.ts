@@ -30,6 +30,7 @@ import {
 import { type Links, oidc, type Profile, providersFrom } from "./oidc.ts";
 import { androidOrigins } from "./origins.ts";
 import { apiKeysSql, HANDOFF_SPENT_GRACE, handoffSpentSql, prepareAuthTables, sealAuthTables } from "./schema.ts";
+import { rateLimit, studioFrom, studioKeys, studioSql, verifyPlayToken } from "./studio.ts";
 export { shapeWhere };
 
 function required(name: string): string {
@@ -189,6 +190,23 @@ export function keyExchangedHook(): string | null {
   throw new Error(`AUTH_KEY_EXCHANGED_HOOK must name a function as schema.name, not ${raw}`);
 }
 keyExchangedHook();
+// Guests (PRONTO-547): on unless a game that is played only inside Studio sets AUTH_GUESTS=off, when no
+// sign-in of the game's own opens (a guest, a passkey, a provider): the one way in is a Studio play token
+// (POST /auth/studio). Read at each request; a value that is neither is refused at startup.
+export function guestsOn(): boolean {
+  const raw = Deno.env.get("AUTH_GUESTS") ?? "";
+  if (raw === "" || raw === "on") return true;
+  if (raw === "off") return false;
+  throw new Error(`AUTH_GUESTS must be on or off, not ${raw}`);
+}
+guestsOn();
+// Studio play tokens: off (404) unless STUDIO_JWKS_URL, STUDIO_ISS and PUBLIC_ORIGIN are all set.
+export function studioOn() {
+  return studioFrom((name) => Deno.env.get(name));
+}
+studioOn();
+// A play token's session is half a day: Studio signs the player in again at each opening.
+export const STUDIO_TOKEN_TTL_S = 12 * 3600;
 // A key's token is short: a key is the durable credential and the token only carries one session of
 // calls, so revoking a key ends its reach within this.
 export const KEY_TOKEN_TTL_S = 900;
@@ -233,6 +251,7 @@ export async function migrate(): Promise<void> {
     if (apiKeysOn()) await tx.unsafe(apiKeysSql(SCHEMAS));
     // The handoff codes spent, only where provider sign-in is on (schema.ts, PRONTO-368).
     if (Object.keys(OIDC_PROVIDERS).length > 0) await tx.unsafe(handoffSpentSql(SCHEMAS));
+    if (studioOn() !== null) await tx.unsafe(studioSql(SCHEMAS.mecha));
     await tx.unsafe(sealAuthTables(["webauthn_credential", "identity_link"], SCHEMAS));
   });
 }
@@ -251,6 +270,7 @@ export function issueUserToken(
   handle: string,
   guest = false,
   profile?: { name?: string | null; email?: string | null },
+  ttlS = USER_TOKEN_TTL_S,
 ): Promise<string> {
   return signJwt({
     iss: STACK_ISSUER,
@@ -260,7 +280,7 @@ export function issueUserToken(
     guest,
     ...(profile?.name ? { name: profile.name } : {}),
     ...(profile?.email ? { email: profile.email } : {}),
-    exp: Math.floor(Date.now() / 1000) + USER_TOKEN_TTL_S,
+    exp: Math.floor(Date.now() / 1000) + ttlS,
   });
 }
 
@@ -1015,6 +1035,86 @@ async function upgrade(req: Request): Promise<Response> {
 }
 
 
+// --- Studio play tokens (PRONTO-547; README.md, "Studio play tokens") ---
+
+// How many proxies stand between a client and this service, each appending the address it saw to
+// X-Forwarded-For: the client is that many entries from the end (the entries before are its own claims).
+// Read at each request; a value that is no whole number from 1 is refused at startup.
+export function trustedHops(): number {
+  const raw = Deno.env.get("AUTH_TRUSTED_HOPS") ?? "";
+  if (raw === "") return 1;
+  const n = Number(raw);
+  if (!/^[0-9]+$/.test(raw) || !(n >= 1)) throw new Error(`AUTH_TRUSTED_HOPS must be a whole number from 1, not ${raw}`);
+  return n;
+}
+trustedHops();
+const STUDIO_CALLS_PER_MIN = 60;
+const studioLimit = rateLimit(STUDIO_CALLS_PER_MIN, 60_000);
+const studioKeySets = new Map<string, ReturnType<typeof studioKeys>>();
+
+// The caller's address: AUTH_TRUSTED_HOPS entries from the end of X-Forwarded-For, else the socket's.
+export function clientIp(req: Request, info?: { remoteAddr?: { hostname?: string } }): string {
+  const parts = (req.headers.get("x-forwarded-for") ?? "").split(",").map((p) => p.trim()).filter((p) => p !== "");
+  return parts.at(-trustedHops()) ?? info?.remoteAddr?.hostname ?? "unknown";
+}
+
+/** The rows of spent tokens that are 5 minutes past their `exp`, deleted: `exp` has no leeway, so no token
+ * with that `jti` can pass again (the 5 minutes cover a database clock that differs from this service's). */
+export async function cleanStudioJti(): Promise<void> {
+  await sql`delete from mecha_auth.studio_jti where exp < now() - interval '5 minutes'`;
+}
+
+// POST /auth/studio {token}: the game's session for a Studio play token, as /auth/guest answers one but
+// for a signed-in player (guest false). The token is spent and the player made in one transaction: a
+// failed upsert leaves the token unspent.
+async function studioSignIn(req: Request, ip: string): Promise<Response> {
+  const cfg = studioOn();
+  if (cfg === null) return jsonError(404, "not found");
+  if (!studioLimit(ip)) {
+    return new Response(JSON.stringify({ error: "too many requests", reason: "rate" }), {
+      status: 429,
+      headers: { "content-type": "application/json", "retry-after": "60" },
+    });
+  }
+  const refuse = (reason: string) => json(401, { error: "invalid studio token", reason });
+  const body = await readBody(req);
+  if (typeof body?.token !== "string") return refuse("malformed");
+  let keys = studioKeySets.get(cfg.jwks);
+  if (keys === undefined) studioKeySets.set(cfg.jwks, keys = studioKeys(cfg.jwks));
+  const verified = await verifyPlayToken(body.token, keys, cfg);
+  if ("refused" in verified) return refuse(verified.refused);
+  const { jti, exp, sub, handle } = verified.play;
+  await cleanStudioJti();
+  const spent = await sql.begin(async (tx) => {
+    const [row] = await tx`insert into mecha_auth.studio_jti (jti, exp) values (${jti}, to_timestamp(${exp}))
+      on conflict (jti) do nothing returning jti`;
+    if (row === undefined) return { err: "replay" as const };
+    // A handle another account holds: the player takes it with the first 8 of their id after it, once. The
+    // savepoints keep the attempt atomic with the jti; past both, nothing is made and the token is not spent.
+    const upsert = (h: string) =>
+      tx.savepoint((sp) => sp`insert into app_user (id, handle) values (${sub}, ${h})
+        on conflict (id) do update set handle = excluded.handle`);
+    let taken = handle;
+    try {
+      await upsert(handle);
+    } catch (e) {
+      if ((e as { code?: string }).code !== "23505") throw e;
+      try {
+        await upsert(taken = `${handle.slice(0, 100)}-${sub.slice(0, 8)}`);
+      } catch (e2) {
+        if ((e2 as { code?: string }).code !== "23505") throw e2;
+        await tx`delete from mecha_auth.studio_jti where jti = ${jti}`;
+        return { err: "handle_taken" as const };
+      }
+    }
+    return { handle: taken };
+  });
+  if ("err" in spent && spent.err === "replay") return json(409, { error: "replay", reason: "replay" });
+  if ("err" in spent) return json(409, { error: "handle taken", reason: "handle_taken" });
+  const token = await issueUserToken(sub, spent.handle, false, undefined, STUDIO_TOKEN_TTL_S);
+  return json(200, { token, user: { id: sub, handle: spent.handle, guest: false } });
+}
+
 export const links: Links = {
   userFor(p: Profile, adopt?: string) {
     return sql.begin(async (tx) => {
@@ -1091,9 +1191,23 @@ const providerSignIn = oidc({
   legacyCookie: Deno.env.get("OIDC_LEGACY_COOKIE") !== "off",
 });
 
-export async function handler(req: Request): Promise<Response> {
+// What AUTH_GUESTS=off closes: every way in the game has of its own. Studio's play token is the other.
+const OWN_SIGN_IN = new Set([
+  "/auth/guest",
+  "/auth/guest/refresh",
+  "/auth/register/start",
+  "/auth/register/verify",
+  "/auth/login/start",
+  "/auth/login/verify",
+]);
+
+export async function handler(req: Request, info?: { remoteAddr?: { hostname?: string } }): Promise<Response> {
   const path = new URL(req.url).pathname;
   try {
+    if (!guestsOn() && (path.startsWith("/auth/oidc/") || (req.method === "POST" && OWN_SIGN_IN.has(path)))) {
+      return jsonError(403, "sign-in is Studio's");
+    }
+    if (req.method === "POST" && path === "/auth/studio") return await studioSignIn(req, clientIp(req, info));
     const signedIn = providerSignIn(req);
     if (signedIn !== null) return await signedIn;
     if (req.method === "POST" && path === "/auth/register/start") {
@@ -1146,5 +1260,5 @@ export async function handler(req: Request): Promise<Response> {
 if (import.meta.main) {
   await migrate();
   // A host launch moves the port (cluster.cue: AUTH_PORT); a container keeps 9999.
-  Deno.serve({ hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("AUTH_PORT") || Deno.env.get("PORT") || 9999) }, handler);
+  Deno.serve({ hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("AUTH_PORT") || Deno.env.get("PORT") || 9999) }, (req, info) => handler(req, info));
 }
