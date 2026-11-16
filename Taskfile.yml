@@ -70,6 +70,23 @@ tasks:
       - mise x -- sh -c 'cd ../electric && deno test --config ../auth/deno.json --frozen -A main_test.ts'
       - mise x -- sh -c 'cd ../proxy && deno test --config ../auth/deno.json --frozen -A proxy_test.ts'
 
+  test:auth:pg:
+    desc: "the auth service against Postgres (main_test.ts, studio_test.ts), a throwaway cluster on this host's own binaries: PG_BIN names the directory holding initdb, pg_ctl and psql; no Docker"
+    dir: services/auth
+    requires:
+      vars: [PG_BIN]
+    env:
+      PG_BIN: "{{.PG_BIN}}"
+    cmds:
+      - mise x -- ./pg_test.sh
+    sources:
+      - "*.ts"
+      - "*.sh"
+      - "deno.json"
+      - "deno.lock"
+      - "../database/rls/rls.sql"
+      - "../database/migrations/00[01]_*.sql"
+
   test:browser:
     desc: "browser PostgREST reads under their request scopes"
     dir: packages/mecha-browser
