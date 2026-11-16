@@ -2,9 +2,9 @@
 // Deno.serve of the test's, and Postgres as main_test.ts needs it (DATABASE_URL and the rest of the
 // environment main.ts reads). Each case is a way a play token could be forged, replayed, misdirected or
 // carried by a JWKS that is not to be trusted; AUTH_GUESTS=off is held to the routes it closes.
-import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.13";
+import { assert, assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1.0.13";
 import "./main_test_env.ts";
-import { cleanStudioJti, handler, migrate, sql, verifyJwt } from "./main.ts";
+import { cleanStudioJti, clientIp, handler, migrate, sql, verifyJwt } from "./main.ts";
 import { encodeBase64Url } from "./jwt.ts";
 import { KEYS_FRESH_MS, KEYS_STALE_MS, REFETCH_MS, rateLimit, studioFrom, studioKeys } from "./studio.ts";
 
@@ -338,19 +338,32 @@ Deno.test({
 });
 
 Deno.test({
-  name: "a handle another account holds makes no player and spends no token",
+  name: "a handle another account holds is taken with the player's id after it, and only if that is free too",
   ...opts,
   fn: async () => {
     await sql`delete from app_user where id = ${SUB}`;
-    await sql`insert into app_user (id, handle) values (gen_random_uuid(), 'taken') on conflict do nothing`;
+    await sql`delete from app_user where handle in ('taken', ${"taken-" + SUB.slice(0, 8)})`;
+    await sql`insert into app_user (id, handle) values (gen_random_uuid(), 'taken')`;
     await using s = serveJwks();
     const c = claims({ handle: "taken" });
     const res = await inStudio(s.url, async () => await handler(studio(await jws(c))));
-    assertEquals(res.status, 409);
-    assertEquals((await res.json()).reason, "handle_taken");
-    assertEquals(await jtiRow(c.jti), undefined);
+    assertEquals(res.status, 200);
+    const derived = `taken-${SUB.slice(0, 8)}`;
+    const body = await res.json();
+    assertEquals(body.user.handle, derived);
+    assertEquals((await verifyJwt(body.token))?.handle, derived);
+    assertEquals((await userRow(SUB)).handle, derived);
+    assert(await jtiRow(c.jti));
+    // Both held by others: nothing is made and the token is not spent.
+    await sql`delete from app_user where id = ${SUB}`;
+    await sql`insert into app_user (id, handle) values (gen_random_uuid(), ${derived})`;
+    const c2 = claims({ handle: "taken" });
+    const res2 = await inStudio(s.url, async () => await handler(studio(await jws(c2))));
+    assertEquals(res2.status, 409);
+    assertEquals((await res2.json()).reason, "handle_taken");
+    assertEquals(await jtiRow(c2.jti), undefined);
     assertEquals(await userRow(SUB), undefined);
-    await sql`delete from app_user where handle = 'taken'`;
+    await sql`delete from app_user where handle in ('taken', ${derived})`;
   },
 });
 
@@ -359,13 +372,15 @@ Deno.test({
   ...opts,
   fn: async () => {
     await using s = serveJwks();
-    await sql`insert into mecha_auth.studio_jti (jti, exp) values ('old-one', now() - interval '1 minute'), ('live-one', now() + interval '1 minute')
+    await sql`insert into mecha_auth.studio_jti (jti, exp) values ('old-one', now() - interval '10 minutes'), ('recent-one', now() - interval '1 minute'), ('live-one', now() + interval '1 minute')
       on conflict (jti) do update set exp = excluded.exp`;
     await cleanStudioJti();
     assertEquals(await jtiRow("old-one"), undefined);
+    // Past exp by less than the 5 minutes of grace a database clock may differ by: kept.
+    assert(await jtiRow("recent-one"));
     assert(await jtiRow("live-one"));
     // Another call cleans too, and the live one is still a replay.
-    await sql`insert into mecha_auth.studio_jti (jti, exp) values ('old-two', now() - interval '1 second')`;
+    await sql`insert into mecha_auth.studio_jti (jti, exp) values ('old-two', now() - interval '6 minutes')`;
     const fresh = await inStudio(s.url, async () => await handler(studio(await jws(claims()))));
     assertEquals(fresh.status, 200);
     assertEquals(await jtiRow("old-two"), undefined);
@@ -396,26 +411,25 @@ Deno.test({
 });
 
 Deno.test({
-  name: "the route is a 404 unless STUDIO_JWKS_URL, STUDIO_ISS and PUBLIC_ORIGIN are all set",
+  name: "the route is a 404 with no Studio setting, and a partial or malformed one is refused at startup",
   ...opts,
   fn: async () => {
     await using s = serveJwks();
     const token = await jws(claims());
-    const all = { STUDIO_JWKS_URL: s.url, STUDIO_ISS: ISS, PUBLIC_ORIGIN: ORIGIN };
-    for (const missing of Object.keys(all)) {
-      const res = await withEnv({ ...all, [missing]: undefined }, () => handler(studio(token)));
-      assertEquals(res.status, 404, missing);
-    }
-    assertEquals((await withEnv({ ...all, STUDIO_ISS: "" }, () => handler(studio(token)))).status, 404);
+    const none = { STUDIO_JWKS_URL: undefined, STUDIO_ISS: undefined, PUBLIC_ORIGIN: undefined };
+    assertEquals((await withEnv(none, () => handler(studio(token)))).status, 404);
+    assertEquals((await withEnv({ ...none, STUDIO_ISS: "" }, () => handler(studio(token)))).status, 404);
     assertEquals(s.jwks.hits, 0);
     assertEquals(studioFrom(() => undefined), null);
-    assertEquals(studioFrom((n) => ({ ...all, STUDIO_JWKS_URL: "https://s.test/k" } as Env)[n])?.jwks, "https://s.test/k");
-    try {
-      studioFrom((n) => ({ ...all, STUDIO_JWKS_URL: "http://s.test/k" } as Env)[n]);
-      assert(false, "a JWKS over http is refused");
-    } catch (e) {
-      assert((e as Error).message.includes("is not https"));
-    }
+    const all: Env = { STUDIO_JWKS_URL: "https://s.test/k", STUDIO_ISS: ISS, PUBLIC_ORIGIN: ORIGIN };
+    assertEquals(studioFrom((n) => all[n])?.jwks, "https://s.test/k");
+    assertEquals(studioFrom((n) => ({ ...all, STUDIO_JWKS_URL: "http://localhost:8/k" })[n])?.origin, ORIGIN);
+    const refuses = (over: Env, text: string) => assertThrows(() => studioFrom((n) => ({ ...all, ...over })[n]), Error, text);
+    for (const name of Object.keys(all)) refuses({ [name]: undefined }, `${name} must be set`);
+    refuses({ STUDIO_JWKS_URL: "http://s.test/k" }, "is not https");
+    refuses({ PUBLIC_ORIGIN: `${ORIGIN}/` }, "PUBLIC_ORIGIN");
+    refuses({ STUDIO_ISS: `${ISS}/path` }, "STUDIO_ISS");
+    refuses({ STUDIO_ISS: "studio.test" }, "STUDIO_ISS");
   },
 });
 
@@ -476,20 +490,120 @@ Deno.test({
   },
 });
 
+/** The service started with `env` on top of what it needs, and what it said when it stopped. */
+const startup = async (env: Record<string, string>) => {
+  const out = await new Deno.Command(Deno.execPath(), {
+    args: ["eval", "--frozen", `import("./main.ts")`],
+    env: { DATABASE_URL: Deno.env.get("DATABASE_URL")!, AUTH_STATEMENT_TIMEOUT_MS: "5000", PGRST_JWT_SECRET: "x", WEBAUTHN_RP_ID: "localhost", WEBAUTHN_ORIGIN: "https://localhost:*", ...env },
+    cwd: new URL(".", import.meta.url).pathname,
+    stdout: "null",
+    stderr: "piped",
+  }).output();
+  return { ok: out.success, stderr: new TextDecoder().decode(out.stderr) };
+};
+
 Deno.test({
-  name: "AUTH_GUESTS is refused at startup unless it is on or off",
+  name: "AUTH_GUESTS, AUTH_TRUSTED_HOPS and a partial Studio setting are refused at startup",
   ...opts,
   fn: async () => {
-    const run = (v: string) =>
-      new Deno.Command(Deno.execPath(), {
-        args: ["eval", "--frozen", `import("./main.ts")`],
-        env: { AUTH_GUESTS: v, DATABASE_URL: Deno.env.get("DATABASE_URL")!, AUTH_STATEMENT_TIMEOUT_MS: "5000", PGRST_JWT_SECRET: "x", WEBAUTHN_RP_ID: "localhost", WEBAUTHN_ORIGIN: "https://localhost:*" },
-        cwd: new URL(".", import.meta.url).pathname,
-        stdout: "null",
-        stderr: "piped",
-      }).output();
-    const bad = await run("maybe");
-    assert(!bad.success);
-    assert(new TextDecoder().decode(bad.stderr).includes("AUTH_GUESTS must be on or off, not maybe"));
+    const guests = await startup({ AUTH_GUESTS: "maybe" });
+    assert(!guests.ok);
+    assert(guests.stderr.includes("AUTH_GUESTS must be on or off, not maybe"));
+    for (const hops of ["0", "-1", "1.5", "two"]) {
+      const r = await startup({ AUTH_TRUSTED_HOPS: hops });
+      assert(!r.ok, hops);
+      assert(r.stderr.includes("AUTH_TRUSTED_HOPS must be a whole number from 1"), r.stderr);
+    }
+    const partial = await startup({ STUDIO_ISS: ISS });
+    assert(!partial.ok);
+    assert(partial.stderr.includes("STUDIO_JWKS_URL and PUBLIC_ORIGIN must be set"), partial.stderr);
+  },
+});
+
+Deno.test({
+  name: "the client is the entry AUTH_TRUSTED_HOPS from the end of X-Forwarded-For, else the socket's",
+  ...opts,
+  fn: async () => {
+    const req = (xff?: string) => new Request("http://auth:9999/", { headers: xff === undefined ? {} : { "x-forwarded-for": xff } });
+    const sock = { remoteAddr: { hostname: "192.0.2.1" } };
+    await withEnv({ AUTH_TRUSTED_HOPS: undefined }, async () => {
+      assertEquals(clientIp(req("1.1.1.1, 2.2.2.2"), sock), "2.2.2.2");
+      assertEquals(clientIp(req("2.2.2.2"), sock), "2.2.2.2");
+      assertEquals(clientIp(req(), sock), "192.0.2.1");
+    });
+    await withEnv({ AUTH_TRUSTED_HOPS: "2" }, async () => {
+      // Spoofed first entry, a CDN's address, the proxy's: the client is the second from the end.
+      assertEquals(clientIp(req("9.9.9.9, 1.1.1.1, 2.2.2.2"), sock), "1.1.1.1");
+      assertEquals(clientIp(req("2.2.2.2"), sock), "192.0.2.1");
+      assertEquals(clientIp(req(), sock), "192.0.2.1");
+    });
+    // The limit follows it: with 2 hops two proxies' addresses are one client.
+    await using s = serveJwks();
+    await withEnv({ AUTH_TRUSTED_HOPS: "2", STUDIO_JWKS_URL: s.url, STUDIO_ISS: ISS, PUBLIC_ORIGIN: ORIGIN }, async () => {
+      const as = (first: string) => studio("junk", { "x-forwarded-for": `${first}, 198.51.100.77, 10.1.1.1` });
+      for (let i = 0; i < 60; i++) assertEquals((await handler(as(`7.7.${i}.1`))).status, 401);
+      assertEquals((await handler(as("7.7.99.1"))).status, 429);
+    });
+  },
+});
+
+Deno.test({
+  name: "a handle or jti Postgres cannot store is refused as a claim, not a fault",
+  ...opts,
+  fn: async () => {
+    await using s = serveJwks();
+    await refused(s.url, await jws(claims({ handle: "li\u0000a" })), 401, "claims");
+    await refused(s.url, await jws(claims({ jti: "j\u0000ti" })), 401, "claims");
+  },
+});
+
+Deno.test({
+  name: "one fetch serves every caller that waits on it, and with no keys a failed fetch is not retried within a minute",
+  ...opts,
+  fn: async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => release = r);
+    await using s = serveJwks(() => new Response(new ReadableStream({ async start(c) { await gate; c.enqueue(enc.encode(JSON.stringify({ keys: [publicJwk] }))); c.close(); } })));
+    const key = studioKeys(s.url);
+    const three = Promise.all([key("k1"), key("k1"), key("k1")]);
+    await new Promise((r) => setTimeout(r, 50));
+    release();
+    assertEquals((await three).map((k) => k?.kty), ["EC", "EC", "EC"]);
+    assertEquals(s.jwks.hits, 1);
+    // A kid new at the keys' rotation, asked during a refresh, waits for it and is served.
+    let t = 5_000_000;
+    let rotated = false;
+    await using r = serveJwks(() => Response.json({ keys: rotated ? [{ ...publicJwk, kid: "k2" }, publicJwk] : [publicJwk] }));
+    const rot = studioKeys(r.url, () => fetch, () => t);
+    await rot("k1");
+    rotated = true;
+    t += REFETCH_MS;
+    const [a, b] = await Promise.all([rot("k2"), rot("k2")]);
+    assertEquals([a?.kty, b?.kty], ["EC", "EC"]);
+    assertEquals(r.jwks.hits, 2);
+    // Nothing held and the fetch failing: asked once, then refused without asking until a minute has passed.
+    await using down = serveJwks(() => new Response(null, { status: 500 }));
+    const none = studioKeys(down.url, () => fetch, () => t);
+    for (let i = 0; i < 3; i++) await assertRejects(() => none("k1"), Error, "no Studio keys");
+    assertEquals(down.jwks.hits, 1);
+    t += REFETCH_MS;
+    await assertRejects(() => none("k1"), Error, "no Studio keys");
+    assertEquals(down.jwks.hits, 2);
+  },
+});
+
+Deno.test({
+  name: "the limiter holds at most maxKeys addresses, the oldest going first",
+  ...opts,
+  fn: () => {
+    let t = 0;
+    const limit = rateLimit(1, 60_000, () => ++t, 3);
+    for (const k of ["a", "b", "c"]) assertEquals(limit(k), true);
+    assertEquals(limit("a"), false);
+    // "d" evicts "a", the oldest; "a" starts a new window.
+    assertEquals(limit("d"), true);
+    assertEquals(limit("a"), true);
+    // That evicted "b": it has a fresh window too, while "d" is still held to its one call.
+    assertEquals(limit("d"), false);
   },
 });

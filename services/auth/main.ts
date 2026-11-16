@@ -811,21 +811,31 @@ async function exchangeKey(req: Request): Promise<Response> {
 
 // --- Studio play tokens (PRONTO-547; README.md, "Studio play tokens") ---
 
+// How many proxies stand between a client and this service, each appending the address it saw to
+// X-Forwarded-For: the client is that many entries from the end (the entries before are its own claims).
+// Read at each request; a value that is no whole number from 1 is refused at startup.
+export function trustedHops(): number {
+  const raw = Deno.env.get("AUTH_TRUSTED_HOPS") ?? "";
+  if (raw === "") return 1;
+  const n = Number(raw);
+  if (!/^[0-9]+$/.test(raw) || !(n >= 1)) throw new Error(`AUTH_TRUSTED_HOPS must be a whole number from 1, not ${raw}`);
+  return n;
+}
+trustedHops();
 const STUDIO_CALLS_PER_MIN = 60;
 const studioLimit = rateLimit(STUDIO_CALLS_PER_MIN, 60_000);
 const studioKeySets = new Map<string, ReturnType<typeof studioKeys>>();
 
-// The caller's address: the one the nearest proxy appended to X-Forwarded-For (a client's own entries come
-// before it), else the socket's.
-function clientIp(req: Request, info?: { remoteAddr?: { hostname?: string } }): string {
-  const forwarded = req.headers.get("x-forwarded-for");
-  const last = forwarded?.split(",").pop()?.trim();
-  return last || info?.remoteAddr?.hostname || "unknown";
+// The caller's address: AUTH_TRUSTED_HOPS entries from the end of X-Forwarded-For, else the socket's.
+export function clientIp(req: Request, info?: { remoteAddr?: { hostname?: string } }): string {
+  const parts = (req.headers.get("x-forwarded-for") ?? "").split(",").map((p) => p.trim()).filter((p) => p !== "");
+  return parts.at(-trustedHops()) ?? info?.remoteAddr?.hostname ?? "unknown";
 }
 
-/** The rows of spent tokens that are past their `exp`, deleted: no token with that `jti` can pass again. */
+/** The rows of spent tokens that are 5 minutes past their `exp`, deleted: `exp` has no leeway, so no token
+ * with that `jti` can pass again (the 5 minutes cover a database clock that differs from this service's). */
 export async function cleanStudioJti(): Promise<void> {
-  await sql`delete from mecha_auth.studio_jti where exp < now()`;
+  await sql`delete from mecha_auth.studio_jti where exp < now() - interval '5 minutes'`;
 }
 
 // POST /auth/studio {token}: the game's session for a Studio play token, as /auth/guest answers one but
@@ -852,24 +862,31 @@ async function studioSignIn(req: Request, ip: string): Promise<Response> {
   const spent = await sql.begin(async (tx) => {
     const [row] = await tx`insert into mecha_auth.studio_jti (jti, exp) values (${jti}, to_timestamp(${exp}))
       on conflict (jti) do nothing returning jti`;
-    if (row === undefined) return "replay";
-    try {
-      await tx.savepoint((sp) => sp`insert into app_user (id, handle) values (${sub}, ${handle})
+    if (row === undefined) return { err: "replay" as const };
+    // A handle another account holds: the player takes it with the first 8 of their id after it, once. The
+    // savepoints keep the attempt atomic with the jti; past both, nothing is made and the token is not spent.
+    const upsert = (h: string) =>
+      tx.savepoint((sp) => sp`insert into app_user (id, handle) values (${sub}, ${h})
         on conflict (id) do update set handle = excluded.handle`);
+    let taken = handle;
+    try {
+      await upsert(handle);
     } catch (e) {
-      // Another account holds the handle: nothing is made, and the token is not spent.
-      if ((e as { code?: string }).code === "23505") {
+      if ((e as { code?: string }).code !== "23505") throw e;
+      try {
+        await upsert(taken = `${handle.slice(0, 100)}-${sub.slice(0, 8)}`);
+      } catch (e2) {
+        if ((e2 as { code?: string }).code !== "23505") throw e2;
         await tx`delete from mecha_auth.studio_jti where jti = ${jti}`;
-        return "handle_taken";
+        return { err: "handle_taken" as const };
       }
-      throw e;
     }
-    return "ok";
+    return { handle: taken };
   });
-  if (spent === "replay") return json(409, { error: "replay", reason: "replay" });
-  if (spent === "handle_taken") return json(409, { error: "handle taken", reason: "handle_taken" });
-  const token = await issueUserToken(sub, handle, false, STUDIO_TOKEN_TTL_S);
-  return json(200, { token, user: { id: sub, handle, guest: false } });
+  if ("err" in spent && spent.err === "replay") return json(409, { error: "replay", reason: "replay" });
+  if ("err" in spent) return json(409, { error: "handle taken", reason: "handle_taken" });
+  const token = await issueUserToken(sub, spent.handle, false, STUDIO_TOKEN_TTL_S);
+  return json(200, { token, user: { id: sub, handle: spent.handle, guest: false } });
 }
 
 export const links: Links = {

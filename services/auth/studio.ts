@@ -21,12 +21,21 @@ INSERT INTO mecha.rls_exempt VALUES ('mecha_auth.studio_jti', 'the auth service'
 
 export type StudioConfig = { jwks: string; iss: string; origin: string };
 
-/** The deployment's Studio settings, or null while any of the three is unset: the route is then off. */
+/** The deployment's Studio settings, or null while none of the three is set: the route is then off. Some
+ * set and not all, or a value that is no origin (or, for the keys, not https), is refused at startup. */
 export function studioFrom(env: (name: string) => string | undefined): StudioConfig | null {
-  const jwks = env("STUDIO_JWKS_URL") ?? "";
-  const iss = env("STUDIO_ISS") ?? "";
-  const origin = env("PUBLIC_ORIGIN") ?? "";
-  if (jwks === "" || iss === "" || origin === "") return null;
+  const names = ["STUDIO_JWKS_URL", "STUDIO_ISS", "PUBLIC_ORIGIN"];
+  const [jwks, iss, origin] = names.map((n) => env(n) ?? "");
+  if (jwks === "" && iss === "" && origin === "") return null;
+  const missing = names.filter((_, i) => [jwks, iss, origin][i] === "");
+  if (missing.length > 0) throw new Error(`${missing.join(" and ")} must be set with the other Studio settings`);
+  for (const [name, value] of [["STUDIO_ISS", iss], ["PUBLIC_ORIGIN", origin]]) {
+    let ok = false;
+    try {
+      ok = new URL(value).origin === value;
+    } catch { /* not a URL */ }
+    if (!ok) throw new Error(`${name} ${value} is not an origin (scheme://host[:port], no path or trailing slash)`);
+  }
   const url = new URL(jwks);
   if (url.protocol !== "https:" && url.hostname !== "localhost") throw new Error(`STUDIO_JWKS_URL ${jwks} is not https`);
   return { jwks, iss, origin };
@@ -88,28 +97,36 @@ export function studioKeys(
   let held: JsonWebKey[] = [];
   let fetchedAt = -Infinity;
   let triedAt = -Infinity;
+  let inflight: Promise<void> | null = null;
   const find = (kid: string) => held.find((k) => (k as { kid?: string }).kid === kid);
-  async function refresh(): Promise<boolean> {
+  // One fetch at a time: callers that arrive during it wait for it, whatever they came for.
+  function refresh(): Promise<void> {
+    if (inflight !== null) return inflight;
     triedAt = now();
-    try {
-      held = await fetchKeys(url, fetcher());
-      fetchedAt = now();
-      return true;
-    } catch (e) {
-      console.error(`studio keys: ${(e as Error).message}`);
-      return false;
-    }
+    inflight = (async () => {
+      try {
+        held = await fetchKeys(url, fetcher());
+        fetchedAt = now();
+      } catch (e) {
+        console.error(`studio keys: ${(e as Error).message}`);
+      } finally {
+        inflight = null;
+      }
+    })();
+    return inflight;
   }
   return async (kid) => {
-    const age = now() - fetchedAt;
-    if (age < KEYS_FRESH_MS) {
+    if (inflight !== null) await inflight;
+    const t = now();
+    if (t - fetchedAt < KEYS_FRESH_MS) {
       const k = find(kid);
-      if (k !== undefined || now() - triedAt < REFETCH_MS) return k;
+      if (k !== undefined || t - triedAt < REFETCH_MS) return k;
       await refresh();
       return find(kid);
     }
-    if (held.length === 0 || now() - triedAt >= REFETCH_MS) await refresh();
-    if (now() - fetchedAt >= KEYS_STALE_MS || held.length === 0) throw new Error("no Studio keys");
+    // Old, or never fetched: at most one attempt a minute, held keys or none.
+    if (t - triedAt >= REFETCH_MS) await refresh();
+    if (held.length === 0 || now() - fetchedAt >= KEYS_STALE_MS) throw new Error("no Studio keys");
     return find(kid);
   };
 }
@@ -150,20 +167,23 @@ export async function verifyPlayToken(
   if (typeof c.sub !== "string" || !UUID.test(c.sub)) return { refused: "sub" };
   if (typeof c.handle !== "string" || c.handle.trim() === "" || c.handle.length > MAX_HANDLE_CHARS) return { refused: "handle" };
   if (typeof c.jti !== "string" || c.jti === "" || c.jti.length > 128) return { refused: "jti" };
+  // Postgres stores no NUL in text (22021): refused here, not as a fault there.
+  if (c.handle.includes("\0") || c.jti.includes("\0")) return { refused: "claims" };
   return { play: { jti: c.jti, exp: c.exp, sub: c.sub, handle: c.handle } };
 }
 
-/** At most `max` calls per key in `windowMs`, the window opening at a key's first call. */
-export function rateLimit(max: number, windowMs: number, now: () => number = Date.now): (key: string) => boolean {
+/** At most `max` calls per key in `windowMs`, the window opening at a key's first call. At most `maxKeys` keys
+ * are held: a new one past that evicts the oldest, so a flood of addresses costs a constant. */
+export function rateLimit(max: number, windowMs: number, now: () => number = Date.now, maxKeys = 10_000): (key: string) => boolean {
   const seen = new Map<string, { since: number; calls: number }>();
   return (key) => {
     const t = now();
-    if (seen.size > 10_000) for (const [k, v] of seen) if (t - v.since >= windowMs) seen.delete(k);
     const w = seen.get(key);
-    if (w === undefined || t - w.since >= windowMs) {
-      seen.set(key, { since: t, calls: 1 });
-      return true;
-    }
-    return ++w.calls <= max;
+    if (w !== undefined && t - w.since < windowMs) return ++w.calls <= max;
+    // Map order is insertion order: a key whose window reopens goes to the back.
+    seen.delete(key);
+    if (seen.size >= maxKeys) seen.delete(seen.keys().next().value!);
+    seen.set(key, { since: t, calls: 1 });
+    return true;
   };
 }
