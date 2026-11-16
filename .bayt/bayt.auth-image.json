@@ -11,11 +11,13 @@
       {
         "from": null,
         "srcs": [
+          "services/auth/api_keys.ts",
           "services/auth/deno.json",
           "services/auth/deno.lock",
           "services/auth/jwt.ts",
           "services/auth/main.ts",
-          "services/auth/oidc.ts"
+          "services/auth/oidc.ts",
+          "services/auth/studio.ts"
         ],
         "dst": "/app/",
         "link": true,
@@ -49,11 +51,13 @@
   "activate": "",
   "srcs": {
     "globs": [
+      "services/auth/api_keys.ts",
       "services/auth/deno.json",
       "services/auth/deno.lock",
       "services/auth/jwt.ts",
       "services/auth/main.ts",
-      "services/auth/oidc.ts"
+      "services/auth/oidc.ts",
+      "services/auth/studio.ts"
     ],
     "exclude": []
   },
@@ -140,11 +144,13 @@
       },
       "outs": {
         "globs": [
+          "services/auth/api_keys.ts",
           "services/auth/deno.json",
           "services/auth/deno.lock",
           "services/auth/jwt.ts",
           "services/auth/main.ts",
-          "services/auth/oidc.ts"
+          "services/auth/oidc.ts",
+          "services/auth/studio.ts"
         ],
         "exclude": []
       },

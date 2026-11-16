@@ -179,6 +179,43 @@ const ALGS = {
   ES256: { kty: "EC", import: { name: "ECDSA", namedCurve: "P-256" }, verify: { name: "ECDSA", hash: "SHA-256" } },
 } as const;
 
+export type Jws = { claims: Record<string, unknown> } | { refused: "malformed" | "alg" | "kid" | "signature" };
+
+/** A compact JWS whose signature holds under a key of the source, as one of
+ * `algs` and nothing else: its claims, or why it is refused. `key` answers
+ * undefined for a key id it does not hold, and may throw when it cannot say.
+ * What the claims mean is the caller's. */
+export async function verifyJws(
+  token: string,
+  key: (kid: string) => Promise<JsonWebKey | undefined>,
+  algs: readonly (keyof typeof ALGS)[] = ["RS256", "ES256"],
+): Promise<Jws> {
+  const parts = token.split(".");
+  if (parts.length !== 3) return { refused: "malformed" };
+  let head: unknown, c: unknown;
+  try {
+    head = JSON.parse(dec.decode(decodeBase64Url(parts[0])));
+    c = JSON.parse(dec.decode(decodeBase64Url(parts[1])));
+  } catch {
+    return { refused: "malformed" };
+  }
+  if (!isObject(head) || !isObject(c)) return { refused: "malformed" };
+  if (typeof head.alg !== "string" || !algs.includes(head.alg as keyof typeof ALGS)) return { refused: "alg" };
+  if (typeof head.kid !== "string") return { refused: "kid" };
+  const alg = ALGS[head.alg as keyof typeof ALGS];
+  const jwk = await key(head.kid);
+  if (jwk === undefined || jwk.kty !== alg.kty) return { refused: "kid" };
+  let ok: boolean;
+  try {
+    const pub = alg.kty === "RSA" ? { kty: "RSA", n: jwk.n, e: jwk.e } : { kty: "EC", crv: jwk.crv, x: jwk.x, y: jwk.y };
+    const k = await crypto.subtle.importKey("jwk", pub, alg.import, false, ["verify"]);
+    ok = await crypto.subtle.verify(alg.verify, k, decodeBase64Url(parts[2]), enc.encode(`${parts[0]}.${parts[1]}`));
+  } catch {
+    return { refused: "signature" };
+  }
+  return ok ? { claims: c } : { refused: "signature" };
+}
+
 /** An ID token's subject and profile, verified: signed under one of the
  * provider's keys, issued by it for this client, unexpired, and carrying the
  * nonce this browser was sent with. Null on any doubt. */
@@ -188,29 +225,9 @@ export async function verifyIdToken(
   key: (kid: string) => Promise<JsonWebKey | undefined>,
   p: { issuer: string; issuers: string[]; client: string; nonce: string },
 ): Promise<Profile | null> {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  let head: unknown, c: unknown;
-  try {
-    head = JSON.parse(dec.decode(decodeBase64Url(parts[0])));
-    c = JSON.parse(dec.decode(decodeBase64Url(parts[1])));
-  } catch {
-    return null;
-  }
-  if (!isObject(head) || !isObject(c)) return null;
-  if (typeof head.kid !== "string" || !Object.hasOwn(ALGS, head.alg as string)) return null;
-  const alg = ALGS[head.alg as keyof typeof ALGS];
-  const jwk = await key(head.kid);
-  if (jwk === undefined || jwk.kty !== alg.kty) return null;
-  let ok: boolean;
-  try {
-    const pub = alg.kty === "RSA" ? { kty: "RSA", n: jwk.n, e: jwk.e } : { kty: "EC", crv: jwk.crv, x: jwk.x, y: jwk.y };
-    const k = await crypto.subtle.importKey("jwk", pub, alg.import, false, ["verify"]);
-    ok = await crypto.subtle.verify(alg.verify, k, decodeBase64Url(parts[2]), enc.encode(`${parts[0]}.${parts[1]}`));
-  } catch {
-    return null;
-  }
-  if (!ok) return null;
+  const jws = await verifyJws(token, key);
+  if ("refused" in jws) return null;
+  const c = jws.claims;
   if (typeof c.iss !== "string" || !p.issuers.includes(c.iss)) return null;
   const aud = Array.isArray(c.aud) ? c.aud : [c.aud];
   if (!aud.includes(p.client)) return null;

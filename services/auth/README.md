@@ -13,6 +13,8 @@ the emitter writes the policies that call `auth_uid()`.
   account is still a guest: 401 for anything else, 409 once it has a passkey or
   a provider's link (its way back is its own sign-in), 404 for no such user.
   `USER_TOKEN_TTL_S` (a week by default) is a token's life.
+- **A Studio play token's session** (`POST /auth/studio`, below) is a user token
+  with `guest: false` that lives 12 hours, whatever `USER_TOKEN_TTL_S` is.
 - **A service token** carries role `service` and the nil uuid, pre-signed
   against the dev secret and delivered as a compose env default. It exists so a
   transform can write without a reader, which is the only caller that has no
@@ -120,3 +122,43 @@ The table is in `mecha_auth` (api_keys.ts), a schema no app role may use, unlike
 the passkeys and links this line keeps in public: no app role reaches it, and the one reader by hash is `mecha_auth.api_key_owner`,
 `SECURITY DEFINER`, whose execute no one but its owner holds. The signing
 secret stays in this service: no other process mints a key's token.
+
+## Studio play tokens
+
+A game played only inside Studio takes no sign-in of its own: Studio signs the
+player in, and hands the game a one-minute token for that game alone
+(`studio.ts`). `POST /auth/studio {token}` trades it for the game's session,
+`{token, user: {id, handle, guest: false}}`, as `/auth/guest` answers one.
+Off (404) unless `STUDIO_JWKS_URL`, `STUDIO_ISS` and `PUBLIC_ORIGIN` are all
+set.
+
+- **The token** is a JWS with `alg` ES256 and nothing else, and a `kid`.
+  Its claims are checked in this order, each with its error code: `iss` equals
+  `STUDIO_ISS` (`iss`); `aud` equals `PUBLIC_ORIGIN` (`aud`); `exp` is in the
+  future, with no leeway (`expired`); `iat` is at most 30 s ahead (`iat`);
+  `exp - iat` is at most 120 s (`lifetime`); `sub` is a uuid (`sub`); `handle`
+  is a string (`handle`); `jti` is a string (`jti`). A claim of the wrong type
+  is `claims`.
+- **The keys** come from `STUDIO_JWKS_URL` alone, never from the token's `iss`
+  or a header. A key must be `kty` EC, `crv` P-256 and `use` sig; any other is
+  not a key. The fetch takes no redirect (a 3xx fails), at most 64 KB and 3 s.
+  Keys are held 10 minutes; a `kid` not held fetches again, at most once a
+  minute; when a fetch fails the keys held serve for up to 1 hour, and with none
+  held every token is refused.
+- **Spent once**: in one transaction the `jti` is inserted into
+  `mecha_auth.studio_jti (jti, exp)` and `app_user (id = sub, handle)` is
+  upserted. A `jti` already there is 409 `replay`; a handle another account
+  holds is 409 `handle_taken`; a failed upsert rolls the `jti` back, so the
+  token is not spent. Rows past `exp` are deleted at each call, which is safe
+  because `exp` has no leeway.
+- **Errors** are 401 `{reason}`: `malformed`, `alg` (any alg but ES256,
+  `none` included), `kid` (none, unknown, or not a usable key), `signature`,
+  `jwks` (the keys could not be had), and the claims' above. The token is never
+  echoed. 60 calls a minute from one address, then 429; the address is the last
+  entry of `X-Forwarded-For` (the nearest proxy's), else the socket's.
+
+`AUTH_GUESTS=off` closes the game's own ways in: `POST /auth/guest`,
+`/auth/guest/refresh`, `/auth/register/{start,verify}`,
+`/auth/login/{start,verify}` and everything under `/auth/oidc/` answer 403.
+Unset (or `on`), the service behaves as it always has, so no app changes by a
+pin bump alone; any other value is refused at startup.

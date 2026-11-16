@@ -26,6 +26,7 @@ import {
 } from "./jwt.ts";
 import { API_KEYS_SQL } from "./api_keys.ts";
 import { type Links, oidc, type Profile, providersFrom } from "./oidc.ts";
+import { rateLimit, STUDIO_SQL, studioFrom, studioKeys, verifyPlayToken } from "./studio.ts";
 export { shapeWhere };
 
 function required(name: string): string {
@@ -114,6 +115,23 @@ export function apiKeysOn(): boolean {
   throw new Error(`AUTH_API_KEYS must be true or false, not ${raw}`);
 }
 apiKeysOn();
+// Guests (PRONTO-547): on unless a game that is played only inside Studio sets AUTH_GUESTS=off, when no
+// sign-in of the game's own opens (a guest, a passkey, a provider): the one way in is a Studio play token
+// (POST /auth/studio). Read at each request; a value that is neither is refused at startup.
+export function guestsOn(): boolean {
+  const raw = Deno.env.get("AUTH_GUESTS") ?? "";
+  if (raw === "" || raw === "on") return true;
+  if (raw === "off") return false;
+  throw new Error(`AUTH_GUESTS must be on or off, not ${raw}`);
+}
+guestsOn();
+// Studio play tokens: off (404) unless STUDIO_JWKS_URL, STUDIO_ISS and PUBLIC_ORIGIN are all set.
+export function studioOn() {
+  return studioFrom((name) => Deno.env.get(name));
+}
+studioOn();
+// A play token's session is half a day: Studio signs the player in again at each opening.
+export const STUDIO_TOKEN_TTL_S = 12 * 3600;
 // A key's token is short: a key is the durable credential and the token only carries one session of
 // calls, so revoking a key ends its reach within this.
 export const KEY_TOKEN_TTL_S = 900;
@@ -169,6 +187,7 @@ export async function migrate(): Promise<void> {
     ON CONFLICT DO NOTHING`;
   // The keys' table only where the program turned keys on: an app that did not gets nothing new.
   if (apiKeysOn()) await sql.unsafe(API_KEYS_SQL);
+  if (studioOn() !== null) await sql.unsafe(STUDIO_SQL);
 }
 
 // --- HS256 JWT via WebCrypto, under this service's secret ---
@@ -180,13 +199,13 @@ export const verifyJwt = (token: string, graceS = 0) => verify(JWT_SECRET, token
 
 // A guest's token says so, so a policy can keep writes to the people who
 // signed in (`request.jwt.claims ->> 'guest'`).
-export function issueUserToken(id: string, handle: string, guest = false): Promise<string> {
+export function issueUserToken(id: string, handle: string, guest = false, ttlS = USER_TOKEN_TTL_S): Promise<string> {
   return signJwt({
     role: "app_user",
     sub: id,
     handle,
     guest,
-    exp: Math.floor(Date.now() / 1000) + USER_TOKEN_TTL_S,
+    exp: Math.floor(Date.now() / 1000) + ttlS,
   });
 }
 
@@ -790,6 +809,69 @@ async function exchangeKey(req: Request): Promise<Response> {
 }
 
 
+// --- Studio play tokens (PRONTO-547; README.md, "Studio play tokens") ---
+
+const STUDIO_CALLS_PER_MIN = 60;
+const studioLimit = rateLimit(STUDIO_CALLS_PER_MIN, 60_000);
+const studioKeySets = new Map<string, ReturnType<typeof studioKeys>>();
+
+// The caller's address: the one the nearest proxy appended to X-Forwarded-For (a client's own entries come
+// before it), else the socket's.
+function clientIp(req: Request, info?: { remoteAddr?: { hostname?: string } }): string {
+  const forwarded = req.headers.get("x-forwarded-for");
+  const last = forwarded?.split(",").pop()?.trim();
+  return last || info?.remoteAddr?.hostname || "unknown";
+}
+
+/** The rows of spent tokens that are past their `exp`, deleted: no token with that `jti` can pass again. */
+export async function cleanStudioJti(): Promise<void> {
+  await sql`delete from mecha_auth.studio_jti where exp < now()`;
+}
+
+// POST /auth/studio {token}: the game's session for a Studio play token, as /auth/guest answers one but
+// for a signed-in player (guest false). The token is spent and the player made in one transaction: a
+// failed upsert leaves the token unspent.
+async function studioSignIn(req: Request, ip: string): Promise<Response> {
+  const cfg = studioOn();
+  if (cfg === null) return jsonError(404, "not found");
+  if (!studioLimit(ip)) {
+    return new Response(JSON.stringify({ error: "too many requests", reason: "rate" }), {
+      status: 429,
+      headers: { "content-type": "application/json", "retry-after": "60" },
+    });
+  }
+  const refuse = (reason: string) => json(401, { error: "invalid studio token", reason });
+  const body = await readBody(req);
+  if (typeof body?.token !== "string") return refuse("malformed");
+  let keys = studioKeySets.get(cfg.jwks);
+  if (keys === undefined) studioKeySets.set(cfg.jwks, keys = studioKeys(cfg.jwks));
+  const verified = await verifyPlayToken(body.token, keys, cfg);
+  if ("refused" in verified) return refuse(verified.refused);
+  const { jti, exp, sub, handle } = verified.play;
+  await cleanStudioJti();
+  const spent = await sql.begin(async (tx) => {
+    const [row] = await tx`insert into mecha_auth.studio_jti (jti, exp) values (${jti}, to_timestamp(${exp}))
+      on conflict (jti) do nothing returning jti`;
+    if (row === undefined) return "replay";
+    try {
+      await tx.savepoint((sp) => sp`insert into app_user (id, handle) values (${sub}, ${handle})
+        on conflict (id) do update set handle = excluded.handle`);
+    } catch (e) {
+      // Another account holds the handle: nothing is made, and the token is not spent.
+      if ((e as { code?: string }).code === "23505") {
+        await tx`delete from mecha_auth.studio_jti where jti = ${jti}`;
+        return "handle_taken";
+      }
+      throw e;
+    }
+    return "ok";
+  });
+  if (spent === "replay") return json(409, { error: "replay", reason: "replay" });
+  if (spent === "handle_taken") return json(409, { error: "handle taken", reason: "handle_taken" });
+  const token = await issueUserToken(sub, handle, false, STUDIO_TOKEN_TTL_S);
+  return json(200, { token, user: { id: sub, handle, guest: false } });
+}
+
 export const links: Links = {
   userFor(p: Profile, adopt?: string) {
     return sql.begin(async (tx) => {
@@ -855,9 +937,23 @@ const providerSignIn = oidc({
   },
 });
 
-export async function handler(req: Request): Promise<Response> {
+// What AUTH_GUESTS=off closes: every way in the game has of its own. Studio's play token is the other.
+const OWN_SIGN_IN = new Set([
+  "/auth/guest",
+  "/auth/guest/refresh",
+  "/auth/register/start",
+  "/auth/register/verify",
+  "/auth/login/start",
+  "/auth/login/verify",
+]);
+
+export async function handler(req: Request, info?: { remoteAddr?: { hostname?: string } }): Promise<Response> {
   const path = new URL(req.url).pathname;
   try {
+    if (!guestsOn() && (path.startsWith("/auth/oidc/") || (req.method === "POST" && OWN_SIGN_IN.has(path)))) {
+      return jsonError(403, "sign-in is Studio's");
+    }
+    if (req.method === "POST" && path === "/auth/studio") return await studioSignIn(req, clientIp(req, info));
     const signedIn = providerSignIn(req);
     if (signedIn !== null) return await signedIn;
     if (req.method === "POST" && path === "/auth/register/start") {
@@ -903,5 +999,5 @@ export async function handler(req: Request): Promise<Response> {
 
 if (import.meta.main) {
   await migrate();
-  Deno.serve({ port: 9999 }, handler);
+  Deno.serve({ port: 9999 }, (req, info) => handler(req, info));
 }
