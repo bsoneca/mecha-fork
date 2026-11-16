@@ -1332,10 +1332,20 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 						}
 						// Peers the caller adds (meta.hostPeers, `<name>=<port>`: a
 						// renderer behind the door), reached on this machine as
-						// PRONTO_UPSTREAM_<NAME>, as the cluster's own are.
+						// PRONTO_UPSTREAM_<NAME>, as the cluster's own are. A peer
+						// that is itself a bayt target exposing http is addressed
+						// through bayt (host: "127.0.0.1" pins it to loopback, since
+						// the peer runs on the host, not as a container bayt would
+						// otherwise dial by name) — its host port may be reallocated
+						// (docs/proxy.md) and the literal below would then dial
+						// nothing. A peer that names no such target keeps the
+						// literal: bayt has no port of its own to resolve for it.
 						for p in X.meta.hostPeers {
 							let _n = strings.Split(p, "=")
-							"PRONTO_UPSTREAM_\(strings.Replace(strings.ToUpper(_n[0]), "-", "_", -1))": "127.0.0.1:\(_n[1])"
+							"PRONTO_UPSTREAM_\(strings.Replace(strings.ToUpper(_n[0]), "-", "_", -1))": [
+								if X.surface.targets[_n[0]].expose.http != _|_ {{peer: _n[0], port: "http", host: "127.0.0.1"}},
+								"127.0.0.1:\(_n[1])",
+							][0]
 						}
 					}
 					env: {
