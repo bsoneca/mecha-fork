@@ -924,7 +924,9 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 						])
 					}
 					compose: {
-						ports: ["5432"]
+						// Published on the host's loopback alone, at a port docker picks: the services reach it on
+						// the stack's network, and nothing off the machine reaches a database that trusts its users.
+						ports: ["127.0.0.1::5432"]
 						// One rebuild entry per migration: the list is the consumer's, and
 						// mecha's own stack keeps a fixture outside the migrations directory.
 						develop: watch: [for m in X.state.migrations {action: "rebuild", path: "../\(m)", target: "/docker-entrypoint-initdb.d"}]
