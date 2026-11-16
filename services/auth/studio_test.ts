@@ -526,16 +526,18 @@ Deno.test({
   fn: async () => {
     const req = (xff?: string) => new Request("http://auth:9999/", { headers: xff === undefined ? {} : { "x-forwarded-for": xff } });
     const sock = { remoteAddr: { hostname: "192.0.2.1" } };
-    await withEnv({ AUTH_TRUSTED_HOPS: undefined }, async () => {
+    await withEnv({ AUTH_TRUSTED_HOPS: undefined }, () => {
       assertEquals(clientIp(req("1.1.1.1, 2.2.2.2"), sock), "2.2.2.2");
       assertEquals(clientIp(req("2.2.2.2"), sock), "2.2.2.2");
       assertEquals(clientIp(req(), sock), "192.0.2.1");
+      return Promise.resolve();
     });
-    await withEnv({ AUTH_TRUSTED_HOPS: "2" }, async () => {
+    await withEnv({ AUTH_TRUSTED_HOPS: "2" }, () => {
       // Spoofed first entry, a CDN's address, the proxy's: the client is the second from the end.
       assertEquals(clientIp(req("9.9.9.9, 1.1.1.1, 2.2.2.2"), sock), "1.1.1.1");
       assertEquals(clientIp(req("2.2.2.2"), sock), "192.0.2.1");
       assertEquals(clientIp(req(), sock), "192.0.2.1");
+      return Promise.resolve();
     });
     // The limit follows it: with 2 hops two proxies' addresses are one client.
     await using s = serveJwks();
