@@ -1122,3 +1122,29 @@ Deno.test("the cdc-events stream is bounded on the bus's Dapr component, and the
   const preamble = JSON.stringify(got.value["mesh-events"]?.dockerfile?.preamble ?? got.value.mesh?.dockerfile?.preamble ?? got.value);
   assert.match(preamble, /maxLenApprox/, "the service the stream is published through ships the component with the cap");
 });
+
+// A host peer (meta.hostPeers, `<name>=<port>`) that is itself a bayt target exposing http is addressed through
+// bayt rather than the literal port the caller wrote: that literal is only ever the port the caller saw when it
+// wrote hostPeers, and bayt may since have put the target on another one (a reallocated host port, docs/proxy.md).
+// A peer naming no such target keeps the literal, the only address bayt has for it.
+const hostPeerUpstream = async (hostPeers: string[], targets: Record<string, unknown> = {}) =>
+  await evaluated(
+    `(#Cluster & {meta: {app: "t", images: [string]: name: "img", bounds: {authStatementMs: 5000, tickerCallMs: 35000}, hostPeers: ${
+      JSON.stringify(hostPeers)
+    }}, state: {migrations: [], pipelines: [], schedules: [], computations: []}, capabilities: {}, surface: targets: ${
+      JSON.stringify(targets)
+    }}).surface.targets.caddy.compose.environment`,
+  );
+
+Deno.test("a host peer that is a bayt target exposing http reaches it through bayt's own port, not the caller's stale literal", async () => {
+  // The caller wrote hostPeers with the port it saw (9999); the target's real expose port is 4000 (as bayt knows
+  // it today). Before the fix this stayed "127.0.0.1:9999" — the literal, wrong once the port moved.
+  const resolved = await hostPeerUpstream(["renderer=9999"], { renderer: { expose: { http: { port: 4000, env: "PORT" } } } });
+  assert.equal(resolved.ok, true, resolved.stderr);
+  assert.equal(resolved.value.PRONTO_UPSTREAM_RENDERER, "127.0.0.1:4000");
+
+  // A peer naming no bayt target (a process bayt knows nothing about) keeps the literal the caller gave.
+  const literal = await hostPeerUpstream(["sidecar=4001"]);
+  assert.equal(literal.ok, true, literal.stderr);
+  assert.equal(literal.value.PRONTO_UPSTREAM_SIDECAR, "127.0.0.1:4001");
+});
