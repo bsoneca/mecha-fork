@@ -1148,3 +1148,19 @@ Deno.test("a host peer that is a bayt target exposing http reaches it through ba
   assert.equal(literal.ok, true, literal.stderr);
   assert.equal(literal.value.PRONTO_UPSTREAM_SIDECAR, "127.0.0.1:4001");
 });
+
+// The test above checks the ref cluster.cue hands bayt; this one runs bayt's own renderers
+// (gen_process_compose.cue, gen_compose.cue) on that exact ref end to end
+// (host_peer_process_compose_check.cue), since process-compose — not compose — is where a
+// reallocated host port actually bit (the door dialled a dead one under bayt 0.71's
+// local-launch port assignment).
+Deno.test("bayt's own renderer resolves a host-target peer to its host port var in process-compose, and to the published port in compose", async () => {
+  const pc = await evaluated("#_hostPeerProcessCompose");
+  assert.equal(pc.ok, true, pc.stderr);
+  assert.match(pc.value.find((e: string) => e.startsWith("PRONTO_UPSTREAM_RENDERER=")), /^PRONTO_UPSTREAM_RENDERER=127\.0\.0\.1:\$\{RENDERER_HTTP_PORT:-\d+\}$/);
+  assert.ok(pc.value.includes("PRONTO_UPSTREAM_SIDECAR=127.0.0.1:4001"), JSON.stringify(pc.value));
+
+  const dc = await evaluated("#_hostPeerDockerCompose");
+  assert.equal(dc.ok, true, dc.stderr);
+  assert.deepEqual(dc.value, { PRONTO_UPSTREAM_RENDERER: "127.0.0.1:9100", PRONTO_UPSTREAM_SIDECAR: "127.0.0.1:4001" });
+});
