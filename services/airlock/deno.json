@@ -9,7 +9,8 @@
     "graphile-worker": "npm:graphile-worker@0.18.0",
     "pg": "npm:pg@8.16.3",
     "quick-lru": "npm:quick-lru@7.3.0",
-    "ses": "npm:ses@1.15.0"
+    "ses": "npm:ses@1.15.0",
+    "undici": "npm:undici@7.30.2"
   },
   "lock": true
 }
