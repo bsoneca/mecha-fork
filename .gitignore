@@ -1,3 +1,4 @@
 # Generated files directory - ignore everything except README.md
 /gen/*
 !/gen/README.md
+node_modules/
