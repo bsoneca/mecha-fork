@@ -136,6 +136,8 @@ export const MAX_TOKEN_CHARS = 2048;
 export const MAX_FUTURE_IAT_S = 30;
 export const MAX_LIFETIME_S = 120;
 const MAX_HANDLE_CHARS = 120;
+/** What a handle may hold, once trimmed: letters, digits, space, dot, underscore, hyphen. */
+const HANDLE = /^[\p{L}\p{N} ._-]{1,120}$/u;
 
 export type Play = { jti: string; exp: number; sub: string; handle: string };
 export type Refused = "malformed" | "alg" | "kid" | "signature" | "jwks" | "iss" | "aud" | "expired" | "iat" | "claims" | "lifetime" | "sub" | "handle" | "jti";
@@ -165,11 +167,11 @@ export async function verifyPlayToken(
   if (c.iat > nowS + MAX_FUTURE_IAT_S) return { refused: "iat" };
   if (c.exp - c.iat > MAX_LIFETIME_S) return { refused: "lifetime" };
   if (typeof c.sub !== "string" || !UUID.test(c.sub)) return { refused: "sub" };
-  if (typeof c.handle !== "string" || c.handle.trim() === "" || c.handle.length > MAX_HANDLE_CHARS) return { refused: "handle" };
-  if (typeof c.jti !== "string" || c.jti === "" || c.jti.length > 128) return { refused: "jti" };
   // Postgres stores no NUL in text (22021): refused here, not as a fault there.
-  if (c.handle.includes("\0") || c.jti.includes("\0")) return { refused: "claims" };
-  return { play: { jti: c.jti, exp: c.exp, sub: c.sub, handle: c.handle } };
+  if ((typeof c.handle === "string" && c.handle.includes("\0")) || (typeof c.jti === "string" && c.jti.includes("\0"))) return { refused: "claims" };
+  if (typeof c.handle !== "string" || c.handle.length > MAX_HANDLE_CHARS || !HANDLE.test(c.handle.trim())) return { refused: "handle" };
+  if (typeof c.jti !== "string" || c.jti === "" || c.jti.length > 128) return { refused: "jti" };
+  return { play: { jti: c.jti, exp: c.exp, sub: c.sub, handle: c.handle.trim() } };
 }
 
 /** At most `max` calls per key in `windowMs`, the window opening at a key's first call. At most `maxKeys` keys
