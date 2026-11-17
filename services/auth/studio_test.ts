@@ -143,6 +143,10 @@ Deno.test({
       ["lifetime", { exp: now() + 3600 }],
       ["sub", { sub: "not-a-uuid" }],
       ["handle", { handle: 7 }],
+      ["handle", { handle: "   " }],
+      ["handle", { handle: "lia<script>" }],
+      ["handle", { handle: "lia\nx" }],
+      ["handle", { handle: "a".repeat(121) }],
       ["jti", { jti: undefined }],
       ["claims", { exp: "soon" }],
     ];
@@ -607,5 +611,21 @@ Deno.test({
     assertEquals(limit("a"), true);
     // That evicted "b": it has a fresh window too, while "d" is still held to its one call.
     assertEquals(limit("d"), false);
+  },
+});
+
+Deno.test({
+  name: "a handle is trimmed and stored trimmed; letters of any script, digits, space, dot, underscore and hyphen pass",
+  ...opts,
+  fn: async () => {
+    await using s = serveJwks();
+    for (const [given, kept] of [["  lia  ", "lia"], ["Zoë Åsa_1.x-y", "Zoë Åsa_1.x-y"], ["李雷", "李雷"]]) {
+      await sql`delete from app_user where id = ${SUB}`;
+      await sql`delete from app_user where handle = ${kept}`;
+      const res = await inStudio(s.url, async () => await handler(studio(await jws(claims({ handle: given })))));
+      assertEquals(res.status, 200);
+      assertEquals((await res.json()).user.handle, kept);
+      assertEquals((await userRow(SUB)).handle, kept);
+    }
   },
 });
