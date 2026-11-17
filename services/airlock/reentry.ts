@@ -30,6 +30,9 @@ export type Effect = {
   handler: string;
   /** The environment variables whose values the handler is handed. */
   secrets?: string[];
+  /** The secret fields of the invoking row whose values the handler is
+   * handed, read from airlock.secret at each call and kept nowhere else. */
+  secretFields?: string[];
   /** A header the airlock adds to every call of the sink, its value the
    * named variable's (prefixed by `scheme`), which the handler never holds. */
   credential?: { header: string; scheme?: string; secret: string };
@@ -38,8 +41,10 @@ export type Effect = {
   /** The media type of a sink that takes no JSON, whose handler sends its
    * body already encoded, as a string. */
   contentType?: string;
-  /** The origin the edge's airlock calls; the compose airlock's daprd holds its own. */
-  edgeOrigin?: string;
+  /** The origin the edge's airlock calls, or the dispatcher's secret that
+   * holds it, for a sink each deployment points elsewhere; the compose
+   * airlock's daprd holds its own. */
+  edgeOrigin?: string | { secret: string };
   /** The bridge the sink is: the release targets its container runs on, and
    * whether the local stack runs a simulator in its place. Anywhere else no
    * call is made and the effect fails. */
@@ -107,6 +112,9 @@ export const RESERVED_HEADERS = new Set(["idempotency-key", "content-type", "con
 export const SECRET = /^[A-Z][A-Z0-9_]*$/;
 export const MEDIA_TYPE = /^[a-z]+\/[a-z0-9][a-z0-9.+-]*$/;
 export const HEADER_VALUE = /^[\x21-\x7e]([\x20-\x7e]*[\x21-\x7e])?$/;
+/** An https origin as mecha's cluster.cue spells it (#OriginPattern): a DNS
+ * name of two labels or more, a port at most, no path. */
+export const ORIGIN = /^https:\/\/([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]([a-z0-9-]*[a-z0-9])?(:[0-9]{1,5})?$/;
 
 /** The headers a handler sets on one sink call, checked: names daprd forwards,
  * none HTTP or the host sets (the idempotency key, the effect's credential),
@@ -196,17 +204,30 @@ export function parseManifest(text: string): Record<string, Effect> {
     if (e.secrets !== undefined && (!Array.isArray(e.secrets) || !e.secrets.every((s) => typeof s === "string" && SECRET.test(s)))) {
       bad("secrets is not a list of environment variables' names");
     }
+    if (e.secretFields !== undefined && (!Array.isArray(e.secretFields) || !e.secretFields.every((f) => IDENTIFIER.test(f)))) {
+      bad("secretFields is not a list of identifiers");
+    }
     if (e.contentType !== undefined && (typeof e.contentType !== "string" || !MEDIA_TYPE.test(e.contentType) || e.contentType === "application/json")) {
       bad("contentType is not a media type other than JSON, which is the default");
     }
-    if (e.credential !== undefined) {
-      const c = e.credential;
-      const token = (v: unknown) => typeof v === "string" && TOKEN.test(v);
-      const header = (v: unknown) => typeof v === "string" && HEADER.test(v) && !RESERVED_HEADERS.has(v.toLowerCase());
-      if (typeof c !== "object" || c === null || !header(c.header) || typeof c.secret !== "string" || !SECRET.test(c.secret) || (c.scheme !== undefined && !token(c.scheme))) {
-        bad("credential is not {header, scheme?, secret}: a header name daprd forwards (uppercase first) that is neither the host's nor HTTP's own, a scheme word and an environment variable's name");
+    if (e.edgeOrigin !== undefined) {
+      const o = e.edgeOrigin;
+      if (typeof o === "string" ? !ORIGIN.test(o) : typeof o !== "object" || o === null || Object.keys(o).length !== 1 || typeof o.secret !== "string" || !SECRET.test(o.secret)) {
+        bad("edgeOrigin is neither an https origin nor {secret}, an environment variable's name");
       }
     }
+    if (e.credential !== undefined && !credentialChecked(e.credential)) bad(CREDENTIAL);
   }
   return effects;
+}
+
+export const CREDENTIAL = "credential is not {header, scheme?, secret}: a header name daprd forwards (uppercase first) that is neither the host's nor HTTP's own, a scheme word and an environment variable's name";
+
+/** A sink's credential as the manifest spells it, for writes and reads alike. */
+export function credentialChecked(c: unknown): c is { header: string; scheme?: string; secret: string } {
+  const token = (v: unknown) => typeof v === "string" && TOKEN.test(v);
+  const header = (v: unknown) => typeof v === "string" && HEADER.test(v) && !RESERVED_HEADERS.has(v.toLowerCase());
+  if (typeof c !== "object" || c === null) return false;
+  const { header: h, scheme, secret } = c as Record<string, unknown>;
+  return header(h) && typeof secret === "string" && SECRET.test(secret) && (scheme === undefined || token(scheme));
 }

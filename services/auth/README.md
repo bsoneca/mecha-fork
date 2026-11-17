@@ -4,9 +4,9 @@ Three components read these tokens and only one mints them, so the shape is
 stated here rather than in each: this service issues, PostgREST verifies, and
 the emitter writes the policies that call `auth_uid()`.
 
-- **HS256**, claims `{role, sub, handle, exp}`, secret from `PGRST_JWT_SECRET`.
+- **HS256**, claims `{role, sub, handle, guest, name?, email?, exp}`, secret from `PGRST_JWT_SECRET`.
   A dev default ships so a fresh cluster boots; production overrides it.
-- **A user token** carries role `app_user` and `sub` = the `app_user` row id.
+- **A user token** carries role `app_user`, `sub` = the `app_user` row id, `guest` (`true` for `/auth/guest`, `false` after a ceremony or provider sign-in), and `name` / verified `email` when minted from a provider link.
 - **A guest's refresh**: `POST /auth/guest/refresh` with a guest's bearer, live or
   expired up to `GUEST_REFRESH_GRACE_S` ago (90 days by default), answers a new
   token of the same id and handle (`{token, user}`, as `/auth/guest`) while the
@@ -95,7 +95,9 @@ a page the door serves:
 - `GET /auth/oidc/<provider>/start?return=<path>` sends the browser to the
   provider's authorization endpoint with a signed `state`, a nonce and the
   PKCE challenge; the verifier stays in an HttpOnly cookie scoped to the
-  callback, and the state carries only its hash.
+  callback, and the state carries only its hash. Speculative `GET`s
+  (`Service-Worker-Navigation-Preload` and `prefetch`/`preview`) are refused on
+  both `start` and `callback` without touching cookies or spending a code.
 - `GET /auth/oidc/<provider>/callback` redeems the code at the provider's token
   endpoint with that verifier, verifies the ID token (RS256 or ES256) against
   the provider's published keys, issuer, client and nonce, and links the
@@ -137,8 +139,8 @@ guest behind. A person signed in through a provider and one holding a passkey
 are two `app_user`s.
 
 `identity_link` is `(provider, issuer, sub, user_id unique, created_at)`, with the
-provider's `name` and `picture` where it gives them, refreshed on every
-sign-in. An app that keeps its people elsewhere copies them with a trigger on
+provider's `name`, `picture` and verified `email` where it gives them, refreshed
+on every sign-in. An app that keeps its people elsewhere copies them with a trigger on
 it, as a reader is made on `webauthn_credential`; the service creates the table
 when it starts, so an app's migration that declares such a trigger declares the
 table as the service does.

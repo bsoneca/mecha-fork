@@ -26,8 +26,11 @@
 //   elsewhere (another colo, the object itself) is seen as before, once the
 //   entry is past its seconds, after one stale answer.
 // - Nothing live, no write, no 4xx or 5xx, and no session but a guest's.
-// - The browser keeps a shape response that is not live as Electric's server
-//   would let it, and nothing else.
+// - Every cluster response reaches the browser `no-store`, and each shape
+//   response the Worker serves gets a fresh `electric-cursor`: `shapes.ts`
+//   answers `offset=-1` with `up-to-date` in one round-trip, and Electric's
+//   client holds back `up-to-date` for 60 s from any response whose cursor
+//   matches the previous session's.
 import { isSession, PUBLIC_WHERE, verifyJwt } from '../../../services/auth/jwt.ts'
 import type { EdgeEnv } from './object.ts'
 import { blobKeyOf, SIGNAL_MAX_BYTES } from './door.ts'
@@ -42,43 +45,33 @@ const STORED_AT = 'x-edge-stored-at'
 const OWN_WRITE_KEEP_S = 300
 // One refresh per stale key per isolate, as edge-ssr.ts's renders.
 const refreshing = new Map<string, Promise<void>>()
+let cursor = Date.now()
 const CLUSTER_ROUTES = /^\/(auth|crud|electric)(\/|$)/
 const BLOB_MAX_BYTES = 16 * 1024 * 1024
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 // Cache API keys are URLs; none of these is ever fetched.
 const keyOf = (...parts: string[]) => new Request(`https://edge-cache.invalid/${parts.map(encodeURIComponent).join('/')}`)
 
-async function cached(key: Request, miss: () => Promise<Response>, ttl: number, ctx: ExecutionContext, browser?: string): Promise<Response> {
+async function cached(key: Request, miss: () => Promise<Response>, ttl: number, ctx: ExecutionContext): Promise<Response> {
   const cache = (caches as unknown as { default: Cache }).default
   const hit = await cache.match(key)
-  if (hit) return marked(hit, 'hit', browser)
+  if (hit) return marked(hit, 'hit')
   const res = await miss()
   if (res.status !== 200) return marked(res, 'miss')
   const stored = new Response(res.body, res)
   stored.headers.set('cache-control', `max-age=${ttl}`)
   ctx.waitUntil(cache.put(key, stored.clone()))
-  return marked(stored, 'miss', browser)
+  return marked(stored, 'miss')
 }
 
-/** What the browser may keep: a shape response that is not live, a 200,
- * under Electric 1.8's own cache headers (its shapes/api/response.ex), which
- * its client is written against: it sends `expired_handle` and a cache buster
- * past a stale entry. Anything else, nothing. */
-function marked(res: Response, state: string, browser = 'no-store'): Response {
+function marked(res: Response, state: string): Response {
   const out = new Response(res.body, res)
-  out.headers.set('cache-control', res.status === 200 ? browser : 'no-store')
+  out.headers.set('cache-control', 'no-store')
   out.headers.set('x-edge-cache', state)
   out.headers.delete(STORED_AT)
+  if (out.headers.has('electric-cursor')) out.headers.set('electric-cursor', String((cursor = Math.max(cursor + 1, Date.now()))))
   return out
 }
-
-// A log read from its start is kept long by a browser and briefly by a shared
-// cache; any other read that is not live, a minute and five more stale.
-const electricCache = (p: URLSearchParams) => p.get('offset') === 'now' || p.get('log') === 'changes_only'
-  ? 'no-store'
-  : p.get('offset') === '-1'
-  ? 'public, max-age=604800, s-maxage=3600, stale-while-revalidate=2629746'
-  : 'public, max-age=60, stale-while-revalidate=300'
 
 /** A public read as the colo keeps it: a day, stamped with when it was read. */
 function storedPublic(res: Response): Response {
@@ -95,6 +88,29 @@ const navigation = (req: Request) =>
   (req.method === 'GET' || req.method === 'HEAD') && (req.headers.get('sec-fetch-mode') === 'navigate' || (req.headers.get('accept') ?? '').includes('text/html'))
 
 const epochOf = (handle: string | null) => handle?.slice(handle.lastIndexOf('-') + 1) ?? null
+
+async function retryDelay(ms: number, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted()
+  await new Promise<void>((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); reject(signal.reason) }
+    const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve() }, ms)
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
+  })
+}
+
+async function forwardRead(object: () => DurableObjectStub, req: Request): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    req.signal.throwIfAborted()
+    try { return await object().fetch(req) }
+    catch (error) {
+      if (attempt === 2 || !error || typeof error !== 'object' || ('overloaded' in error && error.overloaded === true)) throw error
+      const reset = 'durableObjectReset' in error && error.durableObjectReset === true
+      if (!reset && (!('retryable' in error) || error.retryable !== true)) throw error
+      await retryDelay(250 * 2 ** attempt, req.signal)
+    }
+  }
+}
 
 export const edgeWorker = {
   async fetch(req: Request, env: EdgeEnv, ctx: ExecutionContext): Promise<Response> {
@@ -204,6 +220,7 @@ export const edgeWorker = {
     const p = url.searchParams
 
     if (req.method === 'GET' && path === '/electric/v1/shape') {
+      const forward = () => forwardRead(object, req)
       const epochKey = keyOf(version, 'epoch')
       const epoch = await (await cache.match(epochKey))?.text()
       // Awaited when it moves, so the refetch a 409 sends finds the new key.
@@ -217,16 +234,16 @@ export const edgeWorker = {
       // the object still refuses a table it does not sync, and a refusal is never stored.
       const verified = (claims?.typ === 'shape' && p.get('table') === claims.table && p.get('where') === claims.where)
         || (isSession(claims) && p.get('where') === PUBLIC_WHERE)
-      const browser = live ? 'no-store' : electricCache(p)
-      if (live || !verified || !epoch) return marked(await learn(await object().fetch(req)), 'bypass', browser)
+      if (live || !verified || !epoch) return marked(await learn(await forward()), 'bypass')
       // Every parameter but a live poll's cursor: a cache buster or an
       // expired_handle is how the client asks past a stale entry.
       const params = [...p].filter(([k]) => k !== 'cursor').sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      return cached(keyOf(version, epoch, ...params.flat()), async () => learn(await object().fetch(req)), SHAPE_TTL_S, ctx, browser)
+      return cached(keyOf(version, epoch, ...params.flat()), async () => learn(await forward()), SHAPE_TTL_S, ctx)
     }
 
     const session = isSession(claims)
     const guest = session && claims.guest === true
+    const entityRead = req.method === 'GET' && /^\/crud\/(?!rpc$)[a-zA-Z_][a-zA-Z0-9_]*$/.test(path)
     if (path.startsWith('/crud/') && session) {
       const reset = (await (await cache.match(keyOf(version, 'reset')))?.text()) ?? '0'
       const writesKey = keyOf(version, reset, 'writes', claims.sub as string)
@@ -247,7 +264,8 @@ export const edgeWorker = {
           if (Date.now() - storedAt <= PUBLIC_CRUD_FRESH_MS && storedAt > lastPublicWrite) return marked(publicHit, 'hit')
           if (!refreshing.has(publicKey.url)) {
             const refresh = (async () => {
-              const res = await object().fetch(new Request(req.url, { headers: req.headers }))
+              const refreshRequest = new Request(req.url, { headers: req.headers })
+              const res = entityRead ? await forwardRead(object, refreshRequest) : await object().fetch(refreshRequest)
               if (res.status !== 200 || res.headers.get('x-mecha-scope') !== 'public') {
                 await cache.delete(publicKey)
                 throw new Error(`refreshing ${url.pathname}${url.search} answered ${res.status} ${res.headers.get('x-mecha-scope') ?? 'unscoped'}: its stale entry is dropped`)
@@ -262,7 +280,7 @@ export const edgeWorker = {
         const subjectKey = keyOf(version, reset, 'crud', claims.sub as string, String(lastOwnWrite), url.pathname + url.search)
         const subjectHit = await cache.match(subjectKey)
         if (subjectHit) return marked(subjectHit, 'hit')
-        const res = await object().fetch(req)
+        const res = entityRead ? await forwardRead(object, req) : await object().fetch(req)
         if (res.status !== 200) return marked(res, 'miss')
         const isPublic = res.headers.get('x-mecha-scope') === 'public'
         const stored = isPublic ? storedPublic(res) : new Response(res.body, res)
@@ -280,7 +298,7 @@ export const edgeWorker = {
         return res
       }
     }
-    return object().fetch(req)
+    return entityRead ? forwardRead(object, req) : object().fetch(req)
   },
 
   scheduled(_controller: ScheduledController, env: EdgeEnv): Promise<void> {

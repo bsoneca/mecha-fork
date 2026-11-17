@@ -1,5 +1,5 @@
 import { bindBoundary, typedSql } from '../../../services/compute/portable-contract.ts'
-import { snapshotStatements, type Snapshot } from '../../../services/compute/snapshot-data.ts'
+import { planReplicaTable, snapshotStatements, type ReplicaWatermark, type Snapshot } from '../../../services/compute/snapshot-data.ts'
 import { identity, programFor, type SnapshotProgram } from './snapshot-program.ts'
 
 interface Connection {
@@ -9,6 +9,8 @@ interface Connection {
 }
 export interface QueryDatabase { connect(): Connection }
 
+const replicas = new WeakMap<QueryDatabase, Map<string, ReplicaWatermark>>()
+
 /** The database is scratch space; only the coordinator owns publication authority. */
 export function snapshotQuery(db: QueryDatabase, programs: readonly SnapshotProgram[], snapshot: Snapshot) {
   const program = programFor(programs, snapshot)
@@ -16,19 +18,59 @@ export function snapshotQuery(db: QueryDatabase, programs: readonly SnapshotProg
   const conn = db.connect()
   let began = false
   try {
-    conn.query('BEGIN TRANSACTION')
-    began = true
-    for (const [index, table] of statements.entries()) {
-      conn.query(table.create)
-      const statement = conn.prepare(table.insert)
-      try {
-        // Bound JSON parsing work and avoid Emscripten's fixed argument stack.
-        const rows = snapshot.tables[program.reads[index]].rows
-        for (let offset = 0; offset < rows.length; offset += 32) {
-          statement.query(JSON.stringify(rows.slice(offset, offset + 32)))
-        }
+    if (snapshot.wal) {
+      let replicaState = replicas.get(db)
+      if (!replicaState) {
+        conn.query('CREATE SCHEMA IF NOT EXISTS duckpipe_replica')
+        replicaState = new Map()
+        replicas.set(db, replicaState)
       }
-      finally { statement.close() }
+      const pendingState = new Map<string, ReplicaWatermark>()
+      conn.query('BEGIN TRANSACTION')
+      began = true
+      for (const [index, name] of program.reads.entries()) {
+        const replicaPlan = planReplicaTable(
+          name,
+          snapshot.tables[name],
+          statements[index],
+          snapshot.wal[name],
+          program.spec.types,
+          replicaState.get(name),
+        )
+        for (const step of replicaPlan.steps) {
+          if (step.values.length) {
+            const statement = conn.prepare(step.sql)
+            try { statement.query(...step.values) }
+            finally { statement.close() }
+          } else {
+            conn.query(step.sql)
+          }
+        }
+        pendingState.set(name, replicaPlan.next)
+      }
+      conn.query('COMMIT')
+      began = false
+      for (const [name, next] of pendingState) replicaState.set(name, next)
+      conn.query('BEGIN TRANSACTION')
+      began = true
+      for (const name of program.reads) {
+        conn.query(`CREATE TEMP VIEW "${name}" AS SELECT * FROM "duckpipe_replica"."${name}"`)
+      }
+    } else {
+      conn.query('BEGIN TRANSACTION')
+      began = true
+      for (const [index, table] of statements.entries()) {
+        conn.query(table.create)
+        const statement = conn.prepare(table.insert)
+        try {
+          // Bound JSON parsing work and avoid Emscripten's fixed argument stack.
+          const rows = snapshot.tables[program.reads[index]].rows
+          for (let offset = 0; offset < rows.length; offset += 32) {
+            statement.query(JSON.stringify(rows.slice(offset, offset + 32)))
+          }
+        }
+        finally { statement.close() }
+      }
     }
     const inputs: Record<string, unknown[]> = {}
     for (const [name, sql] of Object.entries(program.queries)) {

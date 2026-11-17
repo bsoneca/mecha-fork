@@ -129,7 +129,7 @@ Deno.test({
     const body = await res.json();
     assertEquals(typeof body.challenge, "string");
     assertEquals(body.rp.id, "localhost");
-    assert(/^[a-z]+-[a-z]+-\d\d$/.test(body.user.name), `generated handle, got ${body.user.name}`);
+    assert(/^[a-z]+-[a-z]+-[0-9a-f]{4}$/.test(body.user.name), `generated handle, got ${body.user.name}`);
     assertEquals(body.authenticatorSelection.residentKey, "required");
     assert(Array.isArray(body.pubKeyCredParams) && body.pubKeyCredParams.length > 0);
     const st = await verifyJwt(body.state);
@@ -370,7 +370,7 @@ Deno.test({
     const res = await handler(post("/auth/guest", {}));
     assertEquals(res.status, 200);
     const body = await res.json();
-    assert(/^[a-z]+-[a-z]+-\d\d$/.test(body.user.handle), `generated handle, got ${body.user.handle}`);
+    assert(/^[a-z]+-[a-z]+-[0-9a-f]{4}$/.test(body.user.handle), `generated handle, got ${body.user.handle}`);
     const claims = await verifyJwt(body.token);
     assert(claims !== null);
     assertEquals(claims.role, "app_user");
@@ -1406,7 +1406,14 @@ Deno.test("a configured origin is exact, and only localhost stands for the dev d
   assert(ceremonyOrigin("https://localhost:*", null).endsWith("*"));
 });
 
-const alice = { provider: "google", issuer: "https://accounts.google.com", sub: "g-alice", name: "Alice", picture: null, email: "alice@mail.test" };
+const alice = {
+  provider: "google",
+  issuer: "https://accounts.google.com",
+  sub: "g-alice",
+  name: "Alice",
+  picture: null,
+  email: "alice@example.test",
+};
 
 Deno.test({
   name: "a provider's subject is one person, however many sign-ins race to make it",
@@ -1420,14 +1427,23 @@ Deno.test({
       assertEquals(new Set(racers.map((u) => u.id)).size, 1, sub);
     }
     const users = [await links.userFor(alice)];
-    const [link] = await sql`select user_id from mecha_auth.identity_link where provider = 'google' and sub = 'g-alice'`;
+    const [link] = await sql`select user_id, email from mecha_auth.identity_link where provider = 'google' and sub = 'g-alice'`;
     assertEquals(link.user_id, users[0].id);
-    await links.userFor({ ...alice, name: "Alice B." });
-    assertEquals((await sql`select name from mecha_auth.identity_link where sub = 'g-alice'`)[0].name, "Alice B.");
-    assertEquals((await sql`select email from mecha_auth.identity_link where sub = 'g-alice'`)[0].email, "alice@mail.test");
-    await links.userFor({ ...alice, email: null });
-    assertEquals((await sql`select email from mecha_auth.identity_link where sub = 'g-alice'`)[0].email, null, "the provider no longer vouches for one");
-    assertEquals(await links.handleOf("google", alice.issuer, users[0].id), users[0].handle);
+    assertEquals(link.email, "alice@example.test");
+    await links.userFor({ ...alice, name: "Alice B.", email: "alice.b@example.test" });
+    assertEquals((await sql`select name, email from mecha_auth.identity_link where sub = 'g-alice'`)[0], {
+      name: "Alice B.",
+      email: "alice.b@example.test",
+    });
+    assertEquals(await links.handleOf("google", alice.issuer, users[0].id), {
+      handle: users[0].handle,
+      name: "Alice B.",
+      email: "alice.b@example.test",
+    });
+    const token = await issueUserToken(users[0].id, users[0].handle, false, { name: "Alice B.", email: "alice.b@example.test" });
+    const who = await handler(new Request("http://auth:9999/auth/whoami", { headers: { authorization: `Bearer ${token}` } }));
+    assertEquals(who.status, 200);
+    assertEquals(await who.json(), { id: users[0].id, handle: users[0].handle, name: "Alice B.", email: "alice.b@example.test" });
   },
 });
 
@@ -1500,7 +1516,7 @@ Deno.test({
     const replacement = await links.userFor({ ...alice, issuer: "https://broker.test", sub: "pairwise-1" });
     assert(replacement.id !== guest.id);
     assertEquals(await links.handleOf("google", "https://broker.test", guest.id), null);
-    assertEquals(await links.handleOf("google", alice.issuer, guest.id), guest.handle);
+    assertEquals(await links.handleOf("google", alice.issuer, guest.id), { handle: guest.handle, name: null, email: null });
   },
 });
 

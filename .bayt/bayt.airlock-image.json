@@ -18,8 +18,12 @@
           "services/airlock/handler.ts",
           "services/airlock/cage.ts",
           "services/airlock/reentry.ts",
+          "services/airlock/read.ts",
           "services/airlock/blobs.ts",
+          "services/airlock/seal.ts",
+          "services/airlock/seal-tables.ts",
           "services/airlock/pdf.ts",
+          "services/airlock/xlsx.ts",
           "services/airlock/tsbifrost.ts",
           "services/airlock/ai-models.ts",
           "services/airlock/white-background.ts",
@@ -73,8 +77,12 @@
       "services/airlock/handler.ts",
       "services/airlock/cage.ts",
       "services/airlock/reentry.ts",
+      "services/airlock/read.ts",
       "services/airlock/blobs.ts",
+      "services/airlock/seal.ts",
+      "services/airlock/seal-tables.ts",
       "services/airlock/pdf.ts",
+      "services/airlock/xlsx.ts",
       "services/airlock/tsbifrost.ts",
       "services/airlock/ai-models.ts",
       "services/airlock/white-background.ts",
@@ -181,8 +189,12 @@
           "services/airlock/handler.ts",
           "services/airlock/cage.ts",
           "services/airlock/reentry.ts",
+          "services/airlock/read.ts",
           "services/airlock/blobs.ts",
+          "services/airlock/seal.ts",
+          "services/airlock/seal-tables.ts",
           "services/airlock/pdf.ts",
+          "services/airlock/xlsx.ts",
           "services/airlock/tsbifrost.ts",
           "services/airlock/ai-models.ts",
           "services/airlock/white-background.ts",
@@ -236,8 +248,12 @@
           "services/airlock/handler.ts",
           "services/airlock/cage.ts",
           "services/airlock/reentry.ts",
+          "services/airlock/read.ts",
           "services/airlock/blobs.ts",
+          "services/airlock/seal.ts",
+          "services/airlock/seal-tables.ts",
           "services/airlock/pdf.ts",
+          "services/airlock/xlsx.ts",
           "services/airlock/tsbifrost.ts",
           "services/airlock/ai-models.ts",
           "services/airlock/white-background.ts",
@@ -256,6 +272,7 @@
         "defaultGlobs": null,
         "defaultExclude": null
       },
+      "name": "deno-install",
       "dockerfile": {
         "do": "sh -c 'd=\"${DENO_DIR:-/root/.cache/deno}\"; s=/deno-store; k=\"$(sha256sum deno.lock */deno.lock */*/deno.lock deno.json */deno.json */*/deno.json package.json */package.json 2>/dev/null | sha256sum | cut -d'\\'' '\\'' -f1)\"; mkdir -p \"$d\" \"$s\"; for sub in remote npm jsr; do if [ -d \"$s/$k/$sub\" ]; then mkdir -p \"$d/$sub\" && cp -a \"$s/$k/$sub\"/. \"$d/$sub\"/ 2>/dev/null || true; fi; done; (deno install --frozen) || exit; t=\"$s/.tmp.$$\"; rm -rf \"$t\"; mkdir -p \"$t\"; for sub in remote npm jsr; do if [ -d \"$d/$sub\" ]; then mkdir -p \"$t/$sub\" && cp -a \"$d/$sub\"/. \"$t/$sub\"/ 2>/dev/null || true; fi; done; rm -rf \"$s/$k\" && mv \"$t\" \"$s/$k\" 2>/dev/null || rm -rf \"$t\"; find \"$s\" -mindepth 1 -maxdepth 1 ! -name \"$k\" -exec rm -rf {} + 2>/dev/null || true'",
         "mounts": [
@@ -268,7 +285,6 @@
         ],
         "shell": "sh"
       },
-      "name": "deno-install",
       "shell": "exec",
       "stop": false
     },
@@ -282,8 +298,12 @@
           "services/airlock/handler.ts",
           "services/airlock/cage.ts",
           "services/airlock/reentry.ts",
+          "services/airlock/read.ts",
           "services/airlock/blobs.ts",
+          "services/airlock/seal.ts",
+          "services/airlock/seal-tables.ts",
           "services/airlock/pdf.ts",
+          "services/airlock/xlsx.ts",
           "services/airlock/tsbifrost.ts",
           "services/airlock/ai-models.ts",
           "services/airlock/white-background.ts",
@@ -302,6 +322,7 @@
         "defaultGlobs": null,
         "defaultExclude": null
       },
+      "name": "deno-cache",
       "dockerfile": {
         "do": "sh -c 'd=\"${DENO_DIR:-/root/.cache/deno}\"; s=/deno-store; k=\"$(sha256sum deno.lock */deno.lock */*/deno.lock deno.json */deno.json */*/deno.json package.json */package.json 2>/dev/null | sha256sum | cut -d'\\'' '\\'' -f1)\"; mkdir -p \"$d\" \"$s\"; for sub in remote npm jsr; do if [ -d \"$s/$k/$sub\" ]; then mkdir -p \"$d/$sub\" && cp -a \"$s/$k/$sub\"/. \"$d/$sub\"/ 2>/dev/null || true; fi; done; (deno cache --frozen main.ts cage.ts tsbifrost.ts) || exit; t=\"$s/.tmp.$$\"; rm -rf \"$t\"; mkdir -p \"$t\"; for sub in remote npm jsr; do if [ -d \"$d/$sub\" ]; then mkdir -p \"$t/$sub\" && cp -a \"$d/$sub\"/. \"$t/$sub\"/ 2>/dev/null || true; fi; done; rm -rf \"$s/$k\" && mv \"$t\" \"$s/$k\" 2>/dev/null || rm -rf \"$t\"; find \"$s\" -mindepth 1 -maxdepth 1 ! -name \"$k\" -exec rm -rf {} + 2>/dev/null || true'",
         "mounts": [
@@ -314,7 +335,6 @@
         ],
         "shell": "sh"
       },
-      "name": "deno-cache",
       "shell": "exec",
       "stop": false
     }

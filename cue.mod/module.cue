@@ -8,7 +8,7 @@
 module: "github.com/bonisoft3/mecha@v0"
 
 language: {
-	version: "v0.16.1"
+	version: "v0.18.0"
 }
 
 source: {
@@ -24,7 +24,7 @@ source: {
 // this version falls behind.
 deps: {
 	"github.com/bonisoft3/bayt@v0": {
-		v:       "v0.71.0"
+		v:       "v0.72.3"
 		default: true
 	}
 }

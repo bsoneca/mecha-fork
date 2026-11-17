@@ -24,10 +24,13 @@ transactional inbox survives missed notifications. The coordinator never polls
 source tables to detect changes.
 
 Source triggers mark the inbox once per nonempty statement transition table,
-not once per row. Empty inserts, updates, deletes and conflict no-ops do not
-schedule work; truncation does. This keeps bulk publication from repeating
-the same table notification for every output row. Trigger installation replaces
-the older row triggers transactionally and removes triggers for retired sources.
+not once per row, and record transition-table row deltas (`'T'`, `'D'`, `'I'`)
+in `compute_snapshot_private.wal` alongside per-table watermarks in
+`compute_snapshot_private.table_watermarks`. Empty inserts, updates, deletes
+and conflict no-ops do not schedule work; truncation does. This keeps bulk
+publication from repeating the same table notification for every output row.
+Trigger installation replaces the older row triggers transactionally and removes
+triggers for retired sources.
 
 `wakeAt()` performs durable scheduling and returns an absolute millisecond
 deadline or null. It does not execute computations. `resume()` drains currently
@@ -36,11 +39,15 @@ due work and returns before future coalescing or retry deadlines. Repeated
 for that promise and prevents further execution; the host removes its listener
 and timer.
 
-Remote hosts may use `claim()`, `snapshot(identity)`, `publish(identity, output)`
-and `reject(identity, error)` without providing a local executor. `claim()` returns
-only the capture identity. `manifest(identity)` returns column types and row counts;
-`chunk(identity, table, after, limits)` exports retained rows using a stable numeric
-sequence cursor. `snapshot(identity)` assembles the same chunks for legacy hosts.
+Remote hosts may use `claim()`, `snapshot(identity)`, `wal(identity, afterLsn)`,
+`publish(identity, output)` and `reject(identity, error)` without providing a local
+executor. `claim()` returns only the capture identity. `manifest(identity)` returns
+column types and row counts; `chunk(identity, table, after, limits)` exports retained
+rows using a stable numeric sequence cursor. `wal(identity, afterLsn)` exports
+LSN-fenced transition-table deltas (`fromLsn`, `targetLsn`, `pkColumns`, `entries`)
+for incremental replica maintenance, and local `execute(snapshot)` receives the same
+delta map on `snapshot.wal`. `snapshot(identity)` assembles the same chunks for legacy
+hosts.
 Publication and rejection are fenced by the
 active claim; a rejection received after a committed receipt cannot change it.
 The Cloudflare host runs this protocol from a separate Durable Object and fences
@@ -147,6 +154,11 @@ staging. The executor owns its intermediate data and numerical working storage.
 Writes received while execution runs queue the following coalesced batch. They
 do not prevent the current immutable batch from publishing. A replaced version,
 obsolete claim, or existing receipt prevents a late response from publishing.
+If publication fails a foreign-key constraint and newer source input is waiting,
+the failed transaction rolls back before the coordinator supersedes the still-active
+capture. No sink writes or receipt survive; the next batch reads the newer input.
+This handles parents deleted while an immutable batch was running. Foreign-key
+failures without newer input, and all other publication errors, remain failures.
 Failures retry the identical capture with bounded backoff; after `maxAttempts`
 (default 25), the failure and capture remain recorded and that batch is excluded
 from runnable work. Each failed execution rejects explicitly; inspecting a deadline

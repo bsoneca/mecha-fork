@@ -25,7 +25,6 @@ import (
 
 	bayt "github.com/bonisoft3/bayt/core:bayt"
 	apt "github.com/bonisoft3/bayt/distros/apt"
-	zypper "github.com/bonisoft3/bayt/distros/zypper"
 	deno "github.com/bonisoft3/bayt/stacks/deno"
 	mise "github.com/bonisoft3/bayt/stacks/mise"
 	sayt "github.com/bonisoft3/bayt/stacks/sayt"
@@ -34,7 +33,8 @@ import (
 	pljs "github.com/bonisoft3/mecha/services/database/pljs"
 )
 
-_postgres: "postgres:18-trixie@sha256:073e7c8b84e2197f94c8083634640ab37105effe1bc853ca4d5fbece3219b0e8"
+_postgres: cluster.#PostgresImage
+_pgConfig: "/usr/lib/postgresql/\(cluster.#AppliancePostgres)/bin/pg_config"
 // The one pgroll in the repository: every migration a cluster is given runs
 // through it, and pgroll/pgroll_test.ts holds the grammar to its tag.
 _pgroll:  "ghcr.io/xataio/pgroll:v0.16.3@sha256:aca5425285691ed78079196c1629de039e7d7b795773b1ff63e1419d79dbd830"
@@ -145,7 +145,7 @@ _mecha: bayt.#project & _where & {
 		// ---- The images -------------------------------------------------
 
 		// pljs as `plv8` and pg_ivm for the docker appliance's PostgreSQL, which
-		// Leap ships without either, from the recipe the database image runs,
+		// PGDG ships without either, from the recipe the database image runs,
 		// against that server's own headers (cluster.#AppliancePostgres), built
 		// once for every app's appliance.
 		"extensions-build": {
@@ -155,24 +155,20 @@ _mecha: bayt.#project & _where & {
 			activate: ""
 			srcs: globs: ["services/database/pljs/pins.cue"]
 			dockerfile: bayt.nubox & {
-				defaultPreamble: "zypper-pg-extensions": (zypper.#install & {
-					pkgs: [
-						"postgresql18-server-devel=\(cluster.#AppliancePostgres)",
-						"gcc=15-160000.2.2",
-						"make=4.4.1-160000.3.2",
-						"git=2.51.0-160000.1.2",
-						"patch=2.7.6-160000.4.1",
-						"perl=5.42.0-160000.3.1",
-					]
-					then: list.Concat([
-						(pljs.#Build & {pgConfig: "/usr/lib/postgresql18/bin/pg_config", fetch: "curl -fsSL -o"}).steps,
-						[
-							"mkdir -p /pg-extensions/lib /pg-extensions/extension",
-							#"cp "$(/usr/lib/postgresql18/bin/pg_config --pkglibdir)/pljs.so" "$(/usr/lib/postgresql18/bin/pg_config --pkglibdir)/pg_ivm.so" /pg-extensions/lib/"#,
-							#"cp "$(/usr/lib/postgresql18/bin/pg_config --sharedir)"/extension/pljs* "$(/usr/lib/postgresql18/bin/pg_config --sharedir)"/extension/plv8* "$(/usr/lib/postgresql18/bin/pg_config --sharedir)"/extension/pg_ivm* /pg-extensions/extension/"#,
-						],
-					])
-				}).out
+				defaultPreamble: {
+					"pgdg": {priority: -6, line: cluster.#AppliancePgdg}
+					"pg-extensions": (apt.#install & {
+						pkgs: ["postgresql-server-dev-\(cluster.#AppliancePostgres)=\(cluster.#AppliancePostgres).*", "build-essential=12.12*", "patch=2.8-*"]
+						then: list.Concat([
+							(pljs.#Build & {pgConfig: _pgConfig, fetch: "curl -fsSL -o"}).steps,
+							[
+								"mkdir -p /pg-extensions/lib /pg-extensions/extension",
+								#"cp "$(\#(_pgConfig) --pkglibdir)/pljs.so" "$(\#(_pgConfig) --pkglibdir)/pg_ivm.so" /pg-extensions/lib/"#,
+								#"cp "$(\#(_pgConfig) --sharedir)"/extension/pljs* "$(\#(_pgConfig) --sharedir)"/extension/plv8* "$(\#(_pgConfig) --sharedir)"/extension/pg_ivm* /pg-extensions/extension/"#,
+							],
+						])
+					}).out
+				}
 			}
 		}
 		// What an appliance copies, its libraries and extension files
@@ -186,7 +182,7 @@ _mecha: bayt.#project & _where & {
 			}
 		}
 		"database-image": _image & {
-			srcs: globs: ["services/database/rls/rls.sql", "services/database/role_passwords.sh", "services/ticker/schedule.sql", "services/durex/graphile.sql", "services/airlock/airlock.sql", "services/migrate/migrate.sh"]
+			srcs: globs: ["services/database/rls/rls.sql", "services/database/role_passwords.sh", "services/ticker/schedule.sql", "services/durex/graphile.sql", "services/airlock/airlock.sql", "services/airlock/job_key.sql", "services/migrate/migrate.sh"]
 			dockerfile: {
 				from: name: _postgres
 				// QuickJS's pljs hosts the database's Jessie as the `plv8` language
@@ -194,7 +190,7 @@ _mecha: bayt.#project & _where & {
 				// same RUN as pg_ivm so its sources and toolchain leave no layer.
 				defaultPreamble: extensions: (apt.#install & {
 					pkgs: ["ca-certificates", "wget", "git", "build-essential", "postgresql-server-dev-18"]
-					then: (pljs.#Build & {pgConfig: "/usr/lib/postgresql/18/bin/pg_config"}).steps
+					then: (pljs.#Build & {pgConfig: _pgConfig}).steps
 					purge: ["wget", "git", "ca-certificates", "build-essential", "postgresql-server-dev-18"]
 				}).out
 				// The data directory lives on the container's writable layer.
@@ -214,6 +210,7 @@ _mecha: bayt.#project & _where & {
 					{srcs: ["services/ticker/schedule.sql"], dst: "\(cluster.#StagedDir)/\(cluster.#ScheduleMigration)"},
 					{srcs: ["services/durex/graphile.sql"], dst: "\(cluster.#StagedDir)/\(cluster.#GraphileMigration)"},
 					{srcs: ["services/airlock/airlock.sql"], dst: "\(cluster.#StagedDir)/\(cluster.#AirlockMigration)"},
+					{srcs: ["services/airlock/job_key.sql"], dst: "\(cluster.#StagedDir)/\(cluster.#JobKeyMigration)"},
 					{srcs: ["services/database/role_passwords.sh"], dst: "\(cluster.#StagedDir)/\(cluster.#RolePasswordsStep)"},
 					{from: {name: _pgroll}, srcs: ["/usr/bin/pgroll"], dst: "/usr/local/bin/pgroll"},
 					{srcs: ["services/migrate/migrate.sh"], dst: "/migrate.sh", chmod: "755"},
@@ -283,10 +280,10 @@ _mecha: bayt.#project & _where & {
 		// The extensions a computation's lake needs are installed at build: a
 		// running service reaches no extension host. Workers take no
 		// permissions of their own, an option Deno still calls unstable.
-		"compute-image": _image & (deno.#cache & {entrypoints: "main.ts cage.ts job.ts", frozen: false}).out & {
-			let _files = ["deno.json", "deno.lock", "main.ts", "feldera.ts", "portable.ts", "portable-contract.ts", "batches.ts", "batches.sql", "batch-machine.sql", "migrate-durex.ts", "publication.ts", "native-runtime.ts", "native-feldera.ts", "native-cleanup.ts", "native-sources.ts", "deltas.ts", "workers.ts", "query-stages.ts", "cage.ts", "compartment.ts", "realm.ts", "crypto.ts", "cheerio.ts", "endowments.ts", "language.ts", "job.ts", "job-cache.ts", "job-cache.sql", "wasi.ts", "install.ts", "events.yaml"]
-			// endowments.ts imports the Pdf endowment from its sibling, the airlock.
-			srcs: globs: list.Concat([[for f in _files {"services/compute/\(f)"}], ["services/airlock/pdf.ts", "services/durex/work.ts", "services/durex/work.sql", "services/durex/migrate.ts", "packages/client/src/types.ts", "packages/lake/src/lake-types.ts", "packages/compute-snapshot/src/sink-writes.ts"]])
+		"compute-image": _image & (deno.#cache & {entrypoints: "main.ts cage.ts job.ts step-worker.ts", frozen: false}).out & {
+			let _files = ["deno.json", "deno.lock", "main.ts", "feldera.ts", "portable.ts", "portable-contract.ts", "batches.ts", "batches.sql", "batch-machine.sql", "migrate-durex.ts", "publication.ts", "native-runtime.ts", "bounded-runtime.ts", "step-cage.ts", "step-worker.ts", "native-feldera.ts", "native-cleanup.ts", "native-sources.ts", "native-artifacts.ts", "native-artifacts-build.ts", "native-process.ts", "native-supervisor.c", "deltas.ts", "workers.ts", "query-stages.ts", "cage.ts", "compartment.ts", "realm.ts", "crypto.ts", "cheerio.ts", "endowments.ts", "language.ts", "job.ts", "job-cache.ts", "job-cache.sql", "wasi.ts", "install.ts", "events.yaml"]
+			// endowments.ts imports the Pdf and Xlsx endowments from its sibling, the airlock.
+			srcs: globs: list.Concat([[for f in _files {"services/compute/\(f)"}], ["services/airlock/pdf.ts", "services/airlock/xlsx.ts", "services/durex/work.ts", "services/durex/work.sql", "services/durex/migrate.ts", "packages/client/src/types.ts", "packages/lake/src/lake-types.ts", "packages/compute-snapshot/src/sink-writes.ts", "packages/compute-snapshot/src/bounded.ts", "packages/compute-snapshot/src/json.ts"]])
 			cmd: "duckdb": (deno.#duckdbContainerCmd & {
 				do: "deno run --allow-ffi --allow-read --allow-write --allow-net --allow-env --allow-sys=homedir install.ts"
 			}).out
@@ -295,19 +292,19 @@ _mecha: bayt.#project & _where & {
 				workdir: "/app"
 				copy: [
 					{srcs: [for f in _files {"services/compute/\(f)"}], dst: "/app/"},
-					{srcs: ["services/airlock/pdf.ts"], dst: "/airlock/"},
+					{srcs: ["services/airlock/pdf.ts", "services/airlock/xlsx.ts"], dst: "/airlock/"},
 					{srcs: ["services/durex/work.ts", "services/durex/work.sql", "services/durex/migrate.ts"], dst: "/durex/"},
 					{srcs: ["packages/client/src/types.ts"], dst: "/packages/client/src/"},
 					{srcs: ["packages/lake/src/lake-types.ts"], dst: "/packages/lake/src/"},
-					{srcs: ["packages/compute-snapshot/src/sink-writes.ts"], dst: "/packages/compute-snapshot/src/"},
+					{srcs: ["packages/compute-snapshot/src/sink-writes.ts", "packages/compute-snapshot/src/bounded.ts", "packages/compute-snapshot/src/json.ts"], dst: "/packages/compute-snapshot/src/"},
 				]
-				cmd: ["run", "--unstable-worker-options", "--allow-ffi", "--allow-read", "--allow-write", "--allow-net", "--allow-env", "--allow-sys", "/app/main.ts"]
+				cmd: ["run", "--unstable-worker-options", "--allow-run=/opt/feldera/runtime/supervisor", "--allow-ffi", "--allow-read", "--allow-write", "--allow-net", "--allow-env", "--allow-sys", "/app/main.ts"]
 			}
 		}
 		"activepieces-image": (activepieces.#Target & {source: "services/activepieces"}).target
 		// The handler cage imports compute's realm through its sibling directory.
 		"airlock-image": _image & (deno.#cache & {entrypoints: "main.ts cage.ts tsbifrost.ts"}).out & {
-			let _airlock = ["deno.json", "deno.lock", "main.ts", "airlock.ts", "handler.ts", "cage.ts", "reentry.ts", "blobs.ts", "pdf.ts", "tsbifrost.ts", "ai-models.ts", "white-background.ts", "package.json", "dapr.yaml"]
+			let _airlock = ["deno.json", "deno.lock", "main.ts", "airlock.ts", "handler.ts", "cage.ts", "reentry.ts", "read.ts", "blobs.ts", "seal.ts", "seal-tables.ts", "pdf.ts", "xlsx.ts", "tsbifrost.ts", "ai-models.ts", "white-background.ts", "package.json", "dapr.yaml"]
 			let _compute = ["compartment.ts", "realm.ts", "crypto.ts", "cheerio.ts", "endowments.ts", "language.ts", "workers.ts", "query-stages.ts"]
 			srcs: globs: list.Concat([[for f in _airlock {"services/airlock/\(f)"}], [for f in _compute {"services/compute/\(f)"}]])
 			cmd: "deno-install": (deno.#containerCmd & {
