@@ -502,7 +502,7 @@ Deno.test({
     const claims = await verifyJwt(res.body.token);
     assert(claims !== null, "signed with the key every reader verifies");
     const { exp: _, ...rest } = claims;
-    assertEquals(rest, { role: "app_user", sub: guest.user.id, handle: guest.user.handle, guest: true, ...operation });
+    assertEquals(rest, { iss: "mecha:stack", role: "app_user", sub: guest.user.id, handle: guest.user.handle, guest: true, ...operation });
     // whoami reads it as the same person.
     const who = await handler(new Request("http://auth:9999/auth/whoami", { headers: { authorization: `Bearer ${res.body.token}` } }));
     assertEquals(await who.json(), { id: guest.user.id, handle: guest.user.handle });

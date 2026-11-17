@@ -693,6 +693,19 @@ BEGIN
     RAISE EXCEPTION '72 a key token with no scopes read';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
+  -- Where the app declares a token role, a key's token names the stack's issuer
+  -- (services/auth's exchangeKey) and passes; one naming none is refused.
+  INSERT INTO mecha.token_role VALUES ('_f_bot');
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","kid":"k1","scp":["read"]}', true);
+  PERFORM set_config('request.method', 'GET', true);
+  PERFORM app_pre_request();
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1","scp":["read"]}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '73 a key token naming no issuer passed where a token role exists';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  DELETE FROM mecha.token_role WHERE role_name = '_f_bot';
   PERFORM set_config('request.jwt.claims', '{"sub":"ana"}', true);
   PERFORM set_config('request.method', 'DELETE', true);
   PERFORM set_config('request.path', '/_f_public', true);
@@ -700,7 +713,7 @@ BEGIN
   PERFORM set_config('request.method', 'GET', true);
   PERFORM set_config('response.headers', '', true);
 
-  RAISE WARNING 'rls: 72/72 pass';
+  RAISE WARNING 'rls: 73/73 pass';
 END $$;
 
 DROP TABLE _f_posting, _f_note, _f_denied;

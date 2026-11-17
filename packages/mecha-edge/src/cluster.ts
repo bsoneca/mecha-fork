@@ -294,7 +294,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
        FROM app_user u WHERE u.id = $1`, [sub]))
     if (!u) return json(404, { error: 'no such user' })
     if (u.promoted) return json(409, { error: 'already an account' })
-    const token = await signJwt(secret, { role: 'app_user', sub, handle: u.handle, guest: true, exp: now() + USER_TOKEN_TTL_S })
+    const token = await signJwt(secret, { iss: STACK_ISSUER, role: 'app_user', sub, handle: u.handle, guest: true, exp: now() + USER_TOKEN_TTL_S })
     return json(200, { token, user: { id: sub, handle: u.handle, guest: true } })
   }
 
@@ -644,7 +644,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     u.pathname = u.pathname.replace(/^\/crud/, '')
     const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : await req.arrayBuffer()
     const inner = new Request(u, { method: req.method, headers: req.headers, body })
-    return serialize(() => createRestHandler(db, { role: 'service', scopes: () => [], claims: () => ({ role: 'service' }) }, cfg.schema)(inner))
+    return serialize(() => createRestHandler(db, { role: 'service', scopes: () => [], claims: () => ({ iss: STACK_ISSUER, role: 'service' }) }, cfg.schema)(inner))
   }
 
   async function handle(req: Request): Promise<Response> {

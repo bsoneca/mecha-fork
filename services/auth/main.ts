@@ -933,6 +933,7 @@ async function exchangeKey(req: Request): Promise<Response> {
   const hook = keyExchangedHook();
   if (hook !== null) await sql.unsafe(`select ${hook}($1::uuid)`, [k.owner]);
   const token = await signJwt({
+    iss: STACK_ISSUER,
     role: "app_user",
     sub: k.owner,
     handle: k.handle,
@@ -1021,6 +1022,7 @@ async function upgrade(req: Request): Promise<Response> {
   if (exp < now + UPGRADE_MIN_TTL_S) return jsonError(400, `the upgraded token would end within ${UPGRADE_MIN_TTL_S}s`);
   const asked = body.claims as Record<string, unknown>;
   const token = await signJwt({
+    iss: STACK_ISSUER,
     role: session.role,
     sub: session.sub,
     ...(Object.hasOwn(session, "handle") ? { handle: session.handle } : {}),
@@ -1089,6 +1091,14 @@ async function studioSignIn(req: Request, ip: string): Promise<Response> {
     const [row] = await tx`insert into mecha_auth.studio_jti (jti, exp) values (${jti}, to_timestamp(${exp}))
       on conflict (jti) do nothing returning jti`;
     if (row === undefined) return { err: "replay" as const };
+    // A play token signs a player in; it never takes a native account (one with a passkey or a provider's
+    // link): the token is not spent and nothing is renamed.
+    const [native] = await tx`select 1 from mecha_auth.webauthn_credential where user_id = ${sub}
+      union all select 1 from mecha_auth.identity_link where user_id = ${sub} limit 1`;
+    if (native !== undefined) {
+      await tx`delete from mecha_auth.studio_jti where jti = ${jti}`;
+      return { err: "native" as const };
+    }
     // A handle another account holds: the player takes it with the first 8 of their id after it, once. The
     // savepoints keep the attempt atomic with the jti; past both, nothing is made and the token is not spent.
     const upsert = (h: string) =>
@@ -1110,6 +1120,7 @@ async function studioSignIn(req: Request, ip: string): Promise<Response> {
     return { handle: taken };
   });
   if ("err" in spent && spent.err === "replay") return json(409, { error: "replay", reason: "replay" });
+  if ("err" in spent && spent.err === "native") return json(409, { error: "native account", reason: "native_account" });
   if ("err" in spent) return json(409, { error: "handle taken", reason: "handle_taken" });
   const token = await issueUserToken(sub, spent.handle, false, undefined, STUDIO_TOKEN_TTL_S);
   return json(200, { token, user: { id: sub, handle: spent.handle, guest: false } });
