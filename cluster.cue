@@ -1336,16 +1336,16 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 						// renderer behind the door), reached on this machine as
 						// PRONTO_UPSTREAM_<NAME>, as the cluster's own are. A peer
 						// that is itself a bayt target exposing http is addressed
-						// through bayt (host: "127.0.0.1" pins it to loopback, since
-						// the peer runs on the host, not as a container bayt would
-						// otherwise dial by name) — its host port may be reallocated
-						// (docs/proxy.md) and the literal below would then dial
-						// nothing. A peer that names no such target keeps the
-						// literal: bayt has no port of its own to resolve for it.
+						// through bayt, which resolves it to loopback at its
+						// (possibly reallocated) host port under process-compose
+						// and to the peer's service name under docker compose,
+						// where the door and the peer are separate containers; a
+						// peer that names no such target keeps the literal, bayt
+						// having no port of its own to resolve for it.
 						for p in X.meta.hostPeers {
 							let _n = strings.Split(p, "=")
 							"PRONTO_UPSTREAM_\(strings.Replace(strings.ToUpper(_n[0]), "-", "_", -1))": [
-								if X.surface.targets[_n[0]].expose.http != _|_ {{peer: _n[0], port: "http", host: "127.0.0.1"}},
+								if X.surface.targets[_n[0]].expose.http != _|_ {{peer: _n[0], port: "http"}},
 								"127.0.0.1:\(_n[1])",
 							][0]
 						}

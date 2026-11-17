@@ -1138,10 +1138,11 @@ const hostPeerUpstream = async (hostPeers: string[], targets: Record<string, unk
 
 Deno.test("a host peer that is a bayt target exposing http reaches it through bayt's own port, not the caller's stale literal", async () => {
   // The caller wrote hostPeers with the port it saw (9999); the target's real expose port is 4000 (as bayt knows
-  // it today). Before the fix this stayed "127.0.0.1:9999" — the literal, wrong once the port moved.
+  // it today). Under docker compose the door and the peer are separate containers, so bayt resolves the peer
+  // by its service name at the published port — not the stale literal, and not loopback.
   const resolved = await hostPeerUpstream(["renderer=9999"], { renderer: { expose: { http: { port: 4000, env: "PORT" } } } });
   assert.equal(resolved.ok, true, resolved.stderr);
-  assert.equal(resolved.value.PRONTO_UPSTREAM_RENDERER, "127.0.0.1:4000");
+  assert.equal(resolved.value.PRONTO_UPSTREAM_RENDERER, "renderer:4000");
 
   // A peer naming no bayt target (a process bayt knows nothing about) keeps the literal the caller gave.
   const literal = await hostPeerUpstream(["sidecar=4001"]);
@@ -1151,10 +1152,10 @@ Deno.test("a host peer that is a bayt target exposing http reaches it through ba
 
 // The test above checks the ref cluster.cue hands bayt; this one runs bayt's own renderers
 // (gen_process_compose.cue, gen_compose.cue) on that exact ref end to end
-// (host_peer_process_compose_check.cue), since process-compose — not compose — is where a
-// reallocated host port actually bit (the door dialled a dead one under bayt 0.71's
-// local-launch port assignment).
-Deno.test("bayt's own renderer resolves a host-target peer to its host port var in process-compose, and to the published port in compose", async () => {
+// (host_peer_process_compose_check.cue): under process-compose the peer resolves
+// to loopback at its (possibly reallocated) host port var, and under docker compose
+// the peer resolves to its service name at the port bayt publishes.
+Deno.test("bayt resolves a host-target peer to its host port var in process-compose, and to the peer's service name at its port in compose", async () => {
   const pc = await evaluated("#_hostPeerProcessCompose");
   assert.equal(pc.ok, true, pc.stderr);
   assert.match(pc.value.find((e: string) => e.startsWith("PRONTO_UPSTREAM_RENDERER=")), /^PRONTO_UPSTREAM_RENDERER=127\.0\.0\.1:\$\{RENDERER_HTTP_PORT:-\d+\}$/);
@@ -1162,5 +1163,5 @@ Deno.test("bayt's own renderer resolves a host-target peer to its host port var 
 
   const dc = await evaluated("#_hostPeerDockerCompose");
   assert.equal(dc.ok, true, dc.stderr);
-  assert.deepEqual(dc.value, { PRONTO_UPSTREAM_RENDERER: "127.0.0.1:9100", PRONTO_UPSTREAM_SIDECAR: "127.0.0.1:4001" });
+  assert.deepEqual(dc.value, { PRONTO_UPSTREAM_RENDERER: "renderer:9100", PRONTO_UPSTREAM_SIDECAR: "127.0.0.1:4001" });
 });

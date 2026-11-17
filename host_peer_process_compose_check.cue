@@ -20,7 +20,7 @@ _hostPeerProject: bayt.#project & {
 				env: {
 					// The exact two shapes doorOwn's hostPeers loop emits: a peer
 					// that is a bayt target exposing http, and one that is not.
-					PRONTO_UPSTREAM_RENDERER: {peer: "renderer", port: "http", host: "127.0.0.1"}
+					PRONTO_UPSTREAM_RENDERER: {peer: "renderer", port: "http"}
 					PRONTO_UPSTREAM_SIDECAR:  "127.0.0.1:4001"
 				}
 			}
