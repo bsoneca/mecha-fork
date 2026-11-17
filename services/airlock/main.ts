@@ -25,8 +25,9 @@ if (import.meta.main) {
   const mesh = required("MESH_URL");
   const dir = required("AIRLOCK_DIR");
   const { effects, handlers } = await admitAll(`${dir}/effects.json`, dir);
-  const doors = parseDoors(await Deno.readTextFile(`${dir}/effects.json`), effects);
   const reads = parseReads(await Deno.readTextFile(`${dir}/effects.json`));
+  // A door's name is the binding's, as an effect's and a read's are.
+  const doors = parseDoors(await Deno.readTextFile(`${dir}/effects.json`), { ...effects, ...reads });
   // Where a bridge names its targets, the release names this one.
   const target = Object.values(effects).some((e) => e.bridge !== undefined) ? required("AIRLOCK_TARGET") : undefined;
   // Read once here and handed to the handler at each call; written nowhere, not

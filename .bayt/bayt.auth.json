@@ -9,6 +9,7 @@
       "PGRST_JWT_SECRET": "${PGRST_JWT_SECRET:-mecha-dev-secret-please-override-32ch}",
       "WEBAUTHN_RP_ID": "${WEBAUTHN_RP_ID:-localhost}",
       "WEBAUTHN_ORIGIN": "${WEBAUTHN_ORIGIN:-https://localhost:*}",
+      "WEBAUTHN_ANDROID_ORIGINS": "${WEBAUTHN_ANDROID_ORIGINS:-}",
       "OIDC_PROVIDERS": ""
     },
     "ports": [],
@@ -74,6 +75,7 @@
       "PGRST_JWT_SECRET": "${PGRST_JWT_SECRET:-mecha-dev-secret-please-override-32ch}",
       "WEBAUTHN_RP_ID": "${WEBAUTHN_RP_ID:-localhost}",
       "WEBAUTHN_ORIGIN": "${WEBAUTHN_ORIGIN:-https://localhost:*}",
+      "WEBAUTHN_ANDROID_ORIGINS": "${WEBAUTHN_ANDROID_ORIGINS:-}",
       "OIDC_PROVIDERS": ""
     },
     "after": {
@@ -195,6 +197,7 @@
           "services/auth/jwt.ts",
           "services/auth/main.ts",
           "services/auth/oidc.ts",
+          "services/auth/origins.ts",
           "services/auth/schema.ts"
         ],
         "exclude": []
@@ -217,6 +220,7 @@
               "services/auth/jwt.ts",
               "services/auth/main.ts",
               "services/auth/oidc.ts",
+              "services/auth/origins.ts",
               "services/auth/schema.ts"
             ],
             "exclude": []

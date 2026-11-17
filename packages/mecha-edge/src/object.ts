@@ -147,15 +147,9 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
           const v = (this.env as unknown as Record<string, unknown>)[name]
           return typeof v === 'string' ? v : undefined
         }
-        const configuredProviders = (env('OIDC_PROVIDERS') ?? '')
-          .split(',')
-          .map((s) => s.trim())
-          .filter((name) => name !== '' && Boolean(env(`OIDC_${name.toUpperCase()}_CLIENT_ID`) || env(`OIDC_${name.toUpperCase()}_ISSUER`)))
-          .join(',')
         // A provider that cannot be signed in through refuses the boot, as it
         // refuses the auth service's start.
         const providers = providersFrom((name) => {
-          if (name === 'OIDC_PROVIDERS') return configuredProviders
           if (/^OIDC_[A-Z0-9]+_CLIENT_ID$/.test(name)) return env(name) ?? (env(name.replace(/_CLIENT_ID$/, '_ISSUER')) ? 'origin' : undefined)
           if (/^OIDC_[A-Z0-9]+_AUTHORIZE_PARAMS$/.test(name)) {
             const p = name.slice('OIDC_'.length, -'_AUTHORIZE_PARAMS'.length).toLowerCase()

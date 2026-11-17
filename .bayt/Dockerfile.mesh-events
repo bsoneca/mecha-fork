@@ -37,6 +37,16 @@ spec:
       value: "5"
     - name: concurrency
       value: "1"
+    # cdc-events carries every captured change of every table (docs/change-capture.md), and the redis the cluster
+    # runs has no persistence and no maxmemory (--save '' --appendonly no), so an unbounded stream grows until the
+    # host is out of memory, whatever the consumers do. Each publish trims it to about this many entries (Dapr
+    # XADDs with MAXLEN ~): 100000 entries are some 100 to 300 MB at a row's size, and hold about 30 minutes of a
+    # stack making 50 changes a second, or the better part of a day at a quiet one's few. A consumer that lags
+    # further than that, as one replaying a refused entry forever does, loses its oldest entries (the group's
+    # last-delivered id falls off the stream's head) rather than the host; the cap is the budget for the slowest
+    # consumer's lag.
+    - name: maxLenApprox
+      value: "100000"
 auth:
   secretStore: env
 

@@ -2084,7 +2084,14 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 						start_interval: "500ms"
 						start_period:   "30s"
 					}
-					expose: tcp: {port: 9997, env: "PORT"}
+					// The doors' listener (services/airlock/main.ts), opened where
+					// effects.json declares a door and reached only by its declared
+					// callers, over the networks below; the host launch is given a free
+					// port as for the health port.
+					expose: {
+						tcp:  {port: 9997, env: "PORT"}
+						door: {port: 9998, env: "DOOR_PORT"}
+					}
 					entrypoint: {
 						shell: "nu"
 						do: strings.Join(list.Concat([
@@ -2139,10 +2146,10 @@ _devAuthenticatorPassword: "dev-authenticator-password"
 							[for e in X._effects if e.handler != _|_ {srcs: [e.handler], dst: "/airlock/effects/\(e.name).js"}],
 						])
 						// Its own reach, besides the network's: the database, its
-						// daprd and the health port. Reads are unscoped because Graphile's
+						// daprd, the health port and the doors' port. Reads are unscoped because Graphile's
 						// config search stats every directory up to `/`. A handler
 						// runs in a worker with no permissions at all (handler.ts).
-						cmd: ["run", "--frozen", "--unstable-worker-options", "--allow-net=database:5432,airlock-mesh:3500,0.0.0.0:9997", "--allow-read", "--allow-env", "--allow-sys", "main.ts"]
+						cmd: ["run", "--frozen", "--unstable-worker-options", "--allow-net=database:5432,airlock-mesh:3500,0.0.0.0:9997,0.0.0.0:9998", "--allow-read", "--allow-env", "--allow-sys", "main.ts"]
 					}
 					compose: {
 						environment: AIRLOCK_DIR: "/airlock"

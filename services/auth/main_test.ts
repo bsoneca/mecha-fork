@@ -461,7 +461,7 @@ Deno.test({
   ...opts,
   async fn() {
     const guest = await (await handler(post("/auth/guest", {}))).json();
-    for (const k of ["role", "sub", "handle", "guest"]) {
+    for (const k of ["role", "sub", "handle", "guest", "name", "email"]) {
       const res = await upgraded(upgradeOf(guest.token, { claims: { ...operation, [k]: "x" } }));
       assertEquals(res.status, 400, k);
       assertStringIncludes(res.body.error, `${k} is the session's own`);
@@ -509,6 +509,11 @@ Deno.test({
     // An account's session stays an account's.
     const account = await upgraded(upgradeOf(await issueUserToken(guest.user.id, guest.user.handle)));
     assertEquals((await verifyJwt(account.body.token))?.guest, false);
+    // A name and an email the session carries (a provider sign-in's) are kept, and only when it has them.
+    const named = await upgraded(upgradeOf(await issueUserToken(guest.user.id, guest.user.handle, false, { name: "Ana", email: "ana@example.test" })));
+    const kept = await verifyJwt(named.body.token);
+    assertEquals([kept?.name, kept?.email], ["Ana", "ana@example.test"]);
+    assert(!Object.hasOwn((await verifyJwt(account.body.token))!, "name") && !Object.hasOwn((await verifyJwt(account.body.token))!, "email"));
   },
 });
 
@@ -652,6 +657,29 @@ Deno.test({
     assertEquals((await verifyJwt(body.token))!.exp, t + 120);
     assert(body.expires_in <= 120);
     assert(userToken !== up);
+  },
+});
+
+// A key's token reaches what its scopes grant; a shape is a read, so only a key with `read` mints one.
+Deno.test({
+  name: "a key without read mints no shape token, and one with read does",
+  ...opts,
+  async fn() {
+    const { uid } = await mint("scoped_article");
+    const shapeAs = async (scp: unknown) => {
+      const token = await signJwt({ iss: STACK_ISSUER, role: "app_user", sub: uid, handle: "x", guest: false, kid: crypto.randomUUID(), ...(scp === undefined ? {} : { scp }), exp: nowS() + 600 });
+      return await handler(new Request("http://auth:9999/auth/shape", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ table: "scoped_article" }),
+      }));
+    };
+    for (const scp of [["write"], [], undefined, "read"]) {
+      const res = await shapeAs(scp);
+      assertEquals(res.status, 403, JSON.stringify(scp));
+      assertStringIncludes((await res.json()).error, "do not allow a read");
+    }
+    assertEquals((await shapeAs(["read", "write"])).status, 200);
   },
 });
 

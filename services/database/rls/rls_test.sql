@@ -661,7 +661,7 @@ BEGIN
   -- A token an API key minted reaches only its scopes (services/auth, kid and
   -- scp): a read needs `read`, a write or a call `write`, a check outside any
   -- request `read`; a session's token, with no kid, is untouched.
-  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1","scp":["read"]}', true);
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","kid":"k1","scp":["read"]}', true);
   PERFORM set_config('request.method', 'GET', true);
   PERFORM app_pre_request();
   PERFORM set_config('request.method', 'PATCH', true);
@@ -670,7 +670,7 @@ BEGIN
     RAISE EXCEPTION '72 a read-only key wrote';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
-  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1","scp":["write","machines:match"]}', true);
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","kid":"k1","scp":["write","machines:match"]}', true);
   PERFORM set_config('request.method', 'POST', true);
   PERFORM set_config('request.path', '/rpc/_f_call', true);
   PERFORM app_pre_request();
@@ -686,13 +686,20 @@ BEGIN
     RAISE EXCEPTION '74 a key without read passed a check outside a request';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
-  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1"}', true);
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","kid":"k1"}', true);
   PERFORM set_config('request.method', 'GET', true);
   BEGIN
     PERFORM app_pre_request();
     RAISE EXCEPTION '75 a key token with no scopes read';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
+  -- The gate is the stack's own keys': a trusted issuer's token that happens
+  -- to name a `kid`, with no `scp`, is that issuer's and passes.
+  INSERT INTO mecha.token_role VALUES (current_user);
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":"https://id.example","aud":"https://app.example/crud","kid":"k9"}', true);
+  PERFORM set_config('request.method', 'GET', true);
+  PERFORM app_pre_request();
+  DELETE FROM mecha.token_role WHERE role_name = current_user;
   PERFORM set_config('request.jwt.claims', '{"sub":"ana"}', true);
   PERFORM set_config('request.method', 'DELETE', true);
   PERFORM set_config('request.path', '/_f_public', true);
@@ -700,7 +707,7 @@ BEGIN
   PERFORM set_config('request.method', 'GET', true);
   PERFORM set_config('response.headers', '', true);
 
-  RAISE WARNING 'rls: 75/75 pass';
+  RAISE WARNING 'rls: 76/76 pass';
 END $$;
 
 DROP TABLE _f_posting, _f_note, _f_denied;

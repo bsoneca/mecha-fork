@@ -22,7 +22,7 @@
 //
 // Pure but for what Config hands it — the origin, the links, the network — so
 // oidc_test.ts drives every refusal against a provider of its own.
-import { decodeBase64Url, encodeBase64Url, signJwt, verifyJwt } from "./jwt.ts";
+import { decodeBase64Url, encodeBase64Url, signJwt, STACK_ISSUER, verifyJwt } from "./jwt.ts";
 
 export const PREFIX = "/auth/oidc";
 // Over https the session and state cookies are __Host-: host-only, Secure and Path=/, so a sibling
@@ -370,7 +370,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     const guest = cfg.guestOf === undefined ? null : await cfg.guestOf(req);
     if (guest === null) return refuse(401, "not a guest");
     const door = cfg.origin(req);
-    const token = await signJwt(cfg.secret, { purpose: "oidc-guest", sub: guest.id, exp: now() + STATE_TTL_S });
+    const token = await signJwt(cfg.secret, { iss: STACK_ISSUER, purpose: "oidc-guest", sub: guest.id, exp: now() + STATE_TTL_S });
     return new Response(null, { status: 204, headers: { "set-cookie": guestCookie(door, token, STATE_TTL_S), "cache-control": "no-store" } });
   }
 
@@ -454,6 +454,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
       // The system browser is not the app: it keeps no session, and the app's
       // link back carries a code only the app's secret redeems.
       const handoff = await signJwt(cfg.secret, {
+        iss: STACK_ISSUER,
         purpose: "oidc-handoff",
         provider: name,
         issuer: p.issuer,

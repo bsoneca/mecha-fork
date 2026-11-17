@@ -346,6 +346,11 @@ async function subjectOf(req: Request): Promise<Subject> {
 async function shapeToken(req: Request): Promise<Response> {
   const subject = await subjectOf(req);
   if (subject === "refused" || subject.claims === null) return jsonError(401, "invalid token");
+  // An API key's token reaches what its scopes grant (rls.sql's app_pre_request): a shape
+  // is a read, so a key without `read` mints none.
+  if (subject.claims.kid !== undefined && !(Array.isArray(subject.claims.scp) && subject.claims.scp.includes("read"))) {
+    return jsonError(403, "this API key's scopes do not allow a read");
+  }
   const sub = subject.claims.sub as string;
   const body = await readBody(req);
   if (!body || !validTable(body.table)) return jsonError(400, "table required");
@@ -938,7 +943,7 @@ async function exchangeKey(req: Request): Promise<Response> {
 /** The claims an upgrade adds, all of them, and nothing else. */
 const UPGRADE_CLAIMS = ["operation_kind", "operation_id", "amr", "idp"];
 /** A session's own claims, kept from the token upgraded and never asked for. */
-const SESSION_CLAIMS = ["role", "sub", "handle", "guest"];
+const SESSION_CLAIMS = ["role", "sub", "handle", "guest", "name", "email"];
 /**
  * Whether claims are an upgraded session's. One is scoped to an operation and capped: it mints
  * nothing that outlives it (a passkey, an API key, a guest's promotion or adoption, a refresh).
@@ -1007,6 +1012,8 @@ async function upgrade(req: Request): Promise<Response> {
     sub: session.sub,
     ...(Object.hasOwn(session, "handle") ? { handle: session.handle } : {}),
     ...(Object.hasOwn(session, "guest") ? { guest: session.guest } : {}),
+    ...(Object.hasOwn(session, "name") ? { name: session.name } : {}),
+    ...(Object.hasOwn(session, "email") ? { email: session.email } : {}),
     operation_kind: asked.operation_kind,
     operation_id: asked.operation_id,
     amr: asked.amr,

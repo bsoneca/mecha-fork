@@ -5,6 +5,7 @@
 import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { type Door, type DoorLedger, parseDoors, pass, Refused, request, serveDoors } from "./door.ts";
 import { meshTransport, type Transport } from "./handler.ts";
+import { parseReads, type Read } from "./read.ts";
 
 const stripe: Door = {
   idempotent: true,
@@ -160,6 +161,11 @@ Deno.test("the manifest's doors are checked", () => {
   assertThrows(doors({ stripe: { ...stripe, callers: [] } }), Error, "callers");
   assertThrows(doors({ stripe: { ...stripe, credential: { header: "Content-Type", secret: "K" } } }), Error, "credential");
   assertThrows(doors({ stripe }, { stripe: {} }), Error, "same name");
+  // A read's name is a binding's too: main.ts hands parseDoors the effects and the reads together.
+  const rate: Read = { request: { method: "GET", path: "/rates/{currency}" }, invoke: { table: "expense", field: "status", state: "pricing", onDone: "priced", onError: "unpriced", row: ["id"], count: "pricings", incarnation: "lineage" } };
+  const reads = parseReads(JSON.stringify({ effects: {}, reads: { rate } }));
+  assertThrows(doors({ rate: stripe }, { ...reads }), Error, "same name");
+  assertEquals(Object.keys(doors({ stripe }, { ...reads })()), ["stripe"]);
 });
 
 Deno.test("the door's HTTP answers 200, 400, 404 and 502", async () => {

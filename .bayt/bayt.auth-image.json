@@ -16,6 +16,7 @@
           "services/auth/jwt.ts",
           "services/auth/main.ts",
           "services/auth/oidc.ts",
+          "services/auth/origins.ts",
           "services/auth/schema.ts"
         ],
         "dst": "/app/",
@@ -53,6 +54,7 @@
       "services/auth/jwt.ts",
       "services/auth/main.ts",
       "services/auth/oidc.ts",
+      "services/auth/origins.ts",
       "services/auth/schema.ts"
     ],
     "exclude": []
@@ -145,6 +147,7 @@
           "services/auth/jwt.ts",
           "services/auth/main.ts",
           "services/auth/oidc.ts",
+          "services/auth/origins.ts",
           "services/auth/schema.ts"
         ],
         "exclude": []
@@ -184,6 +187,7 @@
           "services/auth/jwt.ts",
           "services/auth/main.ts",
           "services/auth/oidc.ts",
+          "services/auth/origins.ts",
           "services/auth/schema.ts"
         ],
         "exclude": [],
