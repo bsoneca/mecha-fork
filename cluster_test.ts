@@ -10,7 +10,7 @@ import { ENDOWABLE } from "./services/compute/language.ts";
 const MECHA = fileURLToPath(new URL(".", import.meta.url));
 
 type Effect = { name: string; origin?: string; bridge?: string; ai?: "text" | "image"; tier?: "cheap" | "heavy"; handler?: string; endpoint?: string; secrets?: string[]; simulated?: true };
-type Bridge = { name: string; container: string; port?: number; action?: string; targets?: string[]; simulator?: Record<string, unknown>; appliance?: Record<string, unknown> };
+type Bridge = { name: string; container: string; port?: number; action?: string; targets?: string[]; instance_type?: string; simulator?: Record<string, unknown>; appliance?: Record<string, unknown> };
 type State = {
   migrations: string[];
   pipelines: { name: string; file: string }[];
@@ -133,6 +133,7 @@ Deno.test("compute configuration carries only declared completion RPCs and refus
     const refused = await exported({ computations: [{ ...computation, onComplete }] }, field);
     assert.equal(refused.ok, false, onComplete);
     assert.match(refused.stderr, /onComplete: invalid value/);
+    assert.equal((await exported({ computations: [{ ...computation, onComplete }] }, "state.computations")).ok, false, onComplete);
   }
 });
 
@@ -272,6 +273,7 @@ Deno.test("an effect places the airlock and its daprd, and the ticker and clock 
     [["/usr/share/mecha/initdb/899_role_passwords.sh"], "/docker-entrypoint-initdb.d/899_role_passwords.sh"],
     [["/usr/share/mecha/initdb/011_graphile_worker.sql"], "/docker-entrypoint-initdb.d/011_graphile_worker.sql"],
     [["/usr/share/mecha/initdb/012_airlock.sql"], "/docker-entrypoint-initdb.d/012_airlock.sql"],
+    [["/usr/share/mecha/initdb/013_airlock_job_key.sql"], "/docker-entrypoint-initdb.d/013_airlock_job_key.sql"],
   ]);
   const networks = await exported({ effects: [PROBE] }, "surface.networks");
   assert.deepEqual(networks.value, { airlock: { internal: true }, "airlock-out": { internal: true }, "airlock-wake": { internal: true }, "airlock-egress": {} });
@@ -463,6 +465,23 @@ Deno.test("a bridge on cloudflare builds its real container and needs a Dockerfi
   const pulled = await runtimeWith(state, `{crawler: {dockerfile: from: null, compose: image: "ghcr.io/example/crawler:1"}}`);
   assert.equal(pulled.ok, false);
   assert.match(pulled.stderr, /builds no image from a Dockerfile/);
+  const crawler = `{crawler: {dockerfile: {from: name: "crawler@sha256:fixture", cmd: ["crawl"]}, compose: {}}}`;
+  const sized = await runtimeWith(
+    {effects: [{name: "fetch", bridge: "crawl"}], bridges: [{name: "crawl", container: "crawler", targets: ["cloudflare"], instance_type: "standard-1", simulator: {}}]},
+    crawler,
+  );
+  assert.equal(sized.ok, true, sized.stderr);
+  const unsized = await runtimeWith(
+    {effects: [{name: "fetch", bridge: "crawl"}], bridges: [{name: "crawl", container: "crawler", instance_type: "standard-1", simulator: {}}]},
+    crawler,
+  );
+  assert.equal(unsized.ok, false);
+  assert.match(unsized.stderr, /sets instance_type.*without naming cloudflare/);
+  const unknownTier = await runtimeWith(
+    {effects: [{name: "fetch", bridge: "crawl"}], bridges: [{name: "crawl", container: "crawler", targets: ["cloudflare"], instance_type: "jumbo", simulator: {}}]},
+    crawler,
+  );
+  assert.equal(unknownTier.ok, false);
 });
 
 // The appliance target kept the container's `entrypoint.after` without the
@@ -800,6 +819,8 @@ Deno.test("Feldera deployment selects its pinned internal service and ships the 
     assert.ok(compute.dockerfile.copy.some((copy: { srcs: string[]; dst: string }) => copy.srcs[0] === "duckstream/feldera.json" && copy.dst === "/app/computations/analytics.feldera.json"));
     if (duckstreamEngine === "feldera") {
       assert.equal(feldera.dockerfile.from.name, "images.feldera.com/feldera/pipeline-manager:0.367.0@sha256:42819714d16f7d5d37c17c87812ce98fb23efd2b1bfbf95b4889877f14693272");
+      // Host CPU count can launch enough compiler processes to starve the manager's status API.
+      assert.match(feldera.dockerfile.preamble.join("\n"), /\[build\].*jobs = 2/);
       assert.match(feldera.dockerfile.preamble.join("\n"), /\[profile\.unoptimized\].*strip = "symbols"/);
       assert.deepEqual(feldera.compose.healthcheck.test, ["CMD", "httpcheck", "http://127.0.0.1:8080/healthz"]);
       assert.equal(feldera.compose.ports, undefined);
@@ -850,13 +871,13 @@ Deno.test("an explicit tenancy baseline replaces the image floor once", async ()
 
 // Every docker app's appliance compiled the same toolchain in a stage of its
 // own, its server headers pinned apart from the server it ran: one image now,
-// against the appliance's one PostgreSQL version.
+// against the appliance's one PostgreSQL major.
 Deno.test("the appliance's extensions build once, against the appliance's own PostgreSQL", async () => {
   const out = await new Deno.Command("cue", { args: ["export", ".:cluster", "-e", "#AppliancePostgres"], cwd: MECHA, stdout: "piped" }).output();
   assert.equal(out.success, true);
-  const version: string = JSON.parse(new TextDecoder().decode(out.stdout));
+  const major: string = JSON.parse(new TextDecoder().decode(out.stdout));
   const build = await Deno.readTextFile(`${MECHA}.bayt/Dockerfile.extensions-build`);
-  for (const s of [`postgresql18-server-devel=${version}`, "github.com/plv8/pljs.git", "plv8.control", "sha256sum -c", "/pg-extensions/lib/"]) {
+  for (const s of [`postgresql-server-dev-${major}`, `/usr/lib/postgresql/${major}/bin/pg_config`, "github.com/plv8/pljs.git", "plv8.control", "sha256sum -c", "/pg-extensions/lib/"]) {
     assert.ok(build.includes(s), `${s} missing from the extensions build`);
   }
   assert.ok(!build.includes("zig"), "a second toolchain");
@@ -869,7 +890,7 @@ Deno.test("the published extensions image holds the extensions alone", async () 
   const stage = dockerfile.split(/\n(?=FROM )/)[1];
   assert.match(stage, /^FROM scratch AS extensions-image\n/);
   assert.ok(stage.includes("COPY --link --from=libraries_mecha-extensions-build /pg-extensions /pg-extensions"), stage);
-  assert.ok(!/zypper|gcc|postgresql18-server-devel/.test(stage), `the toolchain ships: ${stage}`);
+  assert.ok(!/apt-get|gcc|postgresql-server-dev/.test(stage), `the toolchain ships: ${stage}`);
 });
 
 // A bridge's container built for the appliance lost its build dependencies

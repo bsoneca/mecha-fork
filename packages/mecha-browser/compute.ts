@@ -1,6 +1,6 @@
 import * as duckdb from 'npm:@duckdb/duckdb-wasm@1.33.1-dev57.0/dist/duckdb-browser.mjs'
 import { types, typedSql, type TypeTable, type TypeField } from '../../services/compute/portable-contract.ts'
-import { snapshotStatements } from '../../services/compute/snapshot-data.ts'
+import { planReplicaTable, snapshotStatements, type ReplicaWatermark } from '../../services/compute/snapshot-data.ts'
 import type { Snapshot, Output } from '../compute-snapshot/src/index.ts'
 
 export interface BrowserProgram {
@@ -60,10 +60,11 @@ export async function browserCompute(config: BrowserCompute) {
     // DuckDB derives its extension entrypoint from the path; fetch ignores this fragment.
     await setup.query(`LOAD '${urls.json}#/json.duckdb_extension.wasm'`)
     await setup.query(`LOAD '${urls.icu}#/icu.duckdb_extension.wasm'`)
-    await setup.query("SET autoinstall_known_extensions = false; SET autoload_known_extensions = false; SET TimeZone = 'UTC'")
+    await setup.query("SET autoinstall_known_extensions = false; SET autoload_known_extensions = false; SET TimeZone = 'UTC'; CREATE SCHEMA IF NOT EXISTS duckpipe_replica")
   }
   finally { await setup.close() }
   const programs = new Map(config.programs.map((p) => [p.spec.name, p]))
+  const replicaState = new Map<string, ReplicaWatermark>()
   let chain: Promise<unknown> = Promise.resolve()
   const execute = (snapshot: Snapshot): Promise<Output> => {
     const work = chain.then(() => run(snapshot))
@@ -76,14 +77,39 @@ export async function browserCompute(config: BrowserCompute) {
     const conn = await db.connect()
     const cage = new Worker(workerUrl(urls.cage), { type: 'module' })
     const job = new Worker(workerUrl(urls.job), { type: 'module' })
+    let inTx = false
     try {
-      await conn.query('BEGIN TRANSACTION')
       const plans = snapshotStatements(snapshot.tables, p.reads, p.spec.types)
-      for (const table of plans) {
-        await conn.query(table.create)
-        const statement = await conn.prepare(table.insert)
-        try { await statement.query(...table.values) }
-        finally { await statement.close() }
+      const pendingState = new Map<string, ReplicaWatermark>()
+      await conn.query('BEGIN TRANSACTION')
+      inTx = true
+      for (const [index, name] of p.reads.entries()) {
+        const replicaPlan = planReplicaTable(
+          name,
+          snapshot.tables[name],
+          plans[index],
+          snapshot.wal?.[name],
+          p.spec.types,
+          replicaState.get(name),
+        )
+        for (const step of replicaPlan.steps) {
+          if (step.values.length) {
+            const statement = await conn.prepare(step.sql)
+            try { await statement.query(...step.values) }
+            finally { await statement.close() }
+          } else {
+            await conn.query(step.sql)
+          }
+        }
+        pendingState.set(name, replicaPlan.next)
+      }
+      await conn.query('COMMIT')
+      inTx = false
+      for (const [name, next] of pendingState) replicaState.set(name, next)
+      await conn.query('BEGIN TRANSACTION')
+      inTx = true
+      for (const name of p.reads) {
+        await conn.query(`CREATE TEMP VIEW "${name}" AS SELECT * FROM "duckpipe_replica"."${name}"`)
       }
       const bound = p.spec.types ? types(p.spec.types) : undefined
       const inputs: Record<string, unknown[]> = {}
@@ -137,7 +163,7 @@ export async function browserCompute(config: BrowserCompute) {
       cage.terminate()
       job.terminate()
       // Every execution owns temporary tables in a private connection transaction.
-      await conn.query('ROLLBACK')
+      if (inTx) await conn.query('ROLLBACK')
       await conn.close()
     }
   }

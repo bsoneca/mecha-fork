@@ -23,9 +23,16 @@
           "services/compute/migrate-durex.ts",
           "services/compute/publication.ts",
           "services/compute/native-runtime.ts",
+          "services/compute/bounded-runtime.ts",
+          "services/compute/step-cage.ts",
+          "services/compute/step-worker.ts",
           "services/compute/native-feldera.ts",
           "services/compute/native-cleanup.ts",
           "services/compute/native-sources.ts",
+          "services/compute/native-artifacts.ts",
+          "services/compute/native-artifacts-build.ts",
+          "services/compute/native-process.ts",
+          "services/compute/native-supervisor.c",
           "services/compute/deltas.ts",
           "services/compute/workers.ts",
           "services/compute/query-stages.ts",
@@ -51,7 +58,8 @@
       {
         "from": null,
         "srcs": [
-          "services/airlock/pdf.ts"
+          "services/airlock/pdf.ts",
+          "services/airlock/xlsx.ts"
         ],
         "dst": "/airlock/",
         "link": true,
@@ -93,7 +101,9 @@
       {
         "from": null,
         "srcs": [
-          "packages/compute-snapshot/src/sink-writes.ts"
+          "packages/compute-snapshot/src/sink-writes.ts",
+          "packages/compute-snapshot/src/bounded.ts",
+          "packages/compute-snapshot/src/json.ts"
         ],
         "dst": "/packages/compute-snapshot/src/",
         "link": true,
@@ -104,6 +114,7 @@
     "cmd": [
       "run",
       "--unstable-worker-options",
+      "--allow-run=/opt/feldera/runtime/supervisor",
       "--allow-ffi",
       "--allow-read",
       "--allow-write",
@@ -140,9 +151,16 @@
       "services/compute/migrate-durex.ts",
       "services/compute/publication.ts",
       "services/compute/native-runtime.ts",
+      "services/compute/bounded-runtime.ts",
+      "services/compute/step-cage.ts",
+      "services/compute/step-worker.ts",
       "services/compute/native-feldera.ts",
       "services/compute/native-cleanup.ts",
       "services/compute/native-sources.ts",
+      "services/compute/native-artifacts.ts",
+      "services/compute/native-artifacts-build.ts",
+      "services/compute/native-process.ts",
+      "services/compute/native-supervisor.c",
       "services/compute/deltas.ts",
       "services/compute/workers.ts",
       "services/compute/query-stages.ts",
@@ -160,12 +178,15 @@
       "services/compute/install.ts",
       "services/compute/events.yaml",
       "services/airlock/pdf.ts",
+      "services/airlock/xlsx.ts",
       "services/durex/work.ts",
       "services/durex/work.sql",
       "services/durex/migrate.ts",
       "packages/client/src/types.ts",
       "packages/lake/src/lake-types.ts",
-      "packages/compute-snapshot/src/sink-writes.ts"
+      "packages/compute-snapshot/src/sink-writes.ts",
+      "packages/compute-snapshot/src/bounded.ts",
+      "packages/compute-snapshot/src/json.ts"
     ],
     "exclude": []
   },
@@ -264,9 +285,16 @@
           "services/compute/migrate-durex.ts",
           "services/compute/publication.ts",
           "services/compute/native-runtime.ts",
+          "services/compute/bounded-runtime.ts",
+          "services/compute/step-cage.ts",
+          "services/compute/step-worker.ts",
           "services/compute/native-feldera.ts",
           "services/compute/native-cleanup.ts",
           "services/compute/native-sources.ts",
+          "services/compute/native-artifacts.ts",
+          "services/compute/native-artifacts-build.ts",
+          "services/compute/native-process.ts",
+          "services/compute/native-supervisor.c",
           "services/compute/deltas.ts",
           "services/compute/workers.ts",
           "services/compute/query-stages.ts",
@@ -284,12 +312,15 @@
           "services/compute/install.ts",
           "services/compute/events.yaml",
           "services/airlock/pdf.ts",
+          "services/airlock/xlsx.ts",
           "services/durex/work.ts",
           "services/durex/work.sql",
           "services/durex/migrate.ts",
           "packages/client/src/types.ts",
           "packages/lake/src/lake-types.ts",
-          "packages/compute-snapshot/src/sink-writes.ts"
+          "packages/compute-snapshot/src/sink-writes.ts",
+          "packages/compute-snapshot/src/bounded.ts",
+          "packages/compute-snapshot/src/json.ts"
         ],
         "exclude": []
       },
@@ -335,9 +366,16 @@
           "services/compute/migrate-durex.ts",
           "services/compute/publication.ts",
           "services/compute/native-runtime.ts",
+          "services/compute/bounded-runtime.ts",
+          "services/compute/step-cage.ts",
+          "services/compute/step-worker.ts",
           "services/compute/native-feldera.ts",
           "services/compute/native-cleanup.ts",
           "services/compute/native-sources.ts",
+          "services/compute/native-artifacts.ts",
+          "services/compute/native-artifacts-build.ts",
+          "services/compute/native-process.ts",
+          "services/compute/native-supervisor.c",
           "services/compute/deltas.ts",
           "services/compute/workers.ts",
           "services/compute/query-stages.ts",
@@ -355,19 +393,23 @@
           "services/compute/install.ts",
           "services/compute/events.yaml",
           "services/airlock/pdf.ts",
+          "services/airlock/xlsx.ts",
           "services/durex/work.ts",
           "services/durex/work.sql",
           "services/durex/migrate.ts",
           "packages/client/src/types.ts",
           "packages/lake/src/lake-types.ts",
-          "packages/compute-snapshot/src/sink-writes.ts"
+          "packages/compute-snapshot/src/sink-writes.ts",
+          "packages/compute-snapshot/src/bounded.ts",
+          "packages/compute-snapshot/src/json.ts"
         ],
         "exclude": [],
         "defaultGlobs": null,
         "defaultExclude": null
       },
+      "name": "deno-cache",
       "dockerfile": {
-        "do": "sh -c 'd=\"${DENO_DIR:-/root/.cache/deno}\"; s=/deno-store; k=\"$(sha256sum deno.lock */deno.lock */*/deno.lock deno.json */deno.json */*/deno.json package.json */package.json 2>/dev/null | sha256sum | cut -d'\\'' '\\'' -f1)\"; mkdir -p \"$d\" \"$s\"; for sub in remote npm jsr; do if [ -d \"$s/$k/$sub\" ]; then mkdir -p \"$d/$sub\" && cp -a \"$s/$k/$sub\"/. \"$d/$sub\"/ 2>/dev/null || true; fi; done; (deno cache main.ts cage.ts job.ts) || exit; t=\"$s/.tmp.$$\"; rm -rf \"$t\"; mkdir -p \"$t\"; for sub in remote npm jsr; do if [ -d \"$d/$sub\" ]; then mkdir -p \"$t/$sub\" && cp -a \"$d/$sub\"/. \"$t/$sub\"/ 2>/dev/null || true; fi; done; rm -rf \"$s/$k\" && mv \"$t\" \"$s/$k\" 2>/dev/null || rm -rf \"$t\"; find \"$s\" -mindepth 1 -maxdepth 1 ! -name \"$k\" -exec rm -rf {} + 2>/dev/null || true'",
+        "do": "sh -c 'd=\"${DENO_DIR:-/root/.cache/deno}\"; s=/deno-store; k=\"$(sha256sum deno.lock */deno.lock */*/deno.lock deno.json */deno.json */*/deno.json package.json */package.json 2>/dev/null | sha256sum | cut -d'\\'' '\\'' -f1)\"; mkdir -p \"$d\" \"$s\"; for sub in remote npm jsr; do if [ -d \"$s/$k/$sub\" ]; then mkdir -p \"$d/$sub\" && cp -a \"$s/$k/$sub\"/. \"$d/$sub\"/ 2>/dev/null || true; fi; done; (deno cache main.ts cage.ts job.ts step-worker.ts) || exit; t=\"$s/.tmp.$$\"; rm -rf \"$t\"; mkdir -p \"$t\"; for sub in remote npm jsr; do if [ -d \"$d/$sub\" ]; then mkdir -p \"$t/$sub\" && cp -a \"$d/$sub\"/. \"$t/$sub\"/ 2>/dev/null || true; fi; done; rm -rf \"$s/$k\" && mv \"$t\" \"$s/$k\" 2>/dev/null || rm -rf \"$t\"; find \"$s\" -mindepth 1 -maxdepth 1 ! -name \"$k\" -exec rm -rf {} + 2>/dev/null || true'",
         "mounts": [
           {
             "type": "cache",
@@ -378,7 +420,6 @@
         ],
         "shell": "sh"
       },
-      "name": "deno-cache",
       "shell": "exec",
       "stop": false
     },
@@ -397,9 +438,16 @@
           "services/compute/migrate-durex.ts",
           "services/compute/publication.ts",
           "services/compute/native-runtime.ts",
+          "services/compute/bounded-runtime.ts",
+          "services/compute/step-cage.ts",
+          "services/compute/step-worker.ts",
           "services/compute/native-feldera.ts",
           "services/compute/native-cleanup.ts",
           "services/compute/native-sources.ts",
+          "services/compute/native-artifacts.ts",
+          "services/compute/native-artifacts-build.ts",
+          "services/compute/native-process.ts",
+          "services/compute/native-supervisor.c",
           "services/compute/deltas.ts",
           "services/compute/workers.ts",
           "services/compute/query-stages.ts",
@@ -417,17 +465,21 @@
           "services/compute/install.ts",
           "services/compute/events.yaml",
           "services/airlock/pdf.ts",
+          "services/airlock/xlsx.ts",
           "services/durex/work.ts",
           "services/durex/work.sql",
           "services/durex/migrate.ts",
           "packages/client/src/types.ts",
           "packages/lake/src/lake-types.ts",
-          "packages/compute-snapshot/src/sink-writes.ts"
+          "packages/compute-snapshot/src/sink-writes.ts",
+          "packages/compute-snapshot/src/bounded.ts",
+          "packages/compute-snapshot/src/json.ts"
         ],
         "exclude": [],
         "defaultGlobs": null,
         "defaultExclude": null
       },
+      "name": "duckdb",
       "dockerfile": {
         "do": "sh -c 'd=\"${DUCKDB_EXTENSIONS_DIR:-/app/extensions}\"; s=/duckdb-store; mkdir -p \"$d\" \"$s\"; cp -a \"$s\"/. \"$d\"/ 2>/dev/null || true; (deno run --allow-ffi --allow-read --allow-write --allow-net --allow-env --allow-sys=homedir install.ts) || exit; cd \"$d\" && find . -type f | while IFS= read -r f; do rel=\"${f#./}\"; dst=\"$s/$rel\"; [ -e \"$dst\" ] && continue; mkdir -p \"$(dirname \"$dst\")\"; tmp=\"$dst.tmp.$$\"; cp -p \"$rel\" \"$tmp\" 2>/dev/null && mv -f \"$tmp\" \"$dst\" 2>/dev/null || rm -f \"$tmp\"; done'",
         "mounts": [
@@ -440,7 +492,6 @@
         ],
         "shell": "sh"
       },
-      "name": "duckdb",
       "shell": "exec",
       "stop": false
     }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   type AiCapabilitiesConfig,
+  resolveCallSpec,
   createTsBifrost,
   DEFAULT_AI_MODELS,
   mergeExtra,
@@ -8,6 +9,7 @@ import {
   providerKey,
   providerKeyGroups,
   resolveModelSpec,
+  routedSettings,
 } from "./tsbifrost.ts";
 
 Deno.test("default 3-tier model lineup resolves per release target", () => {
@@ -190,7 +192,7 @@ Deno.test("tsbifrost normalizes chat completions and image generations across pr
   // 4. Local target via SAYT_PLATFORM + AI_LOCAL_OLLAMA_HOST + json_schema forwarding
   const localGateway = createTsBifrost({
     env: {
-      SAYT_PLATFORM: "local",
+      SAYT_PLATFORM: "host",
       AI_LOCAL_OLLAMA_HOST: "http://host.docker.internal:11434",
       AI_LOCAL_SDCPP_HOST: "http://host.docker.internal:8000",
     },
@@ -225,6 +227,13 @@ Deno.test("tsbifrost normalizes chat completions and image generations across pr
   const daprBody = await daprBindingRes.json();
   assert.equal(daprBody.model, "imagen-4.0-ultra-generate-001");
   assert.equal(daprBody.data[0].b64_json, "R0lGODlhAQABAAAAACw=");
+});
+
+Deno.test("sayt's host and compose platforms run on the local and docker targets", async () => {
+  for (const [platform, target] of [["host", "local"], ["compose", "docker"]]) {
+    const res = await createTsBifrost({ env: { SAYT_PLATFORM: platform } })(new Request("http://tsbifrost:8090/healthz"));
+    assert.deepEqual(await res.json(), { status: "ok", target });
+  }
 });
 
 Deno.test("Cloudflare heavy images use Phoenix parameters and decode its binary stream", async () => {
@@ -496,4 +505,155 @@ Deno.test("providerKeyGroups names the keys every declared tier's resolved provi
   assert.deepEqual(providerKeyGroups({ text: ["cheap", "heavy"], targets: { cloudflare: { text: { cheap: { provider: "openai", model: "gpt" } } } } }, "cloudflare"), [["OPENAI_API_KEY"]]);
   assert.deepEqual(providerKeyGroups({ text: ["browser"] }, "cloudflare"), [], "a browser tier calls no backend");
   assert.deepEqual(providerKey("google", { GOOGLE_API_KEY: "g" }), "g");
+});
+
+const routedConfig: AiCapabilitiesConfig = {
+  image: ["cheap", "heavy"],
+  targets: {
+    cloudflare: {
+      image: {
+        heavy: {
+          secret: "AI_IMAGE_HEAVY",
+          routes: {
+            google: { provider: "google", model: "gemini-3.1-flash-lite-image" },
+            cloudflare: { provider: "cloudflare", model: "@cf/black-forest-labs/flux-1-schnell", steps: 4 },
+          },
+        },
+      },
+    },
+  },
+};
+
+// Staging and production are one release: level 3 was compiled to Gemini,
+// so staging could only call Gemini or be built apart. The route is each
+// deployment's setting, and an unset or undeclared one is refused rather
+// than read as a default.
+Deno.test("a routed tier calls the route its deployment's setting names, and no other", () => {
+  assert.equal(resolveModelSpec(routedConfig, "cloudflare", "image", "heavy", { AI_IMAGE_HEAVY: "google" }).provider, "google");
+  const staging = resolveModelSpec(routedConfig, "cloudflare", "image", "heavy", { AI_IMAGE_HEAVY: "cloudflare" });
+  assert.deepEqual([staging.provider, staging.model, staging.steps], ["cloudflare", "@cf/black-forest-labs/flux-1-schnell", 4]);
+  assert.throws(() => resolveModelSpec(routedConfig, "cloudflare", "image", "heavy", {}), /AI setting AI_IMAGE_HEAVY is not set on this deployment: it names one of google, cloudflare/);
+  assert.throws(
+    () => resolveModelSpec(routedConfig, "cloudflare", "image", "heavy", { AI_IMAGE_HEAVY: "sk-secret-value" }),
+    (e: Error) => /is not one of google, cloudflare/.test(e.message) && !e.message.includes("sk-secret-value"),
+  );
+  assert.equal(resolveModelSpec(routedConfig, "local", "image", "heavy", {}).model, DEFAULT_AI_MODELS.local.image.heavy.model, "a compiled target is not routed");
+});
+
+// A Gemini key required of every deployment would put production's key on
+// staging; the key of a route belongs to the deployments selecting it.
+Deno.test("a routed tier's keys are its routes', and a deployment is refused only the key its route reads", () => {
+  assert.deepEqual(providerKeyGroups(routedConfig, "cloudflare"), []);
+  assert.deepEqual(routedSettings(routedConfig, "cloudflare"), { AI_IMAGE_HEAVY: { cloudflare: [], google: [["GEMINI_API_KEY", "GOOGLE_API_KEY"]] } });
+  assert.deepEqual(routedSettings(routedConfig, "docker"), {});
+  const call = (env: Record<string, string>) => resolveCallSpec(routedConfig, "cloudflare", "image", "heavy", env);
+  call({ AI_IMAGE_HEAVY: "cloudflare" });
+  call({ AI_IMAGE_HEAVY: "google", GEMINI_API_KEY: "k" });
+  assert.throws(() => call({ AI_IMAGE_HEAVY: "google" }), /routes image heavy to google, which reads GEMINI_API_KEY or GOOGLE_API_KEY, and this deployment holds none/);
+  assert.throws(() => call({}), /AI_IMAGE_HEAVY is not set/);
+  const split: AiCapabilitiesConfig = {
+    text: ["heavy"],
+    image: ["heavy"],
+    targets: { cloudflare: { text: { heavy: { secret: "AI_IMAGE_HEAVY", routes: { google: "gemini-2.5-flash" } } }, image: routedConfig.targets!.cloudflare!.image } },
+  };
+  assert.throws(() => routedSettings(split, "cloudflare"), /routes image heavy by cloudflare, google and another tier by google/);
+});
+
+// Vision scans send OpenAI multimodal `messages[].content` arrays (`text` + `image_url`);
+// Gemini 2.5 Flash rejects `{ text: Array }` and prepends `{ thought: true }` parts when thinking runs.
+Deno.test("Google provider translates multimodal image_url parts and skips thought parts", async () => {
+  const seen: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const gateway = createTsBifrost({
+    target: "cloudflare",
+    config: {
+      targets: {
+        cloudflare: {
+          text: {
+            heavy: {
+              provider: "google",
+              model: "gemini-2.5-flash",
+              params: { generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+            },
+          },
+        },
+      },
+    },
+    env: { GEMINI_API_KEY: "gem-key" },
+    fetcher: async (input, init) => {
+      seen.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+      return Response.json({
+        candidates: [{
+          content: {
+            parts: [
+              { thought: true, text: "thinking about bottle" },
+              { text: '{"caption":"PET bottle"}' },
+            ],
+          },
+        }],
+      });
+    },
+  });
+
+  const res = await gateway(new Request("http://tsbifrost/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      tier: "heavy",
+      format: "json",
+      messages: [
+        { role: "system", content: "Return JSON." },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Classify this specimen." },
+            { type: "image_url", image_url: { url: "data:image/jpeg;base64,AQIDBA==" } },
+            { type: "image_url", image_url: { url: "https://example.com/item.jpg" } },
+          ],
+        },
+      ],
+    }),
+  }));
+  assert.equal(res.status, 200);
+  const out = await res.json();
+  assert.equal(out.model, "gemini-2.5-flash");
+  assert.equal(out.choices[0].message.content, '{"caption":"PET bottle"}');
+  assert.equal(seen[0].url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent");
+  assert.deepEqual(seen[0].body.contents, [{
+    role: "user",
+    parts: [
+      { text: "Classify this specimen." },
+      { inlineData: { mimeType: "image/jpeg", data: "AQIDBA==" } },
+      { fileData: { fileUri: "https://example.com/item.jpg" } },
+    ],
+  }]);
+  assert.deepEqual(
+    (seen[0].body.generationConfig as Record<string, unknown>).thinkingConfig,
+    { thinkingBudget: 0 },
+  );
+
+  const thoughtOnly = createTsBifrost({
+    target: "cloudflare",
+    config: {
+      targets: {
+        cloudflare: {
+          text: {
+            heavy: { provider: "google", model: "gemini-2.5-flash" },
+          },
+        },
+      },
+    },
+    env: { GEMINI_API_KEY: "gem-key" },
+    fetcher: async () =>
+      Response.json({
+        candidates: [{
+          content: { parts: [{ thought: true, text: "internal reasoning truncated at maxOutputTokens" }] },
+        }],
+      }),
+  });
+  const thoughtRes = await thoughtOnly(new Request("http://tsbifrost/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tier: "heavy", messages: [{ role: "user", content: "Classify." }] }),
+  }));
+  assert.equal(thoughtRes.status, 502);
 });

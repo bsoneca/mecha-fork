@@ -1,8 +1,6 @@
 # generated from bayt.cue — do not edit
 version: "0.5"
 ordered_shutdown: true
-environment:
-- MISE_LOCKED=0
 processes:
   "bayt:httpcheck":
     entrypoint:
@@ -62,6 +60,46 @@ processes:
     shutdown:
       signal: 2
       timeout_seconds: 5
+  migrate:
+    depends_on:
+      database:
+        condition: process_healthy
+    entrypoint:
+    - mise
+    - x
+    - --
+    - nu
+    - -c
+    - >-
+      let os = (match $$nu.os-info.name { 'macos' => 'macos', 'windows' => 'windows',
+      _ => 'linux' }); let dir = (if (($$env.PRONTO_REPLAY_PGROLL_DIR? | default '')
+      != '') { $$env.PRONTO_REPLAY_PGROLL_DIR } else if ('/pgroll' | path exists) {
+      '/pgroll' } else { let d = (($$env.BAYT_LOCAL_WORK_DIR? | default $$nu.temp-dir) |
+      path join 'pgroll'); rm -rf $$d; mkdir $$d; let m = (open .bayt/bayt.migrate.json |
+      get dockerfile); ($$m | get -o copy | default []) | each {|c| cp ($$c.srcs.0)
+      ($$d | path join ($$c.dst | path basename)) } | ignore; ($$m | get -o epilogue |
+      default []) | each {|e| let lines = ($$e | lines); if ($$lines.0 | str starts-with
+      "COPY <<'PGROLL' /tmp/") { let name = ($$lines.0 | parse "COPY <<'PGROLL'
+      /tmp/{name}.parts" | get 0.name); ($$lines | skip 1 | take while {|l| $$l != "PGROLL" }
+      | str join "" | decode base64) | save --raw -f ($$d | path join $$name) } else if
+      ($$lines.0 | str starts-with "COPY <<'PGROLL' /pgroll/") { let name = ($$lines.0
+      | parse "COPY <<'PGROLL' /pgroll/{name}" | get 0.name); $$lines.1 | save --raw
+      -f ($$d | path join $$name) } else if ($$lines.0 | str starts-with "COPY
+      <<'RECONCILE' /pgroll/") { let name = ($$lines.0 | parse "COPY <<'RECONCILE'
+      /pgroll/{name}" | get 0.name); ($$lines | skip 1 | drop 1 | str join "\\n") | save --raw -f
+      ($$d | path join $$name) } } | ignore; $$d }); let script = (if
+      (($$env.PRONTO_MIGRATE_SH? | default '') != '') { $$env.PRONTO_MIGRATE_SH } else if
+      ('services/migrate/migrate.nu' | path exists) { 'services/migrate/migrate.nu' } else if
+      ('/migrate.sh' | path exists) and ($$os != 'windows') { '/migrate.sh' } else { ((^mise
+      where github:bonisoft3/mecha | str trim) | path join 'services/migrate/migrate.nu')
+      }); if ($$script | str ends-with '.nu') { ^nu $$script $$dir 00_initdb } else {
+      ^bash $$script $$dir 00_initdb }
+    availability:
+      exit_on_skipped: true
+    environment:
+    - >-
+      DATABASE_URL=postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@127.0.0.1:${DATABASE_PG_PORT:-17726}/${POSTGRES_DB:-mecha}?sslmode=disable
+    - REQUIRED_TABLES=schedule
   crud:
     depends_on:
       database:
@@ -124,6 +162,7 @@ processes:
     - OIDC_PROVIDERS=
     - PGRST_JWT_SECRET=${PGRST_JWT_SECRET:-mecha-dev-secret-please-override-32ch}
     - PORT=${AUTH_HTTP_PORT:-20440}
+    - WEBAUTHN_ANDROID_ORIGINS=${WEBAUTHN_ANDROID_ORIGINS:-}
     - WEBAUTHN_ORIGIN=${WEBAUTHN_ORIGIN:-https://localhost:*}
     - WEBAUTHN_RP_ID=${WEBAUTHN_RP_ID:-localhost}
   caddy:
@@ -138,7 +177,7 @@ processes:
     - --
     - nu
     - -c
-    - "let origin = ($$env.ORIGIN? | default \"\"); let h = ($$origin | str replace -r '^https?://' ''); if ($$h == $$origin) or ($$h | is-empty) or ($$h !~ '^[A-Za-z0-9.:-]+$$') { print -e $$\"ORIGIN '($$origin)' is no origin: set it to the scheme and host readers reach the door at, as https://app.example\"; exit 1 }; let p = (if ($$h | str contains \":\") { $$h | split row \":\" | last } else { \"8443\" }); let tls_port = (if (($$env.CADDY_TLS_HOST_PORT? | default \"\") != \"\") { $$env.CADDY_TLS_HOST_PORT } else { $$p }); let work = ($$env.BAYT_LOCAL_WORK_DIR? | default $$nu.temp-dir); let cdir = ($$work | path join $$\"caddy-($$nu.pid)-(random int 1000..9999)\"); mkdir ($$cdir | path join \"data\") ($$cdir | path join \"config\"); let env_file = ($$cdir | path join \"env\"); let certs = (($$env.CADDY_CERT_DIR? | default \".certs\") | path expand | str replace -a (char -u 5c) '/'); let served_dir = ($$env.BAYT_LOCAL_SERVED_DIR? | default \"\"); let is_local = (($$served_dir != \"\") and (($$served_dir | path join \"srv\") | path exists)); let cfg_src = (if $$is_local { 'services/proxy/Caddyfile' } else { ($$env.CADDY_CONFIG_FILE? | default (if ('services/proxy/Caddyfile' | path exists) { 'services/proxy/Caddyfile' } else { \"/etc/caddy/Caddyfile\" })) }); mut env_lines = [$$\"CADDY_TLS_HOST_PORT=($$tls_port)\"]; mut extra_env = { XDG_DATA_HOME: ($$cdir | path join \"data\"), XDG_CONFIG_HOME: ($$cdir | path join \"config\"), CADDY_TLS_HOST_PORT: $$tls_port }; if $$is_local { let served_fwd = ($$served_dir | path expand | str replace -a (char -u 5c) '/'); let srv_root = $$\"($$served_fwd)/srv\"; let omni_root = $$\"($$served_fwd)/omnishell\"; $$env_lines = ($$env_lines | append [$$\"CADDY_DOOR_PORT=($$tls_port)\" $$\"PRONTO_SRV_ROOT=($$srv_root)\" $$\"PRONTO_OMNISHELL_ROOT=($$omni_root)\"]); $$extra_env = ($$extra_env | merge { CADDY_DOOR_PORT: $$tls_port, PRONTO_SRV_ROOT: $$srv_root, PRONTO_OMNISHELL_ROOT: $$omni_root }) }; if (($$certs | path join \"localhost.pem\") | path exists) { let tv = $$\"($$certs)/localhost.pem ($$certs)/localhost-key.pem\"; $$env_lines = ($$env_lines | append $$\"CADDY_TLS=($$tv)\"); $$extra_env = ($$extra_env | merge { CADDY_TLS: $$tv }) }; ($$env_lines | str join (char nl)) + (char nl) | save -f $$env_file; with-env $$extra_env { let adapted = (^caddy adapt --envfile $$env_file --config $$cfg_src --adapter caddyfile); let roots = ($$adapted | split row \",\" | parse -r '\"root\":\"(?<r>[^\"]+)\"' | get -o r | default [] | uniq); for r in $$roots { if ($$r | path exists) { glob ($$r | path join \"**/*\" | str replace -a (char -u 5c) '/') | where ($$it | path type) == \"file\" and (not ($$it | str ends-with \".etag\")) | each {|f| let etag = $$\"($$f).etag\"; if (not ($$etag | path exists)) { let d = (open --raw $$f | hash sha256); ((char dquote) + $$d + (char dquote)) | save --raw -f $$etag } } | ignore } }; exec caddy run --envfile $$env_file --config $$cfg_src --adapter caddyfile }"
+    - "let origin = ($$env.ORIGIN? | default \"\"); let h = ($$origin | str replace -r '^https?://' ''); if ($$h == $$origin) or ($$h | is-empty) or ($$h !~ '^[A-Za-z0-9.:-]+$$') { print -e $$\"ORIGIN '($$origin)' is no origin: set it to the scheme and host readers reach the door at, as https://app.example\"; exit 1 }; let p = (if ($$h | str contains \":\") { $$h | split row \":\" | last } else { \"8443\" }); let tls_port = (if (($$env.CADDY_TLS_HOST_PORT? | default \"\") != \"\") { $$env.CADDY_TLS_HOST_PORT } else { $$p }); let work = ($$env.BAYT_LOCAL_WORK_DIR? | default $$nu.temp-dir); let cdir = ($$work | path join $$\"caddy-($$nu.pid)-(random int 1000..9999)\"); mkdir ($$cdir | path join \"data\") ($$cdir | path join \"config\"); let env_file = ($$cdir | path join \"env\"); let certs = (($$env.CADDY_CERT_DIR? | default \".certs\") | path expand | str replace -a (char -u 5c) '/'); let served_dir = ($$env.BAYT_LOCAL_SERVED_DIR? | default \"\"); let is_local = (($$served_dir != \"\") and (($$served_dir | path join \"srv\") | path exists)); let cfg_src = (if $$is_local { 'services/proxy/Caddyfile' } else { ($$env.CADDY_CONFIG_FILE? | default (if ('services/proxy/Caddyfile' | path exists) { 'services/proxy/Caddyfile' } else { \"/etc/caddy/Caddyfile\" })) }); mut env_lines = [$$\"CADDY_TLS_HOST_PORT=($$tls_port)\"]; mut extra_env = { XDG_DATA_HOME: ($$env.CADDY_DATA_HOME? | default ($$cdir | path join \"data\")), XDG_CONFIG_HOME: ($$cdir | path join \"config\"), CADDY_TLS_HOST_PORT: $$tls_port }; if $$is_local { let served_fwd = ($$served_dir | path expand | str replace -a (char -u 5c) '/'); let srv_root = $$\"($$served_fwd)/srv\"; let omni_root = $$\"($$served_fwd)/omnishell\"; $$env_lines = ($$env_lines | append [$$\"CADDY_DOOR_PORT=($$tls_port)\" $$\"PRONTO_SRV_ROOT=($$srv_root)\" $$\"PRONTO_OMNISHELL_ROOT=($$omni_root)\"]); $$extra_env = ($$extra_env | merge { CADDY_DOOR_PORT: $$tls_port, PRONTO_SRV_ROOT: $$srv_root, PRONTO_OMNISHELL_ROOT: $$omni_root }) }; if (($$certs | path join \"localhost.pem\") | path exists) { let tv = $$\"($$certs)/localhost.pem ($$certs)/localhost-key.pem\"; $$env_lines = ($$env_lines | append $$\"CADDY_TLS=($$tv)\"); $$extra_env = ($$extra_env | merge { CADDY_TLS: $$tv }) }; ($$env_lines | str join (char nl)) + (char nl) | save -f $$env_file; with-env $$extra_env { let adapted = (^caddy adapt --envfile $$env_file --config $$cfg_src --adapter caddyfile); let roots = ($$adapted | split row \",\" | parse -r '\"root\":\"(?<r>[^\"]+)\"' | get -o r | default [] | uniq); for r in $$roots { if ($$r | path exists) { glob ($$r | path join \"**/*\" | str replace -a (char -u 5c) '/') | where ($$it | path type) == \"file\" and (not ($$it | str ends-with \".etag\")) | each {|f| let etag = $$\"($$f).etag\"; if (not ($$etag | path exists)) { let d = (open --raw $$f | hash sha256); ((char dquote) + $$d + (char dquote)) | save --raw -f $$etag } } | ignore } }; exec caddy run --envfile $$env_file --config $$cfg_src --adapter caddyfile }"
     availability:
       exit_on_skipped: true
     environment:
@@ -360,7 +399,7 @@ processes:
     - --
     - nu
     - -c
-    - "if (which imgproxy | is-not-empty) { with-env { IMGPROXY_BIND: $$\"127.0.0.1:($$env.IMGPROXY_PORT? | default '8081')\" } { exec imgproxy } } else { exec deno eval \"Deno.serve({hostname:'127.0.0.1',port:Number(Deno.env.get('IMGPROXY_PORT')||8081)},async(req)=>{const u=new URL(req.url);if(u.pathname==='/health')return new Response('ok');const k=(u.pathname.split('s3://')[1]||u.pathname.split('s3:/')[1]||'').split('@')[0];if(k){const r=await fetch(Deno.env.get('IMGPROXY_S3_ENDPOINT')+'/'+k);return new Response(r.body,{status:r.status,headers:r.headers});}return new Response('not found',{status:404});})\" }"
+    - "if (which imgproxy | is-not-empty) { with-env { IMGPROXY_BIND: $$\"127.0.0.1:($$env.IMGPROXY_PORT? | default '8081')\" } { exec imgproxy } } else { exec deno run --allow-all ((^mise where github:bonisoft3/mecha | str trim) | path join 'services/imgproxy/host.ts') }"
     availability:
       exit_on_skipped: true
       restart: on_failure
@@ -371,9 +410,14 @@ processes:
     - AWS_REGION=rclone
     - >-
       AWS_SECRET_ACCESS_KEY=${RCLONE_SECRET_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+    - IMGPROXY_ALLOWED_SOURCES=s3://mecha-objects/,https://lh3.googleusercontent.com/
     - IMGPROXY_CACHE_CONTROL_PASSTHROUGH=true
+    - IMGPROXY_MAX_RESULT_DIMENSION=1024
     - IMGPROXY_MAX_SRC_RESOLUTION=50
+    - IMGPROXY_ONLY_PRESETS=true
     - IMGPROXY_PORT=${IMGPROXY_HTTP_PORT:-20489}
+    - >-
+      IMGPROXY_PRESETS=thumb=rs:fill:128:128/f:webp,avatar=rs:fill:256:256/f:webp,picture=rs:fit:1024:1024/f:webp
     - IMGPROXY_S3_ENDPOINT=http://127.0.0.1:${RCLONE_S3_HTTP_PORT:-21694}
     - IMGPROXY_SET_CANONICAL_HEADER=false
     - IMGPROXY_USE_S3=true
@@ -415,7 +459,7 @@ processes:
     - CRUD_URL=http://127.0.0.1:${CRUD_HTTP_PORT:-31050}
     - REDIS_URL=redis://127.0.0.1:${REDIS_REDIS_PORT:-16525}
     - >-
-      SERVICE_JWT=${SERVICE_JWT:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZSIsInN1YiI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCIsImV4cCI6MTk4ODE1MDQwMH0.dGYz_sMSnOvZy0eANh7spJbgyr2fEzeynOERIqW7gd4}
+      SERVICE_JWT=${SERVICE_JWT:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJtZWNoYTpzdGFjayIsInJvbGUiOiJzZXJ2aWNlIiwic3ViIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIiwiZXhwIjoxOTg4MTUwNDAwfQ.K4ZX9EDs-BwPIh3r_ZOKmO9XfrQrEx18rwlw3siXcxs}
   ticker:
     depends_on:
       crud:
@@ -442,7 +486,7 @@ processes:
     - CRUD_URL=http://127.0.0.1:${CRUD_HTTP_PORT:-31050}
     - PORT=${TICKER_HTTP_PORT:-11760}
     - >-
-      SERVICE_JWT=${SERVICE_JWT:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZSIsInN1YiI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCIsImV4cCI6MTk4ODE1MDQwMH0.dGYz_sMSnOvZy0eANh7spJbgyr2fEzeynOERIqW7gd4}
+      SERVICE_JWT=${SERVICE_JWT:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJtZWNoYTpzdGFjayIsInJvbGUiOiJzZXJ2aWNlIiwic3ViIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIiwiZXhwIjoxOTg4MTUwNDAwfQ.K4ZX9EDs-BwPIh3r_ZOKmO9XfrQrEx18rwlw3siXcxs}
     - WAKE_URLS=http://127.0.0.1:${MESH_EVENTS_HTTP_PORT:-17538}/v1.0/healthz/outbound
   clock:
     depends_on:
@@ -469,7 +513,7 @@ processes:
     - POKE_INTERVAL=${POKE_INTERVAL:-60s}
     - POKE_URL=http://127.0.0.1:${TICKER_HTTP_PORT:-11760}
     - >-
-      SERVICE_JWT=${SERVICE_JWT:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZSIsInN1YiI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCIsImV4cCI6MTk4ODE1MDQwMH0.dGYz_sMSnOvZy0eANh7spJbgyr2fEzeynOERIqW7gd4}
+      SERVICE_JWT=${SERVICE_JWT:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJtZWNoYTpzdGFjayIsInJvbGUiOiJzZXJ2aWNlIiwic3ViIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIiwiZXhwIjoxOTg4MTUwNDAwfQ.K4ZX9EDs-BwPIh3r_ZOKmO9XfrQrEx18rwlw3siXcxs}
   launch:
     depends_on:
       caddy:
@@ -511,43 +555,3 @@ processes:
       period_seconds: 1
       timeout_seconds: 5
       failure_threshold: 10
-  migrate:
-    depends_on:
-      database:
-        condition: process_healthy
-    entrypoint:
-    - mise
-    - x
-    - --
-    - nu
-    - -c
-    - >-
-      let os = (match $$nu.os-info.name { 'macos' => 'macos', 'windows' => 'windows',
-      _ => 'linux' }); let dir = (if (($$env.PRONTO_REPLAY_PGROLL_DIR? | default '')
-      != '') { $$env.PRONTO_REPLAY_PGROLL_DIR } else if ('/pgroll' | path exists) {
-      '/pgroll' } else { let d = (($$env.BAYT_LOCAL_WORK_DIR? | default $$nu.temp-dir) |
-      path join 'pgroll'); rm -rf $$d; mkdir $$d; let m = (open .bayt/bayt.migrate.json |
-      get dockerfile); ($$m | get -o copy | default []) | each {|c| cp ($$c.srcs.0)
-      ($$d | path join ($$c.dst | path basename)) } | ignore; ($$m | get -o epilogue |
-      default []) | each {|e| let lines = ($$e | lines); if ($$lines.0 | str starts-with
-      "COPY <<'PGROLL' /tmp/") { let name = ($$lines.0 | parse "COPY <<'PGROLL'
-      /tmp/{name}.parts" | get 0.name); ($$lines | skip 1 | take while {|l| $$l != "PGROLL" }
-      | str join "" | decode base64) | save --raw -f ($$d | path join $$name) } else if
-      ($$lines.0 | str starts-with "COPY <<'PGROLL' /pgroll/") { let name = ($$lines.0
-      | parse "COPY <<'PGROLL' /pgroll/{name}" | get 0.name); $$lines.1 | save --raw
-      -f ($$d | path join $$name) } else if ($$lines.0 | str starts-with "COPY
-      <<'RECONCILE' /pgroll/") { let name = ($$lines.0 | parse "COPY <<'RECONCILE'
-      /pgroll/{name}" | get 0.name); ($$lines | skip 1 | drop 1 | str join "\\n") | save --raw -f
-      ($$d | path join $$name) } } | ignore; $$d }); let script = (if
-      (($$env.PRONTO_MIGRATE_SH? | default '') != '') { $$env.PRONTO_MIGRATE_SH } else if
-      ('services/migrate/migrate.nu' | path exists) { 'services/migrate/migrate.nu' } else if
-      ('/migrate.sh' | path exists) and ($$os != 'windows') { '/migrate.sh' } else { ((^mise
-      where github:bonisoft3/mecha | str trim) | path join 'services/migrate/migrate.nu')
-      }); if ($$script | str ends-with '.nu') { ^nu $$script $$dir 00_initdb } else {
-      ^bash $$script $$dir 00_initdb }
-    availability:
-      exit_on_skipped: true
-    environment:
-    - >-
-      DATABASE_URL=postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@127.0.0.1:${DATABASE_PG_PORT:-17726}/${POSTGRES_DB:-mecha}?sslmode=disable
-    - REQUIRED_TABLES=schedule

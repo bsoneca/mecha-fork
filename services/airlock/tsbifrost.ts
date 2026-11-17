@@ -8,6 +8,7 @@ import {
   type AiTier,
   DEFAULT_AI_MODELS,
   providerKey,
+  resolveCallSpec,
   resolveModelSpec,
 } from "./ai-models.ts";
 
@@ -96,10 +97,13 @@ export function mergeExtra(base: Extra, extra: Extra): Extra {
   return out;
 }
 
+// The sayt platforms whose name differs from the AI target they run on.
+const SAYT_PLATFORM_TARGETS: Record<string, AiTarget> = { host: "local", compose: "docker" };
+
 export function createTsBifrost(opts: TsBifrostOptions = {}): (req: Request) => Promise<Response> {
   const env = opts.env ?? (typeof Deno !== "undefined" ? Deno.env.toObject() : {});
   const rawPlatform = opts.target ?? env.AI_TARGET ?? env.SAYT_PLATFORM ?? "docker";
-  const rawTarget = (rawPlatform === "host" ? "local" : rawPlatform) as AiTarget;
+  const rawTarget = (SAYT_PLATFORM_TARGETS[rawPlatform] ?? rawPlatform) as AiTarget;
   const target: AiTarget = rawTarget in DEFAULT_AI_MODELS ? rawTarget : "docker";
   const config: AiCapabilitiesConfig = opts.config ?? (env.AI_MODELS ? JSON.parse(env.AI_MODELS) : {});
   const fetcher = opts.fetcher ?? fetch;
@@ -152,7 +156,7 @@ export function createTsBifrost(opts: TsBifrostOptions = {}): (req: Request) => 
       if (!Array.isArray(messages) || messages.length === 0) {
         return json(400, { error: "messages array is required" });
       }
-      const spec = resolveModelSpec(config, target, "text", tier, env);
+      const spec = resolveCallSpec(config, target, "text", tier, env);
       const model = typeof body.model === "string" && body.model !== "" && body.model !== "auto"
         ? body.model
         : spec.model;
@@ -164,7 +168,7 @@ export function createTsBifrost(opts: TsBifrostOptions = {}): (req: Request) => 
           target,
           spec,
           model,
-          messages as Array<{ role: string; content: string }>,
+          messages as Array<{ role: string; content: ChatMessageContent }>,
           body,
           extra,
           idempotencyKey,
@@ -209,7 +213,7 @@ export function createTsBifrost(opts: TsBifrostOptions = {}): (req: Request) => 
       if (typeof prompt !== "string" || prompt.trim() === "") {
         return json(400, { error: "prompt string is required" });
       }
-      const spec = resolveModelSpec(config, target, "image", tier, env);
+      const spec = resolveCallSpec(config, target, "image", tier, env);
       const model = typeof body.model === "string" && body.model !== "" && body.model !== "auto"
         ? body.model
         : spec.model;
@@ -262,11 +266,40 @@ class UpstreamError extends Error {
   }
 }
 
+type ChatMessageContent = string | Array<Record<string, unknown>>;
+
+function googleParts(content: ChatMessageContent): Array<Record<string, unknown>> {
+  if (typeof content === "string") return [{ text: content }];
+  if (!Array.isArray(content) || content.length === 0) {
+    throw new UpstreamError(400, "google message content must be a string or non-empty multimodal array");
+  }
+  return content.map((part) => {
+    if (typeof part === "string") return { text: part };
+    if (part.type === "text" && typeof part.text === "string") return { text: part.text };
+    if (part.type === "image_url") {
+      const rawUrl = typeof part.image_url === "string"
+        ? part.image_url
+        : isPlain(part.image_url) && typeof part.image_url.url === "string"
+        ? part.image_url.url
+        : "";
+      const dataMatch = /^data:([^;,]+);base64,(.+)$/s.exec(rawUrl);
+      if (dataMatch) {
+        return { inlineData: { mimeType: dataMatch[1], data: dataMatch[2] } };
+      }
+      if (rawUrl.startsWith("https://") || rawUrl.startsWith("gs://")) {
+        return { fileData: { fileUri: rawUrl } };
+      }
+      throw new UpstreamError(400, "google image_url must be a base64 data URI or https/gs URI");
+    }
+    throw new UpstreamError(400, `unsupported google message part type: ${String(part.type)}`);
+  });
+}
+
 async function dispatchText(
   target: AiTarget,
   spec: AiModelSpec,
   model: string,
-  messages: Array<{ role: string; content: string }>,
+  messages: Array<{ role: string; content: ChatMessageContent }>,
   body: Record<string, unknown>,
   extra: Extra,
   idempotencyKey: string,
@@ -414,10 +447,10 @@ async function dispatchText(
   if (spec.provider === "google") {
     const apiKey = providerKey("google", env);
     const base = (spec.endpoint ?? "https://generativelanguage.googleapis.com/v1beta/models").replace(/\/$/, "");
-    const systemParts = messages.filter((m) => m.role === "system").map((m) => ({ text: m.content }));
+    const systemParts = messages.filter((m) => m.role === "system").flatMap((m) => googleParts(m.content));
     const contents = messages.filter((m) => m.role !== "system").map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content }],
+      parts: googleParts(m.content),
     }));
     const res = await fetcher(`${base}/${model}:generateContent`, {
       method: "POST",
@@ -440,10 +473,15 @@ async function dispatchText(
     const text = await res.text();
     if (!res.ok) throw new UpstreamError(res.status, `google ${res.status}: ${text}`);
     const parsed = JSON.parse(text) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string; thought?: boolean }> } }>;
       choices?: Array<{ message?: { content?: string } }>;
     };
-    const content = parsed.candidates?.[0]?.content?.parts?.[0]?.text ?? parsed.choices?.[0]?.message?.content;
+    const candidateParts = parsed.candidates?.[0]?.content?.parts ?? [];
+    const answerText = candidateParts
+      .filter((p) => !p.thought && typeof p.text === "string")
+      .map((p) => p.text)
+      .join("");
+    const content = answerText !== "" ? answerText : parsed.choices?.[0]?.message?.content;
     if (typeof content !== "string") throw new UpstreamError(502, "google response missing candidate text");
     return content;
   }
@@ -661,5 +699,5 @@ async function dispatchImage(
 if (import.meta.main) {
   const port = Number(Deno.env.get("TSBIFROST_PORT") ?? TSBIFROST_PORT);
   const plat = Deno.env.get("SAYT_PLATFORM");
-  Deno.serve({ hostname: plat === "local" || plat === "host" ? "127.0.0.1" : "0.0.0.0", port }, createTsBifrost());
+  Deno.serve({ hostname: plat === "host" ? "127.0.0.1" : "0.0.0.0", port }, createTsBifrost());
 }

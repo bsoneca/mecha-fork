@@ -14,11 +14,13 @@
 // the queue an effect's run is handed to the dispatcher Worker on (dispatch.ts);
 // OIDC_*, the providers a person may sign in through, as the auth service reads
 // them (services/auth/README.md#provider-sign-in), a client secret as a secret.
+// AIRLOCK_SEAL_PUBLIC, where an effect reads a secret field, the public half
+// of the dispatcher's seal key, `{kid, key}`, which the object publishes for
+// the screen to seal to.
 import { DurableObject } from 'cloudflare:workers'
 import type { PGlite } from '@electric-sql/pglite'
 import { type Assets, DataDirectory } from '../../pglite-workerd/src/data-directory.ts'
 import type { StorageFormat } from '../../pglite-workerd/src/storage-block.ts'
-import { providersFrom } from '../../../services/auth/oidc.ts'
 import { createEdgeCluster, type EdgeCluster, type EdgeClusterConfig } from './cluster.ts'
 import { type Clock, createClock, hasSchedules, serviceCrud } from './clock.ts'
 import type { Drain } from '../../mecha-browser/drains.ts'
@@ -27,13 +29,16 @@ import { createEdgeAirlock, die, type EdgeAirlock, type EdgeEffectDeclarations }
 import type { ClaimedRun, DispatchedRun, RunAnswer } from './dispatch.ts'
 import { hatchAt, type EdgeHatch } from './hatches.ts'
 import { verifyJwt } from '../../../services/auth/jwt.ts'
+import { providersFrom } from '../../../services/auth/oidc.ts'
 import { blobKeyOf, SIGNAL_MAX_BYTES } from './door.ts'
 import { applyScripts, ChangedScript, NoLedger, OutOfOrderScript, type Script, UnrunnableScript } from '../../pglite-workerd/scripts.ts'
-import type { PublicSnapshot } from './public-snapshot.ts'
+import { snapshotAdmission, type PublicSnapshot } from './public-snapshot.ts'
 import type { BatchMachine, Computation, Output } from '../../compute-snapshot/src/index.ts'
 import type { ComputeCapture } from './compute-coordinator.ts'
 import { physicalSnapshotId, readerName, type computeReader } from './compute-reader.ts'
 import { ComputeReaderOwners } from './compute-reader-owners.ts'
+import { SEAL_TTL_SECONDS, SEALED, sealKid } from '../../../services/airlock/seal.ts'
+import { PUBLISH_SEAL_SQL, SEAL_TABLES_SQL } from '../../../services/airlock/seal-tables.ts'
 
 export interface EdgeEnv {
   CLUSTER: DurableObjectNamespace
@@ -49,6 +54,7 @@ export interface EdgeEnv {
   BLOB_OBJECTS?: { put(key: string, bytes: Uint8Array | ReadableStream, options: { httpMetadata: { contentType: string } }): Promise<unknown>; head(key: string): Promise<unknown>; get(key: string): Promise<{ arrayBuffer(): Promise<ArrayBuffer> } | null> }
   BLOB_URL?: string
   AIRLOCK_QUEUE?: { send(body: DispatchedRun): Promise<unknown> }
+  AIRLOCK_SEAL_PUBLIC?: string
 }
 
 export interface EdgeOptions {
@@ -76,6 +82,15 @@ export class DataDirectoryLoading extends Error {
   constructor() { super('the data directory is loading') }
 }
 
+// A key as a uuid column would spell it back, lowercase: what tells two
+// offers of one row apart however they spelled it. A sealed value is kept
+// under the key as the database answered it (seal.ts sealLabel binds it so),
+// which for a text key is exactly what the write named.
+const canonicalKey = (v: unknown) => {
+  const text = String(v)
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text) ? text.toLowerCase() : text
+}
+
 const earliest = (a: number | null, b: number | null): number | null =>
   a === null ? b : b === null ? a : Math.min(a, b)
 
@@ -84,10 +99,26 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
   // pgl_step reaches the step through the isolate: one set of machines per Worker.
   installHostStep(machines, functions)
   const hasAirlock = Object.keys(effects).length > 0
+  // The tables whose writes carry a secret field (pronto's #Field.secret), by
+  // the fields and the key a sealed value is bound by.
+  const secretTables = new Map<string, { pk: string; fields: Set<string> }>()
+  for (const { declaration: d } of Object.values(effects)) {
+    if (!d.secretFields?.length) continue
+    const t = secretTables.get(d.table) ?? { pk: d.row[0], fields: new Set<string>() }
+    for (const f of d.secretFields) t.fields.add(f)
+    secretTables.set(d.table, t)
+  }
   return class Cluster extends DurableObject<EdgeEnv> {
-    readonly #dir = new DataDirectory(this.ctx.storage, storageFormat)
+    // A secret field's sealed value, from the write that named it until the
+    // last effect naming it on its row settles or five minutes pass: in this
+    // instance's memory and nowhere else, never its storage, the queue or the
+    // database, so an eviction loses it, which its effect meets as a value
+    // never written. `keys` are the invocations that claimed it.
+    readonly #sealed = new Map<string, { value: string; expires: number; keys: Set<string> }>()
+    readonly #dir = new DataDirectory(this.ctx.storage, storageFormat, error => { this.ctx.abort(error instanceof Error ? error.message : String(error)); throw error })
     readonly #readers = new ComputeReaderOwners(this.ctx.storage.sql)
     #resetting = false
+    readonly #snapshotAdmission = snapshotAdmission()
     #cluster: Promise<{ db: PGlite; cluster: EdgeCluster; clock: Clock; airlock: EdgeAirlock; ticks: boolean }> | null = null
 
     // One instance per hatch for this object's life, so what it remembers between
@@ -97,19 +128,37 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
     #boot() {
       if (this.#resetting || !this.#dir.storageReady) throw new DataDirectoryLoading()
       return this.#cluster ??= (async () => {
-        // A provider that cannot be signed in through refuses the boot, as it
-        // refuses the auth service's start.
-        const providers = providersFrom((name) => this.env[name as `OIDC_${string}`])
         const db = await this.#dir.open(assets)
         // A machine's steps run read committed, ordered by the locks they hold
         // on their players (its serial() refuses any other level): the
         // container tier's default, which this one connection states for
         // every request.
         await db.exec(`SET default_transaction_isolation TO 'read committed'`)
+        // The one connection serves requests and the service's own lanes, the
+        // airlock's moves among them. A request sets its claims LOCAL, and a
+        // setting once set LOCAL reads back as '' after its transaction, not
+        // NULL, which ''::json refuses wherever a policy or trigger reads the
+        // role: between requests the session holds the service's claims, as
+        // the drains state theirs.
+        await db.exec(`SELECT set_config('request.jwt.claims', '{"role":"service"}', false)`)
         await installEngines(db, Object.keys(machines), Object.keys(functions))
         const ticks = clockMode === 'ticker' && await hasSchedules(db)
+        const env = (name: string) => {
+          const v = (this.env as unknown as Record<string, unknown>)[name]
+          return typeof v === 'string' ? v : undefined
+        }
+        // A provider that cannot be signed in through refuses the boot, as it
+        // refuses the auth service's start.
+        const providers = providersFrom((name) => {
+          if (/^OIDC_[A-Z0-9]+_CLIENT_ID$/.test(name)) return env(name) ?? (env(name.replace(/_CLIENT_ID$/, '_ISSUER')) ? 'origin' : undefined)
+          if (/^OIDC_[A-Z0-9]+_AUTHORIZE_PARAMS$/.test(name)) {
+            const p = name.slice('OIDC_'.length, -'_AUTHORIZE_PARAMS'.length).toLowerCase()
+            return env(name) ?? (env(name.replace(/_AUTHORIZE_PARAMS$/, '_ISSUER')) && !env(name.replace(/_AUTHORIZE_PARAMS$/, '_CLIENT_ID')) ? `provider=${p}` : undefined)
+          }
+          return env(name)
+        })
         const cluster = await createEdgeCluster({
-          db, tables, schema, secret: this.env.JWT_SECRET, providers, log: console.error, drains,
+          db, tables, schema, secret: this.env.JWT_SECRET, log: console.error, drains, providers,
           ...(compute ? { compute: {
             ...compute,
             ...(compute.physicalSnapshots ? { retainSnapshot: async identity => {
@@ -152,6 +201,14 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
         // A job a drain or a settle enqueued, with no write after it, waited for
         // the next write or the hourly cron: a deck's text sat queued for minutes.
         // Graphile's add_job announces each insert, as its own workers hear it.
+        if (secretTables.size > 0) {
+          const published = JSON.parse(this.env.AIRLOCK_SEAL_PUBLIC ?? die('an effect reads a secret field, and AIRLOCK_SEAL_PUBLIC, its seal key\'s public half, is not set')) as { kid: string; key: JsonWebKey }
+          if (await sealKid(published.key) !== published.kid) die('AIRLOCK_SEAL_PUBLIC names a key its id is not')
+          await cluster.serialize(() => db.transaction(async (tx) => {
+            await tx.exec(SEAL_TABLES_SQL)
+            await tx.query(PUBLISH_SEAL_SQL, [published.kid, JSON.stringify(published.key)])
+          }))
+        }
         if (hasAirlock) await db.listen('"jobs:insert"', () => this.ctx.waitUntil(airlock.drain()))
         await clock.arm()
         this.#signalCompute()
@@ -187,7 +244,7 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
         for (const { owner, capture } of this.#readers.list()) {
           if (owner !== compute.reader) continue
           if (capture.generation === generation && await coordinator.publication(capture.identity) === 'pending') continue
-          await this.#readers.release(owner, capture, () => this.#reader(capture).release())
+          await this.#releaseCapture(capture)
         }
       }
       if (this.#resetting) throw new DataDirectoryLoading()
@@ -201,21 +258,44 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
     }
 
     async #releaseCapture(capture: ComputeCapture) {
-      if (compute?.physicalSnapshots) await this.#readers.release(compute.reader!, capture, () => this.#reader(capture).release())
-      this.#dir.releaseSnapshot(physicalSnapshotId(capture))
+      if (compute?.physicalSnapshots) await this.#readers.release(compute.reader!, capture, async () => {
+        const base = await this.#reader(capture).release(capture)
+        if (base === physicalSnapshotId(capture)) {
+          const old = this.#readers.base(compute.reader!, capture)
+          this.#readers.promote(compute.reader!, capture)
+          if (old && !this.#readers.pinned(old)) this.#dir.releaseSnapshot(physicalSnapshotId(old))
+        }
+      })
+      if (!this.#readers.pinned(capture)) this.#dir.releaseSnapshot(physicalSnapshotId(capture))
     }
 
     computeReaders() { return this.#readers.list() }
 
     async computePrepare(capture: ComputeCapture): Promise<boolean> {
-      await this.#captureCoordinator(capture)
-      if (!compute?.physicalSnapshots) return true
+      const coordinator = await this.#captureCoordinator(capture)
+      if (!compute?.physicalSnapshots) {
+        if (await coordinator.publication(capture.identity) !== 'pending') throw new Error('compute capture is no longer pending')
+        return true
+      }
       this.#readers.retain(compute.reader!, capture)
       const reader = this.#reader(capture)
-      const status = await reader.status(capture)
-      if (!status) return await reader.advance(capture, { kind: 'manifest', value: await this.computePhysicalManifest(capture) })
-      if (!status.nodesDone) return await reader.advance(capture, { kind: 'nodes', value: await this.computePhysicalNodes(capture, status.nodesAfter) })
-      if (status.nextFile) return await reader.advance(capture, { kind: 'blocks', value: await this.computePhysicalBlocks(capture, status.nextFile.path, status.nextFile.after) })
+      const state = await reader.status(capture)
+      const status = state.transfer
+      if (!status && !state.restoring && await coordinator.publication(capture.identity) !== 'pending') throw new Error('compute capture is no longer pending')
+      if (this.#resetting || !this.#dir.complete) throw new DataDirectoryLoading()
+      if (capture.generation !== this.#dir.generation) throw new Error('the data directory was replaced')
+      const manifest = this.#dir.snapshotManifest(physicalSnapshotId(capture))
+      if (!manifest) throw new Error('physical snapshot is no longer available')
+      if (state.restoring) return false
+      if (!status) return await reader.advance(capture, { kind: 'manifest', value: manifest })
+      if (!status.nodesDone) return await reader.advance(capture, { kind: 'nodes', value: await this.computePhysicalNodes(capture, status.nodesAfter, status.baseId ?? undefined) })
+      if (status.preparing) return await reader.advance(capture)
+      if (status.nextFile) return await reader.advance(capture, { kind: 'blocks', value: await this.computePhysicalBlocks(capture, status.nextFile.path, status.nextFile.after, status.baseId ?? undefined) })
+      if (status.complete) {
+        const old = this.#readers.base(compute.reader!, capture)
+        this.#readers.promote(compute.reader!, capture)
+        if (old && !this.#readers.pinned(old)) this.#dir.releaseSnapshot(physicalSnapshotId(old))
+      }
       return await reader.advance(capture)
     }
 
@@ -226,14 +306,14 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
       return snapshot
     }
 
-    async computePhysicalNodes(capture: ComputeCapture, after: string) {
+    async computePhysicalNodes(capture: ComputeCapture, after: string, baseId?: string) {
       await this.computePhysicalManifest(capture)
-      return this.#dir.snapshotNodes(physicalSnapshotId(capture), after)
+      return this.#dir.snapshotNodes(physicalSnapshotId(capture), after, baseId)
     }
 
-    async computePhysicalBlocks(capture: ComputeCapture, path: string, after: number) {
+    async computePhysicalBlocks(capture: ComputeCapture, path: string, after: number, baseId?: string) {
       await this.computePhysicalManifest(capture)
-      return this.#dir.snapshotBlocks(physicalSnapshotId(capture), path, after)
+      return this.#dir.snapshotBlocks(physicalSnapshotId(capture), path, after, baseId)
     }
 
     async computeSnapshot(capture: ComputeCapture): Promise<Response> {
@@ -260,9 +340,20 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
       return compute?.physicalSnapshots ? await this.#reader(capture).manifest(capture) : await coordinator.manifest(capture.identity)
     }
 
+    async computeReaderName(capture: ComputeCapture) {
+      await this.#captureCoordinator(capture)
+      return compute?.physicalSnapshots ? readerName(capture) : null
+    }
+
     async computeChunk(capture: ComputeCapture, source: string, after: number) {
       const coordinator = await this.#captureCoordinator(capture)
       return compute?.physicalSnapshots ? await this.#reader(capture).chunk(capture, source, after) : await coordinator.chunk(capture.identity, source, after)
+    }
+
+    async computeWal(capture: ComputeCapture, source: string, afterLsn: number) {
+      const coordinator = await this.#captureCoordinator(capture)
+      if (compute?.physicalSnapshots) return await this.#reader(capture).tableWal(capture, source, afterLsn)
+      return coordinator.tableWal ? await coordinator.tableWal(capture.identity, source, afterLsn) : null
     }
 
     async computeOutputChunk(capture: ComputeCapture, attempt: string, sink: string, ordinal: number, rows: Record<string, unknown>[]) {
@@ -346,13 +437,14 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
      * writes. The drains settle on a timer after the call returns, so the
      * object stays until they have. */
     async #effects<T>(use: (airlock: EdgeAirlock) => Promise<T>): Promise<T> {
-      const { cluster, airlock } = await this.#boot()
+      const { cluster, clock, airlock, ticks } = await this.#boot()
       await cluster.compute()
       const drains = await cluster.drains()
       try {
         return await use(airlock)
       } finally {
-        this.ctx.waitUntil(drains.idle())
+        if (ticks) await clock.arm()
+        this.ctx.waitUntil(drains.idle().then(() => ticks ? clock.arm() : undefined))
       }
     }
 
@@ -361,7 +453,94 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
      * loaded directory's own lease dispatches what it still owes. */
     async effectClaim(key: string, token: string, claimant: string): Promise<ClaimedRun | null> {
       if (this.#resetting || !this.#dir.complete || !this.#dir.storageReady) return null
-      return await this.#effects((airlock) => airlock.claim(key, token, claimant))
+      const run = await this.#effects((airlock) => airlock.claim(key, token, claimant))
+      const d = run && effects[run.effect]?.declaration
+      if (!run || !d?.secretFields?.length) return run
+      // The sealed values travel with the claim alone, to the one Worker that
+      // can open them, and leave memory once the key's outcome lands.
+      const sealed: Record<string, string> = {}
+      for (const f of d.secretFields) {
+        const held = this.#heldSecret(d.table, String(run.row[d.row[0]]), f)
+        if (held) {
+          held.keys.add(key)
+          sealed[f] = held.value
+        }
+      }
+      return { ...run, sealed }
+    }
+
+    #secretKey = (table: string, pk: string, field: string) => JSON.stringify([table, pk, field])
+
+    #heldSecret(table: string, pk: string, field: string) {
+      const now = Date.now()
+      for (const [k, v] of this.#sealed) if (v.expires <= now) this.#sealed.delete(k)
+      return this.#sealed.get(this.#secretKey(table, pk, field))
+    }
+
+    /** A write naming a secret field: the sealed values taken out of its body,
+     * which reaches the database without them, and kept here once the write
+     * lands, for the rows it returned. What is not sealed is refused, and not
+     * repeated. A PATCH names its one row by its key, the row a seal binds
+     * to. */
+    async #withoutSecrets(req: Request, write: (req: Request) => Promise<Response>): Promise<Response> {
+      const url = new URL(req.url)
+      // The table as crud's router reads it (cluster.ts): the first segment past /crud.
+      const table = /^\/crud(\/|$)/.test(url.pathname) ? url.pathname.replace(/^\/crud/, '').split('/').filter(Boolean)[0] : undefined
+      const spec = table === undefined ? undefined : secretTables.get(table)
+      if (!spec || !['POST', 'PATCH', 'PUT'].includes(req.method)) return await write(req)
+      // Only a JSON body is read for its secret fields; crud's other bodies
+      // (a form, CSV) would carry one past this to the database.
+      if (!/^application\/json\b/i.test(req.headers.get('content-type') ?? '')) return json({ error: `a write to ${table} is JSON, which its secret fields are read from` }, 415)
+      const text = await req.text()
+      let body: unknown
+      try {
+        body = JSON.parse(text)
+      } catch {
+        return json({ error: `a write to ${table} is JSON, which its secret fields are read from` }, 400)
+      }
+      const rows = (Array.isArray(body) ? body : [body]) as Record<string, unknown>[]
+      const named = req.method === 'PATCH' ? /^eq\.(.+)$/.exec(url.searchParams.get(spec.pk) ?? '')?.[1] : undefined
+      const patched = named
+      const taken: { pk: string; field: string; value: string }[] = []
+      for (const row of rows) {
+        if (row === null || typeof row !== 'object') continue
+        for (const field of spec.fields) {
+          if (!(field in row)) continue
+          const value = row[field]
+          delete row[field]
+          if (value === null) continue
+          if (typeof value !== 'string' || !SEALED.test(value)) return json({ error: `${table}.${field} takes a value sealed to the airlock's key, and this one is not` }, 400)
+          const pk = req.method === 'PATCH' ? patched : row[spec.pk] === undefined ? undefined : String(row[spec.pk])
+          if (pk === undefined) return json({ error: `${table}.${field} is written to one row named by its ${spec.pk}` }, 400)
+          if (req.method === 'PATCH' && Object.keys(row).length === 0) row[spec.pk] = pk
+          taken.push({ pk, field, value })
+        }
+      }
+      if (taken.length === 0) return await write(new Request(req, { body: text }))
+      // A row offered twice in one write, a value or not, would keep one
+      // offer's value for the other's row once a conflict turns one away.
+      const offered = rows.flatMap((r) => r !== null && typeof r === 'object' && r[spec.pk] !== undefined ? [canonicalKey(r[spec.pk])] : [])
+      if (new Set(offered).size !== offered.length) return json({ error: `${table} is offered one row twice in one write, which a secret field cannot tell apart` }, 400)
+      const headers = new Headers(req.headers)
+      headers.delete('content-length')
+      // The rows the write landed on, which the caller may write, are the
+      // ones a sealed value is kept for; a filter that matched none keeps none.
+      const prefer = (headers.get('prefer') ?? '').split(',').map((p) => p.trim()).filter((p) => p !== '' && !p.startsWith('return='))
+      headers.set('prefer', [...prefer, 'return=representation'].join(','))
+      const res = await write(new Request(req.url, { method: req.method, headers, body: JSON.stringify(body) }))
+      if (!res.ok) return res
+      const answered = await res.text()
+      // Each offered key as the database answered it: exactly, or, where the
+      // column lowercased a uuid, its lowercase.
+      const landed = (JSON.parse(answered || '[]') as Record<string, unknown>[]).map((r) => String(r[spec.pk]))
+      const answeredAs = (pk: string) => landed.includes(pk) ? pk : landed.find((l) => l === canonicalKey(l) && l === canonicalKey(pk) && l !== pk)
+      const now = Date.now()
+      for (const [k, v] of this.#sealed) if (v.expires <= now) this.#sealed.delete(k)
+      for (const { pk, field, value } of taken) {
+        const at = answeredAs(pk)
+        if (at !== undefined) this.#sealed.set(this.#secretKey(table!, at, field), { value, expires: now + SEAL_TTL_SECONDS * 1000, keys: new Set() })
+      }
+      return new Response(answered, { status: res.status, headers: res.headers })
     }
 
     /** The dispatcher's answer for a run, settled here in the object's
@@ -370,6 +549,18 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
     async effectAnswer(key: string, entered: number, answer: RunAnswer): Promise<void> {
       if (this.#resetting || !this.#dir.complete || !this.#dir.storageReady) throw new DataDirectoryLoading()
       await this.#effects((airlock) => airlock.answer(key, entered, answer))
+      // Settled, or settled unknown on its last error: no run asks again.
+      // A value another effect naming its field still awaits on the row
+      // (claimed, unsettled) is kept for that one.
+      if ('outcome' in answer || entered >= (effects[key.slice(0, key.indexOf(':'))]?.declaration.attempts ?? Infinity)) {
+        for (const [k, v] of this.#sealed) {
+          if (!v.keys.delete(key)) continue
+          const [table, pk, field] = JSON.parse(k) as [string, string, string]
+          const naming = Object.entries(effects).filter(([, e]) => e.declaration.table === table && e.declaration.secretFields?.includes(field))
+          const awaited = await this.#effects((airlock) => airlock.awaiting(naming.map(([n]) => n), naming[0]?.[1].declaration.row[0] ?? '', pk, key))
+          if (!awaited) this.#sealed.delete(k)
+        }
+      }
     }
 
     override async alarm(): Promise<void> {
@@ -401,8 +592,10 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
 
     protected async readPublic<T>(use: (snapshot: PublicSnapshot) => Promise<T>, priority: 'high' | 'low' = 'high'): Promise<T> {
       if (!this.#dir.complete) throw new DataDirectoryLoading()
-      const { cluster } = await this.#boot()
-      return cluster.publicSnapshot(this.#dir.generation, use, priority)
+      return await this.#snapshotAdmission(priority, async () => {
+        const { cluster } = await this.#boot()
+        return await cluster.publicSnapshot(this.#dir.generation, use, priority)
+      })
     }
 
     override async fetch(req: Request): Promise<Response> {
@@ -423,11 +616,16 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
         this.#resetting = true
         const booted = this.#cluster ? await this.#cluster : null
         if (booted) await booted.cluster.read(async () => {})
+        for (const { owner, capture } of this.#readers.bases()) {
+          if (owner === compute?.reader) await this.#reader(capture).release(capture, true)
+          else this.#readers.retain(owner, capture)
+          this.#readers.clearBase(owner, capture)
+        }
         for (const snapshot of this.#dir.snapshots()) {
           await this.#releaseCapture({ generation: snapshot.sourceGeneration, identity: JSON.parse(snapshot.id) })
         }
         for (const { owner, capture } of this.#readers.list()) {
-          if (owner === compute?.reader) await this.#readers.release(owner, capture, () => this.#reader(capture).release())
+          if (owner === compute?.reader) await this.#readers.release(owner, capture, async () => { await this.#reader(capture).release(capture, true) })
         }
         await this.ctx.blockConcurrencyWhile(async () => {
           await this.ctx.storage.deleteAlarm()
@@ -435,6 +633,24 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
           else this.#dir.reset()
         })
         return json({ reset: true })
+      }
+      if (path === '/import/compute') {
+        if (req.method !== 'GET') return json({ error: 'compute status is a GET' }, 405)
+        if (!compute || !this.env.COMPUTE_COORDINATOR) return json({ error: 'computation is not configured' }, 404)
+        const detail = new URL(req.url).searchParams.get('detail') === '1'
+        const coordinator = await this.env.COMPUTE_COORDINATOR.get(this.env.COMPUTE_COORDINATOR.idFromName('compute')).status(detail)
+        const postgresMemoryBytes = detail && this.#cluster ? (await this.#cluster).db.Module.HEAPU8.byteLength : null
+        const readers = []
+        for (const row of this.#readers.list()) {
+          if (row.owner !== compute.reader) { readers.push({ ...row, status: null }); continue }
+          try {
+            readers.push({ ...row, status: { released: false, transfer: await this.#reader(row.capture).status(row.capture) } })
+          } catch (error) {
+            if (!(error instanceof Error) || error.message !== 'compute reader was released') throw error
+            readers.push({ ...row, status: { released: true, transfer: null } })
+          }
+        }
+        return json({ coordinator, readerOwner: compute.reader ?? null, readers, readerBases: this.#readers.bases(), ...(detail ? { postgresMemoryBytes } : {}) })
       }
       // A release's migrations over a directory kept: what the ledger lacks
       // is applied while nothing else runs, and the Worker ends the object
@@ -559,7 +775,7 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
       }
       if (CLUSTER_ROUTES.test(path)) {
         const { cluster, clock, airlock, ticks } = await this.#boot()
-        const res = await cluster.handle(req)
+        const res = secretTables.size > 0 ? await this.#withoutSecrets(req, (r) => cluster.handle(r)) : await cluster.handle(req)
         // A write may have armed a deadline (a machine's settle) or enqueued an effect.
         if (res.ok && /^\/crud(\/|$)/.test(path) && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
           if (ticks) await clock.arm()

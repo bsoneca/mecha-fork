@@ -26,6 +26,11 @@ services:
         ${RCLONE_SECRET_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
       AWS_REGION: rclone
       IMGPROXY_MAX_SRC_RESOLUTION: "50"
+      IMGPROXY_ALLOWED_SOURCES: s3://mecha-objects/,https://lh3.googleusercontent.com/
+      IMGPROXY_ONLY_PRESETS: "true"
+      IMGPROXY_PRESETS: >-
+        thumb=rs:fill:128:128/f:webp,avatar=rs:fill:256:256/f:webp,picture=rs:fit:1024:1024/f:webp
+      IMGPROXY_MAX_RESULT_DIMENSION: "1024"
       IMGPROXY_SET_CANONICAL_HEADER: "false"
       IMGPROXY_CACHE_CONTROL_PASSTHROUGH: "true"
     healthcheck:

@@ -165,10 +165,12 @@ export async function createDrains(cfg: DrainsConfig): Promise<Drains> {
     const ending = passing
     passing = []
     let failed = false
+    let ran = false
     for (const s of states) {
       if (stopped) break
       if (!s.owed) continue
       s.owed = false
+      ran = true
       try {
         await serialize(() => db.transaction(async (tx) => {
           await tx.exec(`SELECT set_config('request.jwt.claims', '{"role":"service"}', true); SELECT set_config('app.scopes', '', true); SET LOCAL ROLE service;`)
@@ -187,7 +189,7 @@ export async function createDrains(cfg: DrainsConfig): Promise<Drains> {
     }
     busy = false
     if (failed) armRetry()
-    if (retryAt() !== before) cfg.retry?.()
+    if (ran || retryAt() !== before) cfg.retry?.()
     for (const p of ending) p()
     if (states.some((s) => s.owed)) settle()
     else {
@@ -198,7 +200,7 @@ export async function createDrains(cfg: DrainsConfig): Promise<Drains> {
     if (quiet()) wake()
   }
 
-  const unlisten = await db.listen('drain', (table: string) => {
+  const unlisten = await serialize(() => db.listen('drain', (table: string) => {
     let woke = false
     for (const s of states) {
       if (!s.drain.on.includes(table)) continue
@@ -206,7 +208,7 @@ export async function createDrains(cfg: DrainsConfig): Promise<Drains> {
       woke = true
     }
     if (woke) settle()
-  })
+  }))
   settle()
 
   return {
@@ -219,7 +221,7 @@ export async function createDrains(cfg: DrainsConfig): Promise<Drains> {
       if (retrying !== null) clearTimeout(retrying)
       settling = retrying = null
       await current
-      await unlisten()
+      await serialize(() => unlisten())
       for (const p of passing) p()
       passing = []
       wake()

@@ -9,6 +9,7 @@
       "PGRST_JWT_SECRET": "${PGRST_JWT_SECRET:-mecha-dev-secret-please-override-32ch}",
       "WEBAUTHN_RP_ID": "${WEBAUTHN_RP_ID:-localhost}",
       "WEBAUTHN_ORIGIN": "${WEBAUTHN_ORIGIN:-https://localhost:*}",
+      "WEBAUTHN_ANDROID_ORIGINS": "${WEBAUTHN_ANDROID_ORIGINS:-}",
       "OIDC_PROVIDERS": ""
     },
     "ports": [],
@@ -74,6 +75,7 @@
       "PGRST_JWT_SECRET": "${PGRST_JWT_SECRET:-mecha-dev-secret-please-override-32ch}",
       "WEBAUTHN_RP_ID": "${WEBAUTHN_RP_ID:-localhost}",
       "WEBAUTHN_ORIGIN": "${WEBAUTHN_ORIGIN:-https://localhost:*}",
+      "WEBAUTHN_ANDROID_ORIGINS": "${WEBAUTHN_ANDROID_ORIGINS:-}",
       "OIDC_PROVIDERS": ""
     },
     "after": {
@@ -143,8 +145,8 @@
         "libraries/mecha/.bayt/compose.auth.yaml",
         "libraries/mecha/.bayt/compose.auth-image.yaml",
         "libraries/mecha/.bayt/compose.database.yaml",
-        "libraries/mecha/.bayt/compose.database-image.yaml",
-        "libraries/mecha/.bayt/compose.migrate.yaml"
+        "libraries/mecha/.bayt/compose.migrate.yaml",
+        "libraries/mecha/.bayt/compose.database-image.yaml"
       ]
     },
     "outs": {
@@ -175,8 +177,8 @@
         "libraries/mecha/.bayt/compose.auth.yaml",
         "libraries/mecha/.bayt/compose.auth-image.yaml",
         "libraries/mecha/.bayt/compose.database.yaml",
-        "libraries/mecha/.bayt/compose.database-image.yaml",
-        "libraries/mecha/.bayt/compose.migrate.yaml"
+        "libraries/mecha/.bayt/compose.migrate.yaml",
+        "libraries/mecha/.bayt/compose.database-image.yaml"
       ]
     },
     "srcs": {
@@ -195,6 +197,7 @@
           "services/auth/jwt.ts",
           "services/auth/main.ts",
           "services/auth/oidc.ts",
+          "services/auth/origins.ts",
           "services/auth/schema.ts"
         ],
         "exclude": []
@@ -217,6 +220,7 @@
               "services/auth/jwt.ts",
               "services/auth/main.ts",
               "services/auth/oidc.ts",
+              "services/auth/origins.ts",
               "services/auth/schema.ts"
             ],
             "exclude": []
@@ -233,8 +237,8 @@
         "libraries/mecha/.bayt/compose.auth.yaml",
         "libraries/mecha/.bayt/compose.auth-image.yaml",
         "libraries/mecha/.bayt/compose.database.yaml",
-        "libraries/mecha/.bayt/compose.database-image.yaml",
-        "libraries/mecha/.bayt/compose.migrate.yaml"
+        "libraries/mecha/.bayt/compose.migrate.yaml",
+        "libraries/mecha/.bayt/compose.database-image.yaml"
       ]
     }
   },
@@ -260,8 +264,8 @@
     "libraries/mecha/.bayt/compose.auth.yaml",
     "libraries/mecha/.bayt/compose.auth-image.yaml",
     "libraries/mecha/.bayt/compose.database.yaml",
-    "libraries/mecha/.bayt/compose.database-image.yaml",
-    "libraries/mecha/.bayt/compose.migrate.yaml"
+    "libraries/mecha/.bayt/compose.migrate.yaml",
+    "libraries/mecha/.bayt/compose.database-image.yaml"
   ],
   "chainedDeps": [
     {

@@ -330,6 +330,95 @@ BEGIN
     RAISE EXCEPTION '38 a subjectless request did not hold exactly public:';
   END IF;
 
+  -- A token another issuer signed acts only as a role declared for one,
+  -- whatever role it named; the stack's own tokens name the stack's issuer.
+  SET LOCAL ROLE _f_app;
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":"https://id.example","role":"_f_app"}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '63 an outside issuer''s token acted as an undeclared role';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  -- An empty or null issuer is not the stack's either.
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":"","role":"_f_app"}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '63 an outside token naming an empty issuer acted as an undeclared role';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":null,"role":"_f_app"}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '63 an outside token naming a null issuer acted as an undeclared role';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","role":"_f_app"}', true);
+  PERFORM app_pre_request();
+  IF current_scopes() <> ARRAY['public:', 'user:ana'] THEN
+    RAISE EXCEPTION '64 the stack''s own token was refused a role';
+  END IF;
+  -- One naming no issuer is the stack's from before it named one, believed
+  -- while the app trusts no other issuer.
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","role":"_f_app"}', true);
+  PERFORM app_pre_request();
+  IF current_scopes() <> ARRAY['public:', 'user:ana'] THEN
+    RAISE EXCEPTION '64 a token naming no issuer was refused where the app trusts no other';
+  END IF;
+  RESET ROLE;
+  INSERT INTO mecha.token_role VALUES ('_f_bot');
+  SET LOCAL ROLE _f_app;
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '67 a token naming no issuer acted as a role where the app trusts another issuer';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","role":"_f_app"}', true);
+  PERFORM app_pre_request();
+  IF current_scopes() <> ARRAY['public:', 'user:ana'] THEN
+    RAISE EXCEPTION '67 the stack''s own token was refused a role where the app trusts another issuer';
+  END IF;
+  RESET ROLE;
+  DELETE FROM mecha.token_role WHERE role_name = '_f_bot';
+  INSERT INTO mecha.token_role VALUES ('_f_app');
+  SET LOCAL ROLE _f_app;
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":"https://id.example","aud":"https://app.example/crud","role":"_f_app"}', true);
+  PERFORM app_pre_request();
+  IF current_scopes() <> ARRAY['public:', 'user:bot'] THEN
+    RAISE EXCEPTION '65 an outside issuer''s token was refused a declared role';
+  END IF;
+  -- PostgREST lets a token naming no audience past crud's, so the floor
+  -- refuses an outside one that names none, even as a declared role.
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":"https://id.example","role":"_f_app"}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '66 an outside token naming no audience acted as a declared role';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":"https://id.example","aud":[],"role":"_f_app"}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '66 an outside token naming an empty audience acted as a declared role';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":"https://id.example","aud":["https://app.example/crud"],"role":"_f_app"}', true);
+  PERFORM app_pre_request();
+  -- A declared role is another issuer's: the stack's issuer, or none, is refused it.
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":"mecha:stack","aud":"https://app.example/crud","role":"_f_app"}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '68 a token naming the stack''s issuer acted as a declared role';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","aud":"https://app.example/crud","role":"_f_app"}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '68 a token naming no issuer acted as a declared role';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  RESET ROLE;
+  DELETE FROM mecha.token_role WHERE role_name = '_f_app';
+  PERFORM set_config('request.jwt.claims', '{}', true);
+
   -- A write's response names its transaction, which is how the client
   -- confirms the write against its shape stream: as the 32-bit xid Electric
   -- reports, added to the headers already set. A read names none, nor does a
@@ -525,14 +614,14 @@ BEGIN
     FOR EACH ROW EXECUTE FUNCTION mecha.scope_from_parent('_f_parent', 'id', 'parent_id');
   INSERT INTO _f_arch._f_child(parent_id) VALUES (1);
   IF (SELECT scope_id FROM _f_arch._f_child) <> 'user:public' THEN
-    RAISE EXCEPTION '67 an unqualified parent no longer resolved on the search path';
+    RAISE EXCEPTION '69 an unqualified parent no longer resolved on the search path';
   END IF;
   CREATE TABLE _f_arch._f_orphan(id serial primary key, parent_id int not null, scope_id text not null);
   CREATE TRIGGER _f_orphan_scope BEFORE INSERT ON _f_arch._f_orphan
     FOR EACH ROW EXECUTE FUNCTION mecha.scope_from_parent('_f_lone', 'id', 'parent_id');
   INSERT INTO _f_arch._f_orphan(parent_id) VALUES (1);
   IF (SELECT scope_id FROM _f_arch._f_orphan) <> 'user:lone' THEN
-    RAISE EXCEPTION '68 an unqualified parent outside the search path was not the child''s schema''s';
+    RAISE EXCEPTION '70 an unqualified parent outside the search path was not the child''s schema''s';
   END IF;
   DROP SCHEMA _f_arch CASCADE;
   DROP TABLE _f_parent;
@@ -552,7 +641,7 @@ BEGIN
   -- PUBLIC among other roles is PUBLIC still.
   CREATE POLICY mixed ON _f_open FOR ALL TO _f_app, PUBLIC USING (true) WITH CHECK (true);
   SELECT count(*) INTO n FROM mecha.rls_unprotected WHERE table_name = 'public._f_open';
-  IF n <> 1 THEN RAISE EXCEPTION '69 a permissive policy granted to PUBLIC and a role was not flagged'; END IF;
+  IF n <> 1 THEN RAISE EXCEPTION '71 a permissive policy granted to PUBLIC and a role was not flagged'; END IF;
   DROP TABLE _f_open;
 
   -- The floor's scopes are a constant of the statement, evaluated once as an
@@ -572,38 +661,58 @@ BEGIN
   -- A token an API key minted reaches only its scopes (services/auth, kid and
   -- scp): a read needs `read`, a write or a call `write`, a check outside any
   -- request `read`; a session's token, with no kid, is untouched.
-  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1","scp":["read"]}', true);
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","kid":"k1","scp":["read"]}', true);
   PERFORM set_config('request.method', 'GET', true);
   PERFORM app_pre_request();
   PERFORM set_config('request.method', 'PATCH', true);
   BEGIN
     PERFORM app_pre_request();
-    RAISE EXCEPTION '63 a read-only key wrote';
+    RAISE EXCEPTION '72 a read-only key wrote';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
-  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1","scp":["write","machines:match"]}', true);
+  -- A key token from before the stack named its issuer is held to its scopes too.
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1","scp":["read"]}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '77 an issuerless read-only key wrote';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","kid":"k1","scp":["write","machines:match"]}', true);
   PERFORM set_config('request.method', 'POST', true);
   PERFORM set_config('request.path', '/rpc/_f_call', true);
   PERFORM app_pre_request();
   PERFORM set_config('request.method', 'GET', true);
   BEGIN
     PERFORM app_pre_request();
-    RAISE EXCEPTION '64 a key without read read';
+    RAISE EXCEPTION '73 a key without read read';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
   PERFORM set_config('request.method', '', true);
   BEGIN
     PERFORM app_pre_request();
-    RAISE EXCEPTION '65 a key without read passed a check outside a request';
+    RAISE EXCEPTION '74 a key without read passed a check outside a request';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
-  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1"}', true);
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","kid":"k1"}', true);
   PERFORM set_config('request.method', 'GET', true);
   BEGIN
     PERFORM app_pre_request();
-    RAISE EXCEPTION '66 a key token with no scopes read';
+    RAISE EXCEPTION '75 a key token with no scopes read';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1"}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '78 an issuerless key token with no scopes read';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+  -- The gate is the stack's own keys': a trusted issuer's token that happens
+  -- to name a `kid`, with no `scp`, is that issuer's and passes.
+  INSERT INTO mecha.token_role VALUES (current_user);
+  PERFORM set_config('request.jwt.claims', '{"sub":"bot","iss":"https://id.example","aud":"https://app.example/crud","kid":"k9"}', true);
+  PERFORM set_config('request.method', 'GET', true);
+  PERFORM app_pre_request();
+  DELETE FROM mecha.token_role WHERE role_name = current_user;
   PERFORM set_config('request.jwt.claims', '{"sub":"ana"}', true);
   PERFORM set_config('request.method', 'DELETE', true);
   PERFORM set_config('request.path', '/_f_public', true);
@@ -611,7 +720,7 @@ BEGIN
   PERFORM set_config('request.method', 'GET', true);
   PERFORM set_config('response.headers', '', true);
 
-  RAISE WARNING 'rls: 69/69 pass';
+  RAISE WARNING 'rls: 78/78 pass';
 END $$;
 
 DROP TABLE _f_posting, _f_note, _f_denied;

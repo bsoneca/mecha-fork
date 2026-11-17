@@ -82,6 +82,14 @@ Deno.test("secrets are named by environment variables", () => {
   }
 });
 
+Deno.test("secret fields are named by the invoking row's columns", () => {
+  const manifest = (secretFields: unknown) => JSON.stringify({ effects: { charge: { ...effect(), secretFields } } });
+  assertEquals(parseManifest(manifest(["pin"])).charge.secretFields, ["pin"]);
+  for (const bad of [["pin; drop"], [""], "pin", [1]]) {
+    assertThrows(() => parseManifest(manifest(bad)), Error, "secretFields");
+  }
+});
+
 Deno.test("a credential is a header name daprd forwards and neither the host nor HTTP sets, a scheme word and an environment variable's name", () => {
   const manifest = (credential: unknown) => JSON.stringify({ effects: { charge: { ...effect(), credential } } });
   assertEquals(parseManifest(manifest({ header: "Authorization", scheme: "Bearer", secret: "ACQUIRER_KEY" })).charge.credential, { header: "Authorization", scheme: "Bearer", secret: "ACQUIRER_KEY" });
@@ -91,6 +99,15 @@ Deno.test("a credential is a header name daprd forwards and neither the host nor
   const taken = ["x-api-key", "Idempotency-Key", "content-type", "Content-Length", "Host", "Accept", "Transfer-Encoding", "traceparent", "Tracestate", "baggage"].map((header) => ({ header, secret: "K" }));
   for (const bad of [{ header: "Authorization", secret: "acquirer-key" }, { header: "Auth orization", secret: "K" }, { header: "X", scheme: "Bearer token", secret: "K" }, "ACQUIRER_KEY", { secret: "K" }, ...taken]) {
     assertThrows(() => parseManifest(manifest(bad)), Error, "credential");
+  }
+});
+
+Deno.test("the edge's origin is an https origin without a path, or the environment variable naming one", () => {
+  const manifest = (edgeOrigin: unknown) => JSON.stringify({ effects: { charge: { ...effect(), edgeOrigin } } });
+  assertEquals(parseManifest(manifest("https://api.acquirer.example")).charge.edgeOrigin, "https://api.acquirer.example");
+  assertEquals(parseManifest(manifest({ secret: "ACQUIRER_ORIGIN" })).charge.edgeOrigin, { secret: "ACQUIRER_ORIGIN" });
+  for (const bad of ["http://api.acquirer.example", "https://api.acquirer.example/v1", { secret: "acquirer-origin" }, { secret: "A", url: "https://a.example" }, {}, null]) {
+    assertThrows(() => parseManifest(manifest(bad)), Error, "edgeOrigin");
   }
 });
 
