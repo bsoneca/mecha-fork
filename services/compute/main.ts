@@ -41,7 +41,8 @@
 //   - and past it, only what the computation declares in `endowments`
 //     (language.ts's ENDOWABLE): Crypto, WebCrypto's operations that are
 //     deterministic by their specification (crypto.ts), TextEncoder,
-//     TextDecoder, URL, URLSearchParams, Cheerio and Pdf. One used undeclared throws.
+//     TextDecoder, URL, URLSearchParams, Cheerio, Pdf and Xlsx. One used undeclared
+//     throws.
 //
 // The service loads every computation at startup and dies on one it refuses;
 // admit.ts loads them as it does, for a lint to refuse them first.
@@ -61,7 +62,16 @@ import { compilationProfile } from "./native-feldera.ts";
 import { reconcileNativeResources } from "./native-cleanup.ts";
 import type { BatchSpec } from "./batches.ts";
 import { Feldera, type FelderaProgram } from "./feldera.ts";
-import { publish } from "./publication.ts";
+import {
+  dropStagedPages,
+  preparePublish,
+  publish,
+  publishPages,
+  publishPrepared,
+  publishStagedPages,
+  stagePages,
+} from "./publication.ts";
+import { BoundedRuntime, collectBoundedFiles, type BoundedCapture, type BoundedOutput } from "./bounded-runtime.ts";
 import { type SinkWrites, validateSinkWrites } from "../../packages/compute-snapshot/src/sink-writes.ts";
 import { PostgresJobCache } from "./job-cache.ts";
 import type { TypeTable } from "./portable-contract.ts";
@@ -350,6 +360,7 @@ export class Computation implements Runnable {
 export class Lake implements Reader {
   private constructor(
     private databaseUrl: string,
+    private lakeDir: string,
     private con: DuckDBConnection,
     private reader: Reader,
   ) {}
@@ -370,7 +381,7 @@ export class Lake implements Reader {
     );
     const reader = await db.connect();
     await reader.run("USE lake");
-    return new Lake(databaseUrl, con, readerOf(reader));
+    return new Lake(databaseUrl, lakeDir, con, readerOf(reader));
   }
 
   /** A failed delivery may have left Postgres attached; each one starts clean. */
@@ -388,6 +399,37 @@ export class Lake implements Reader {
   /** CDC can arrive before Postgres statistics catch up. Always copy the
    * declared inputs in one transaction instead of caching by those counters. */
   async hold(tables: string[]) {
+    if (await BoundedRuntime.syncReplica(this.lakeDir, this.databaseUrl, tables)) {
+      await this.con.run(
+        `ATTACH ${literal(`${this.lakeDir}/replica.duckdb`)} AS __duckstream_replica (READ_ONLY)`,
+      );
+      try {
+        await this.con.run("BEGIN");
+        try {
+          for (const t of tables) {
+            await this.con.run(`DROP TABLE IF EXISTS lake.${t}`);
+            await this.con.run(
+              `CREATE TABLE lake.${t} AS SELECT * FROM __duckstream_replica.main.${t}`,
+            );
+          }
+          await this.con.run("COMMIT");
+        } catch (e) {
+          await this.con.run("ROLLBACK").catch((r) => {
+            throw new AggregateError([e, r], "a snapshot failed, and so did its rollback");
+          });
+          throw e;
+        }
+      } finally {
+        await this.con.run("DETACH DATABASE IF EXISTS __duckstream_replica");
+      }
+      await this.con.run(
+        "CALL ducklake_expire_snapshots('lake', older_than => now())",
+      );
+      await this.con.run(
+        "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)",
+      );
+      return;
+    }
     await this.con.run("BEGIN");
     try {
       for (const t of tables) {
@@ -522,12 +564,12 @@ export async function computationVersion(
     )
       .map((byte) => byte.toString(16).padStart(2, "0")).join("");
   const files = await Promise.all(
-    [spec.file, ...spec.wasm, ...(spec.feldera ? [spec.feldera] : [])]
+    [spec.file, ...spec.wasm, ...(spec.feldera ? [spec.feldera] : []), ...(engine === "duckdb-snapshot" && spec.steps ? [`${spec.steps}.bundle.js`] : [])]
       .map(async (file) => await hash(await Deno.readFile(file))),
   );
   const contract = spec.feldera === undefined && engine === "duckdb-snapshot"
     ? { protocol: 1, spec, schema, files }
-    : { protocol: engine === "feldera" ? 3 : 2, engine, spec, schema, files };
+    : { protocol: engine === "feldera" ? 3 : spec.steps ? 4 : 2, engine, spec, schema, files };
   return await hash(new TextEncoder().encode(strictJson(contract, true)));
 }
 
@@ -535,6 +577,8 @@ async function main() {
   const { openBatches } = await import("./batches.ts");
   const specs: Spec[] = JSON.parse(need("COMPUTATIONS"));
   const engine = queryEngine(Deno.env.get("DUCKSTREAM_ENGINE"));
+  const artifacts = Deno.env.get("FELDERA_ARTIFACTS_DIR");
+  if (engine === "feldera" && artifacts !== undefined && (!artifacts || !artifacts.startsWith("/"))) throw new Error("FELDERA_ARTIFACTS_DIR must be an absolute path");
   const profile = compilationProfile(Deno.env.get("FELDERA_COMPILATION_PROFILE"));
   if (engine === "feldera" && specs.some((spec) => !spec.feldera)) {
     throw new Error(
@@ -563,6 +607,9 @@ async function main() {
   const native: NativeRuntime[] = [];
   const nativeDb = new pg.Pool({ connectionString: databaseUrl });
   const engineFailure = Promise.withResolvers<unknown>();
+  const stateDir = Deno.env.get("COMPUTE_STATE_DIR");
+  const boundedNames = specs.filter(spec => engine === "duckdb-snapshot" && Boolean(spec.steps || stateDir)).map(spec => spec.name);
+  let collected = false;
   for (let i = 0; i < computations.length; i++) {
     const c = computations[i];
     const spec = specs[i];
@@ -573,11 +620,52 @@ async function main() {
     );
     if (engine === "feldera") {
       const program = JSON.parse(await Deno.readTextFile(spec.feldera!));
-      c.feldera(need("FELDERA_URL"), program);
-      const runtime = new NativeRuntime(nativeDb, need("FELDERA_URL"), c,
-        program, version, databaseUrl, claims, profile);
+      c.feldera((artifacts ? Deno.env.get("FELDERA_URL") ?? "http://127.0.0.1" : need("FELDERA_URL")), program);
+      const runtime = new NativeRuntime(nativeDb, (artifacts ? Deno.env.get("FELDERA_URL") ?? "" : need("FELDERA_URL")), c,
+        program, version, databaseUrl, claims, profile, artifacts);
       native.push(runtime);
       batches.push(runtime.spec);
+      continue;
+    }
+    if (spec.steps || stateDir) {
+      const directory = stateDir ?? need("COMPUTE_STATE_DIR");
+      const admitted = await admit(spec.file, spec.endowments ?? []);
+      const runtime = await BoundedRuntime.create({
+        spec, version, databaseUrl, directory, runner,
+        ...(spec.steps ? { source: await Deno.readTextFile(`${spec.steps}.bundle.js`) } : { computation: c }),
+        reads: admitted.reads, queries: admitted.queries, queryStages: admitted.queryStages,
+      });
+      batches.push({
+        name: c.name, reads: c.reads, to: c.to, version,
+        async initialize(client) {
+          if (collected) return;
+          const { rows } = await client.query(
+            "SELECT c.inputs FROM compute.capture c JOIN compute.definition d USING(instance_id) WHERE d.name=ANY($1::text[]) AND c.inputs IS NOT NULL",
+            [boundedNames],
+          );
+          await collectBoundedFiles(directory, rows.map(row => row.inputs));
+          collected = true;
+        },
+        hasCapture: input => runtime.hasCapture(input as BoundedCapture),
+        capture: () => runtime.capture(),
+        calculate: input => runtime.calculate(input as BoundedCapture),
+        async stage(client, output) {
+          const staged = await stagePages(client, spec, sink => runtime.pages(output as BoundedOutput, sink));
+          return {
+            async publish(client) {
+              const sinks = await publishStagedPages(client, spec, staged, claims);
+              return () => console.log(JSON.stringify({ computation: c.name, sinks }));
+            },
+            close: () => dropStagedPages(client, staged),
+          };
+        },
+        async publish(client, output) {
+          const sinks = await publishPages(client, spec, sink => runtime.pages(output as BoundedOutput, sink), claims);
+          console.log(JSON.stringify({ computation: c.name, sinks }));
+        },
+        release: (input, output) => runtime.release(input as BoundedCapture, output as BoundedOutput),
+        discard: output => runtime.discard(output as BoundedOutput),
+      });
       continue;
     }
     batches.push({
@@ -602,6 +690,16 @@ async function main() {
         return await c.capture(lake);
       },
       calculate: (input) => c.calculate(input),
+      stage(_client, out) {
+        const prepared = preparePublish(c, out);
+        return Promise.resolve({
+          async publish(client) {
+            const sinks = await publishPrepared(client, c, prepared, claims);
+            return () => console.log(JSON.stringify({ computation: c.name, sinks }));
+          },
+          close: () => Promise.resolve(),
+        });
+      },
       async publish(client, out) {
         const sinks = await publish(client, c, out, claims);
         console.log(JSON.stringify({ computation: c.name, sinks }));
@@ -609,7 +707,7 @@ async function main() {
     });
   }
   NativeRuntime.validateGraph(native);
-  const coordinator = await openBatches(databaseUrl, batches);
+  const coordinator = await openBatches(databaseUrl, batches, { invalidateOnStart: !native.length });
   const service = {
     async refresh(tables?: string[]) {
       if (native.length) throw new Error("native CDC owns computation invalidation");
@@ -618,8 +716,12 @@ async function main() {
     },
   };
   await reconcileNativeResources(nativeDb, native.map((runtime) => runtime.spec.name), Deno.env.get("FELDERA_URL"));
-  for (const runtime of native) await runtime.initialize();
-  if (!native.length) await service.refresh();
+  try {
+    for (const runtime of native) await runtime.initialize();
+  } catch (error) {
+    for (const runtime of native) await runtime.close();
+    throw error;
+  }
   let stopping = false;
   const polling = (async () => {
     while (!stopping && native.length) {
@@ -637,6 +739,7 @@ async function main() {
     stopping = true;
     await server.shutdown();
     await coordinator.close();
+    for (const runtime of native) await runtime.close();
     await nativeDb.end();
   }
 }
@@ -655,7 +758,7 @@ export function serve(
   port: number,
 ) {
   return Deno.serve({
-    hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0",
+    hostname: Deno.env.get("SAYT_PLATFORM") === "host" ? "127.0.0.1" : "0.0.0.0",
     port,
     onError(error) {
       console.error(error);

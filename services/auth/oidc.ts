@@ -51,7 +51,7 @@ export const PRESETS: Record<string, Preset> = {
     issuer: "https://accounts.google.com",
     // Google's ID tokens name it either way.
     issuers: ["https://accounts.google.com", "accounts.google.com"],
-    scope: "openid profile",
+    scope: "openid profile email",
     params: { prompt: "select_account" },
   },
 };
@@ -173,13 +173,15 @@ export function keySource(fetcher: typeof fetch = fetch): (jwks: string, kid: st
     if (find()) return find();
     const res = await fetcher(jwks);
     if (!res.ok) throw new Error(`${jwks}: ${res.status}`);
-    held.set(jwks, (await res.json() as { keys: JsonWebKey[] }).keys);
+    held.set(jwks, ((await res.json()) as { keys: JsonWebKey[] }).keys);
     return find();
   };
 }
 
 export type Profile = { provider: string; issuer: string; sub: string; name: string | null; picture: string | null; email: string | null };
-export type User = { id: string; handle: string };
+/** The person as the app shows them: the handle always, the link's name and
+ * email while a provider vouches for them. */
+export type User = { id: string; handle: string; name?: string | null; email?: string | null };
 
 /** What the service needs of Postgres. */
 export interface Links {
@@ -189,8 +191,10 @@ export interface Links {
    * handle and every row it wrote are kept) instead of to a new user, once, and
    * only if it is still a guest (nothing links to it, no passkey is its own). */
   userFor(p: Profile, adopt?: string): Promise<User>;
-  /** The user's handle while a link of `provider` still names them. */
-  handleOf(provider: string, issuer: string, id: string): Promise<string | null>;
+
+  /** The user, with the link's name and email, while a link of `provider`
+   * still names them. */
+  handleOf(provider: string, issuer: string, id: string): Promise<Omit<User, "id"> | null>;
 }
 
 export type Config = {
@@ -284,11 +288,11 @@ export async function verifyIdToken(
   return { provider, issuer: p.issuer, sub: c.sub, name, picture, email: emailOf(c) };
 }
 
-/** The e-mail a verified ID token vouches for: only where the provider says it
+/** The e-mail a verified ID token vouches for, lowercased: only where the provider says it
  * verified it (`email_verified` true, OIDC Core 5.1), else none. */
 export function emailOf(c: Record<string, unknown>): string | null {
   if (c.email_verified !== true || typeof c.email !== "string") return null;
-  const email = c.email.trim();
+  const email = c.email.trim().toLowerCase();
   return email.length <= 254 && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) ? email : null;
 }
 
@@ -325,6 +329,12 @@ const redirect = (to: string, cookies: string[]) => {
 };
 const refuse = (status: number, error: string) =>
   new Response(JSON.stringify({ error }), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+// Speculative GETs (an inherited Service-Worker-Navigation-Preload or link prefetch)
+// are discarded when /auth/* bypasses the worker; answering them would spend a
+// single-use OAuth code or overwrite the browser's PKCE state cookie.
+const speculative = (req: Request) =>
+  req.headers.has("service-worker-navigation-preload") ||
+  /\b(prefetch|preview)\b/i.test(`${req.headers.get("sec-purpose") ?? ""},${req.headers.get("purpose") ?? ""}`);
 
 /** The routes under PREFIX, or null for a path that is not one of them. */
 export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
@@ -430,7 +440,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
       }),
     });
     if (!exchanged.ok) return refuse(401, "the provider refused the code");
-    const idToken = (await exchanged.json() as { id_token?: unknown }).id_token;
+    const idToken = ((await exchanged.json()) as { id_token?: unknown }).id_token;
     if (typeof idToken !== "string") return refuse(401, "no id token");
     const profile = await verifyIdToken(name, idToken, (kid) => keys(ends.jwks, kid), { issuer: p.issuer, issuers: p.issuers, client, nonce: state.nonce });
     if (profile === null) return refuse(401, "id token refused");
@@ -506,9 +516,9 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     // An issuer replacement cannot inherit the previous issuer's sessions.
     if (!Object.hasOwn(cfg.providers, c.provider) || cfg.providers[c.provider].issuer !== c.issuer) return refuse(401, "not signed in");
     // A link removed since is a sign-in revoked.
-    const handle = await cfg.links.handleOf(c.provider, c.issuer, c.sub);
-    if (handle === null) return refuse(401, "not signed in");
-    const user = { id: c.sub, handle };
+    const who = await cfg.links.handleOf(c.provider, c.issuer, c.sub);
+    if (who === null) return refuse(401, "not signed in");
+    const user: User = { id: c.sub, ...who };
     return new Response(JSON.stringify({ token: await cfg.issue(user), user }), {
       status: 200,
       headers: { "content-type": "application/json", "cache-control": "no-store" },
@@ -533,6 +543,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     if (req.method === "POST" && path === `${PREFIX}/signout`) return Promise.resolve(signout(req));
     const m = /^\/auth\/oidc\/([a-z][a-z0-9]*)\/(start|callback)$/.exec(path);
     if (m === null || !Object.hasOwn(cfg.providers, m[1]) || req.method !== "GET") return null;
+    if (speculative(req)) return Promise.resolve(refuse(400, "not a navigation"));
     return m[2] === "start" ? start(req, m[1]) : callback(req, m[1]);
   };
 }

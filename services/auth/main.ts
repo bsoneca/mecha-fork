@@ -20,6 +20,7 @@ import {
   SHAPE_FIXED_PARAMS,
   shapeWhere,
   signJwt as sign,
+  STACK_ISSUER,
   SUBSET_LIMIT,
   SUBSET_ORDER,
   SUBSET_PARAMS,
@@ -245,12 +246,20 @@ export const verifyJwt = (token: string, graceS = 0) => verify(JWT_SECRET, token
 
 // A guest's token says so, so a policy can keep writes to the people who
 // signed in (`request.jwt.claims ->> 'guest'`).
-export function issueUserToken(id: string, handle: string, guest = false): Promise<string> {
+export function issueUserToken(
+  id: string,
+  handle: string,
+  guest = false,
+  profile?: { name?: string | null; email?: string | null },
+): Promise<string> {
   return signJwt({
+    iss: STACK_ISSUER,
     role: "app_user",
     sub: id,
     handle,
     guest,
+    ...(profile?.name ? { name: profile.name } : {}),
+    ...(profile?.email ? { email: profile.email } : {}),
     exp: Math.floor(Date.now() / 1000) + USER_TOKEN_TTL_S,
   });
 }
@@ -309,7 +318,7 @@ export function rowWhere(column: string, value: string): string {
 async function rowReach(uid: string, table: string, column: string, value: string): Promise<boolean> {
   return await sql.begin(async (tx) => {
     await tx`SET LOCAL ROLE app_user`;
-    await tx`SELECT set_config('request.jwt.claims', ${JSON.stringify({ sub: uid, role: "app_user" })}, true)`;
+    await tx`SELECT set_config('request.jwt.claims', ${JSON.stringify({ iss: STACK_ISSUER, sub: uid, role: "app_user" })}, true)`;
     await tx`SELECT ${tx(FLOOR_SCHEMA)}.app_pre_request()`;
     const rows = await tx`SELECT ${tx(MECHA_SCHEMA)}.shape_reach(${DB_SCHEMA + "." + table}, ${column}, ${value}) AS ok`;
     return rows[0].ok as boolean;
@@ -559,12 +568,27 @@ async function readState(
   return st;
 }
 
-const ADJECTIVES = ["amber", "brisk", "calm", "dusk", "ember", "fern", "gold", "hazel", "ivory", "jade", "kind", "lunar", "mellow", "noble", "ochre", "pale", "quiet", "rustic", "sage", "tidal"];
-const NOUNS = ["fox", "wren", "otter", "pine", "reed", "moth", "lark", "moss", "dune", "cove", "elk", "finch", "heron", "ibis", "kite", "lynx", "newt", "orca", "quail", "seal"];
-function generateHandle(): string {
-  const a = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
-  const n = NOUNS[Math.floor(Math.random() * NOUNS.length)];
-  return `${a}-${n}-${10 + Math.floor(Math.random() * 90)}`;
+const FRUITS = [
+  "acerola", "amora", "avocado", "banana", "caju", "carambola", "cherry", "citrus",
+  "coconut", "cupuacu", "fig", "guava", "jabuticaba", "jackfruit", "kiwi", "lemon",
+  "lime", "lychee", "mango", "maracuja", "melon", "nectarine", "olive", "orange",
+  "papaya", "peach", "pear", "persimmon", "pineapple", "pitanga", "plum", "tangerine",
+];
+const ANIMALS = [
+  "albatross", "armadillo", "badger", "capybara", "chameleon", "condor", "dolphin", "falcon",
+  "flamingo", "fox", "gecko", "heron", "hummingbird", "ibis", "iguana", "jaguar",
+  "kingfisher", "koala", "lemur", "lynx", "macaw", "manatee", "meerkat", "ocelot",
+  "otter", "owl", "panda", "pelican", "penguin", "quokka", "tapir", "toucan",
+];
+export function guestHandle(id: string): string {
+  const hex = id.replaceAll("-", "").toLowerCase();
+  const fruit = FRUITS[(parseInt(hex.slice(0, 2), 16) || 0) % FRUITS.length];
+  const animal = ANIMALS[(parseInt(hex.slice(2, 4), 16) || 0) % ANIMALS.length];
+  const slug = hex.slice(-4) || "0000";
+  return `${fruit}-${animal}-${slug}`;
+}
+function generateHandle(id = crypto.randomUUID()): string {
+  return guestHandle(id);
 }
 
 async function registerStart(req: Request): Promise<Response> {
@@ -657,7 +681,8 @@ async function registerVerify(req: Request): Promise<Response> {
 }
 
 async function loginStart(_req: Request): Promise<Response> {
-  // Discoverable credentials: the authenticator offers the resident passkey.
+  // Usernameless by doctrine: allowCredentials is empty so the authenticator
+  // surfaces its discoverable (resident) credentials for this RP.
   const options = await generateAuthenticationOptions({
     rpID: RP_ID,
     allowCredentials: [],
@@ -685,7 +710,7 @@ async function loginVerify(req: Request): Promise<Response> {
     from mecha_auth.webauthn_credential c join app_user u on u.id = c.user_id
     where c.id = ${response.id}`;
   if (creds.length === 0) {
-    return jsonError(401, "authentication verification failed");
+    return json(401, { error: "authentication verification failed", unknownCredential: true });
   }
   const cred = creds[0];
   let verification;
@@ -722,11 +747,12 @@ async function guest(_req: Request): Promise<Response> {
   // Origin-independent by terminal doctrine: no WebAuthn, no origin check —
   // this door must open from any origin the cluster is reachable on.
   const userId = crypto.randomUUID();
-  let handle = generateHandle();
+  let handle = generateHandle(userId);
   let inserted = false;
   for (let attempt = 0; attempt < 3 && !inserted; attempt++) {
     try {
-      await sql`insert into app_user (id, handle) values (${userId}, ${handle})`;
+      const [row] = await sql`insert into app_user (id, handle) values (${userId}, ${handle}) returning handle`;
+      if (row?.handle) handle = String(row.handle);
       inserted = true;
     } catch (e) {
       if ((e as { code?: string }).code === "23505") handle = generateHandle();
@@ -768,7 +794,12 @@ async function whoami(req: Request): Promise<Response> {
   const subject = await subjectOf(req);
   if (subject === "refused" || subject.claims === null) return jsonError(401, "invalid token");
   const claims = subject.claims;
-  return json(200, { id: claims.sub, handle: claims.handle });
+  return json(200, {
+    id: claims.sub,
+    handle: claims.handle,
+    ...(typeof claims.name === "string" ? { name: claims.name } : {}),
+    ...(typeof claims.email === "string" ? { email: claims.email } : {}),
+  });
 }
 
 // What the door asks before it proxies a request whose answer depends on who is
@@ -882,6 +913,7 @@ async function exchangeKey(req: Request): Promise<Response> {
   const hook = keyExchangedHook();
   if (hook !== null) await sql.unsafe(`select ${hook}($1::uuid)`, [k.owner]);
   const token = await signJwt({
+    iss: STACK_ISSUER,
     role: "app_user",
     sub: k.owner,
     handle: k.handle,
@@ -970,6 +1002,7 @@ async function upgrade(req: Request): Promise<Response> {
   if (exp < now + UPGRADE_MIN_TTL_S) return jsonError(400, `the upgraded token would end within ${UPGRADE_MIN_TTL_S}s`);
   const asked = body.claims as Record<string, unknown>;
   const token = await signJwt({
+    iss: STACK_ISSUER,
     role: session.role,
     sub: session.sub,
     ...(Object.hasOwn(session, "handle") ? { handle: session.handle } : {}),
@@ -994,7 +1027,7 @@ export const links: Links = {
         where provider = ${p.provider} and issuer = ${p.issuer} and sub = ${p.sub} returning user_id`;
       if (link) {
         const [u] = await tx`select handle from app_user where id = ${link.user_id}`;
-        return { id: link.user_id as string, handle: u.handle as string };
+        return { id: link.user_id as string, handle: u.handle as string, name: p.name, email: p.email };
       }
       // A new subject that came from a guest's browser takes the guest in once: the guest's id, handle and every
       // row it wrote stay, as a passkey promotes one. Only a guest is taken (no passkey, no other provider is
@@ -1007,7 +1040,7 @@ export const links: Links = {
         if (g) {
           await tx`insert into mecha_auth.identity_link (provider, issuer, sub, user_id, name, picture, email)
             values (${p.provider}, ${p.issuer}, ${p.sub}, ${adopt}, ${p.name}, ${p.picture}, ${p.email})`;
-          return { id: adopt, handle: g.handle as string };
+          return { id: adopt, handle: g.handle as string, name: p.name, email: p.email };
         }
       }
       const id = crypto.randomUUID();
@@ -1022,15 +1055,16 @@ export const links: Links = {
         }
         await tx`insert into mecha_auth.identity_link (provider, issuer, sub, user_id, name, picture, email)
           values (${p.provider}, ${p.issuer}, ${p.sub}, ${id}, ${p.name}, ${p.picture}, ${p.email})`;
-        return { id, handle };
+        return { id, handle, name: p.name, email: p.email };
       }
       throw new Error("could not allocate identity");
     });
   },
   async handleOf(provider: string, issuer: string, id: string) {
-    const [u] = await sql`select u.handle from app_user u
-      where u.id = ${id} and exists (select 1 from mecha_auth.identity_link l where l.user_id = u.id and l.provider = ${provider} and l.issuer = ${issuer})`;
-    return u ? (u.handle as string) : null;
+    const [u] = await sql`select u.handle, l.name, l.email from app_user u
+      join mecha_auth.identity_link l on l.user_id = u.id and l.provider = ${provider} and l.issuer = ${issuer}
+      where u.id = ${id}`;
+    return u ? { handle: u.handle as string, name: (u.name as string | null) ?? null, email: (u.email as string | null) ?? null } : null;
   },
 };
 
@@ -1051,7 +1085,7 @@ const providerSignIn = oidc({
   providers: OIDC_PROVIDERS,
   links,
   spend: handoffSpender(sql),
-  issue: (user) => issueUserToken(user.id, user.handle),
+  issue: (user) => issueUserToken(user.id, user.handle, false, user),
   // The guest a bearer names, for POST /auth/oidc/adopt: a guest token only, never an account's.
   guestOf: adoptableGuest,
   // An origin new since the __Host- session cookie sets this "off": a bare mecha_oidc there could
@@ -1114,5 +1148,5 @@ export async function handler(req: Request): Promise<Response> {
 if (import.meta.main) {
   await migrate();
   // A host launch moves the port (cluster.cue: AUTH_PORT); a container keeps 9999.
-  Deno.serve({ hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("AUTH_PORT") || Deno.env.get("PORT") || 9999) }, handler);
+  Deno.serve({ hostname: Deno.env.get("SAYT_PLATFORM") === "host" ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("AUTH_PORT") || Deno.env.get("PORT") || 9999) }, handler);
 }

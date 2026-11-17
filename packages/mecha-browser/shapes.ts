@@ -427,7 +427,6 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
       'electric-up-to-date': 'true',
     }
     if (!live) headers['electric-schema'] = JSON.stringify(l.schema)
-    if (entries.length === 0 && live) return new Response(null, { status: 204, headers })
     const msgs: unknown[] = entries.map((e) => e.message)
     msgs.push(upToDate())
     return new Response(JSON.stringify(msgs), { headers })
@@ -493,7 +492,7 @@ export async function createShapes(cfg: ShapesConfig): Promise<Shapes> {
       return m
     })
     return new Response(JSON.stringify({ metadata, data }), {
-      headers: { ...base, 'electric-offset': own ?? offsetOf(l.filled), 'electric-schema': JSON.stringify(l.schema), 'electric-up-to-date': 'true' },
+      headers: { ...base, 'electric-offset': own ?? offsetOf(l.filled), 'electric-schema': JSON.stringify(l.schema), 'electric-snapshot': 'true', 'electric-up-to-date': 'true' },
     })
   }
 

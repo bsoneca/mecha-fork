@@ -58,12 +58,14 @@ tasks:
       - task: test:auth
       - task: test:pgroll
       - task: test:cluster
+      - task: test:isolate
       - task: test:browser
 
   test:auth:
     desc: "OIDC authorization, issuer isolation, browser sessions and Android origins"
     dir: services/auth
     cmds:
+      - mise x -- deno check --frozen main.ts main_test.ts
       - mise x -- deno test --frozen oidc_test.ts origins_test.ts schema_test.ts
       - mise x -- sh -c 'cd ../electric && deno test --config ../auth/deno.json --frozen -A main_test.ts'
       - mise x -- sh -c 'cd ../proxy && deno test --config ../auth/deno.json --frozen -A proxy_test.ts'
@@ -79,6 +81,11 @@ tasks:
     cmds:
       # mise x puts the real tool bin dir on PATH — see cue:generate.
       - mise x -- deno test --no-config --no-lock --allow-read --allow-run=cue cluster_test.ts
+
+  test:isolate:
+    desc: "the host an isolate hatch's build runs behind: its module's process, sandboxed, replaced when a call outlives its deadline"
+    cmds:
+      - mise x -- deno test --no-config --no-lock --allow-read --allow-write --allow-run --allow-net --allow-env isolate_test.ts
 
   test:pgroll:
     desc: "pgroll grammar against the pinned image, and what the cluster's field refuses"
@@ -121,7 +128,9 @@ tasks:
     desc: "airlock service: re-entry, the manifest, the handler's cage and its one door out, the poke, Graphile's initdb step"
     dir: services/airlock
     cmds:
-      - mise x -- deno test --frozen --unstable-worker-options --allow-read --allow-write --allow-env --allow-sys --allow-run reentry_test.ts handler_test.ts door_test.ts admit_test.ts tsbifrost_test.ts white-background_test.ts blobs_test.ts
+      - mise x -- deno test --frozen --unstable-worker-options --allow-read --allow-write --allow-env --allow-sys --allow-run reentry_test.ts handler_test.ts door_test.ts admit_test.ts tsbifrost_test.ts white-background_test.ts blobs_test.ts seal_test.ts
+      # A read's sink is served from the test, on loopback.
+      - mise x -- deno test --frozen --allow-net=127.0.0.1 --allow-read --allow-env --allow-sys read_test.ts
     sources:
       - "*.ts"
       - "*.sql"

@@ -71,6 +71,17 @@ the callback; the owner drains pending reads and revokes the reader before closi
 the transaction. Any failed read rejects the snapshot, including
 a failure the callback caught. Writes wait while a render holds the snapshot.
 
+Admission precedes database startup: at most four background and 16 interactive
+snapshots may be active or waiting. Excess demand raises `PublicSnapshotCapacity`,
+which the renderer maps to a non-cacheable 503 with `Retry-After`. When short
+background database operations and crawler renders both wait, up to 16 database
+turns run before the next crawler render. Foreground traffic still yields after
+four turns; an already-running transaction cannot be preempted.
+Background snapshots also use transaction-local `work_mem = '1MB'` to reserve
+headroom under crawler load. Interactive snapshots retain the configured default;
+PostgreSQL restores the setting when the transaction ends. This limits individual
+sort/hash operations, not total isolate memory.
+
 `revision` combines PostgreSQL's full `pg_current_snapshot()` value with the
 data directory's persistent generation. Ordinary committed writes invalidate it;
 resetting and importing even an older directory changes the generation. Read-only
@@ -117,9 +128,10 @@ an eviction does not lose it.
 An app's effects run in two Workers. The object claims each due run through
 Graphile, settles in place what needs no call — an outcome already recorded, a
 bridge not deployed on `cloudflare`, a run the reentry policy settles `unknown`
-— and leases the rest with a Graphile job keyed by the ledger key, then, after
-that commit and outside any transaction, enqueues it on `AIRLOCK_QUEUE` as
-`{key, token}`. The token is the lease job's id and revision, which Graphile
+— and leases the rest with a Graphile job keyed by the ledger key's digest
+(`airlock.job_key`, `services/airlock/job_key.sql`: Graphile caps a job key at
+512 bytes), then, after that commit and outside any transaction, enqueues it
+on `AIRLOCK_QUEUE` as `{key, token}`. The token is the lease job's id and revision, which Graphile
 bumps each time the key is scheduled again, so a later lease, renewal or
 backoff makes it stale ([`airlock.ts`](src/airlock.ts)). An object whose
 program declares effects and has no `AIRLOCK_QUEUE` refuses to boot.
@@ -144,7 +156,10 @@ gets null and counts nothing.
 The dispatcher runs the handler with the container's sink and cage, stows
 answered bytes in `BLOB_OBJECTS`, and calls `effectAnswer` with the outcome or
 the error, fenced by the run's number ([`dispatch.ts`](src/dispatch.ts)). A
-sink is tsbifrost, a declared origin, or a bridge deployed on `cloudflare`: a
+sink is tsbifrost, a declared origin, an origin this deployment holds in the
+dispatcher secret the effect names (`edgeOrigin: {secret}`, read at each run
+and refused unless an https origin without a path, so staging and production
+reach a vendor's sandbox and its live API from one release), or a bridge deployed on `cloudflare`: a
 Cloudflare Container the dispatcher owns as a Durable Object class, `Bridge<Name>`
 bound as `BRIDGE_<NAME>` ([`bridge.ts`](src/bridge.ts)), whose stub the sink's
 call goes to under the bridge's name, on the port the class holds. The
@@ -184,6 +199,17 @@ retain their captured input and retry. Filter-table edits use the same path.
 Companions have neither database credentials nor public execution routes. They
 accept packaged computation names and versions and return the exact capture
 identity. See [[../../docs/compute#cloudflare-snapshot-execution|the computation contract]] for isolation, deployment ordering and per-isolate capacity limits.
+
+The operator-authenticated `GET /import/compute` reports the coordinator alarm, failures, paged publication cursors, retained reader transfer positions, and acknowledged reader baselines (`readerBases`). It reads durable metadata without opening the serving PostgreSQL database. Like other `/import/*` endpoints, it requires the deployment’s import token.
+
+With `?detail=1`, it also reads the current engine's source positions, materialized
+query count, execution revision and completion flag. The checkpoint summary contains
+at most 32 numeric, boolean or null fields; nested state and strings are omitted.
+Recorded failures may predate later progress, so compare their timestamps with the
+execution counters before treating a capture as stalled.
+`postgresMemoryBytes` measures the serving database's WASM linear memory, not
+total isolate usage. It is null before the database has begun opening; reading
+it never starts a database or issues SQL.
 
 ## The clock
 
@@ -271,11 +297,11 @@ Reads the object answered are answered again from the colo's Cache API, with
   both write markers.
 - **Never** a live request, a write, a 4xx or 5xx, or a session other than a
   guest's.
-- **The browser** keeps a shape response that is not live under Electric
-  1.8's own `cache-control` — a week for a log read from its start, a minute
-  (and five more stale) for any other — since Electric's client steps past a
-  stale entry with `expired_handle` and a cache buster, which the Worker's
-  key includes too. Everything else reaches the browser `no-store`.
+- **The browser** receives every cluster response `no-store`, and each shape
+  response the Worker serves carries a fresh `electric-cursor`: `shapes.ts`
+  answers `offset=-1` with `up-to-date` in one round-trip, and Electric's
+  client holds back `up-to-date` for 60 s from any response whose cursor
+  matches the previous session's.
 
 ## What fixes its shape
 
@@ -284,7 +310,9 @@ Reads the object answered are answered again from the colo's Cache API, with
   each `/crud` request sets its role, scopes and claims inside its own
   transaction, and a shape's reach is `subject_scopes` of the token's subject,
   read when the request is served. Row policy is Postgres's own, as on a
-  single machine.
+  single machine. Between requests the session holds the service's claims,
+  set once at boot: a setting a transaction set LOCAL reads back as `''`
+  afterwards, not NULL, and the airlock's moves run between requests.
 - **Nothing migrates here.** The object boots over the data directory a
   release loaded, rls.sql and the app's migrations already applied; it adds
   the shape triggers ([`shapes.ts`](../mecha-browser/shapes.ts)) on every

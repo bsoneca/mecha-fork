@@ -74,9 +74,9 @@ Deno.test({ name: 'a person signs in at the edge through a provider', sanitizeRe
     let alice: Awaited<ReturnType<typeof signIn>>
     await t.step('the provider signs a person in, with a handle as the auth service makes one', async () => {
       alice = await signIn()
-      assert.match(alice.user.handle, /^[a-z]+-[a-z]+-\d\d$/)
+      assert.match(alice.user.handle, /^[a-z]+-[a-z]+-[0-9a-f]{4}$/)
       const who = await call('/auth/whoami', { headers: { authorization: `Bearer ${alice.token}` } })
-      assert.deepEqual(await who.json(), { id: alice.user.id, handle: alice.user.handle })
+      assert.deepEqual(await who.json(), { id: alice.user.id, handle: alice.user.handle, name: 'Alice', email: 'alice@mail.test' })
     })
     await t.step('the link names the provider, its issuer and the subject', async () => {
       const { rows } = await db.query<{ provider: string; issuer: string; sub: string; user_id: string; name: string; email: string }>('SELECT provider, issuer, sub, user_id, name, email FROM identity_link')
@@ -177,7 +177,7 @@ Deno.test({ name: "links an earlier edge made without their issuer take their pr
     const { walk, user } = await walker(await cluster(db, idp.issuer))
     const signedIn = await walk()
     assert.equal(signedIn.status, 303, await signedIn.clone().text())
-    assert.deepEqual(await user(signedIn), { id, handle: 'amber-fox-11' })
+    assert.deepEqual(await user(signedIn), { id, handle: 'amber-fox-11', name: 'Alice', email: 'alice@mail.test' })
     const { rows: links } = await db.query<{ issuer: string }>("SELECT issuer FROM identity_link WHERE sub = 'alice-sub'")
     assert.deepEqual(links, [{ issuer: idp.issuer }])
     const { rows } = await db.query<{ k: string[] }>(`SELECT array_agg(a.attname ORDER BY a.attname) AS k FROM pg_constraint c
@@ -209,7 +209,7 @@ Deno.test({ name: 'a link whose provider the edge no longer has refuses provider
     await db.query("UPDATE identity_link SET issuer = 'https://gone.example' WHERE provider = 'gone'")
     const signedIn = await walk()
     assert.equal(signedIn.status, 303, await signedIn.clone().text())
-    assert.deepEqual(await user(signedIn), { id: bob, handle: 'amber-fox-12' })
+    assert.deepEqual(await user(signedIn), { id: bob, handle: 'amber-fox-12', name: 'Alice', email: 'alice@mail.test' })
   } finally {
     await db.close()
     await idp.stop()

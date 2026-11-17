@@ -51,6 +51,11 @@ DO $$ BEGIN
 END $$;
 SQL
 
+# Roles ahead of the ledger, which may grant one (the cluster's `roles`).
+if [ -f "$dir/roles.sql" ]; then
+	ask --single-transaction -c "SET LOCAL lock_timeout = '5s'; SET LOCAL statement_timeout = '60s'; SET LOCAL pgroll.no_inferred_migrations = 'TRUE';" --file="$dir/roles.sql"
+fi
+
 pgroll init
 
 if [ "$(ask -v schema="$PGROLL_SCHEMA" <<< "SELECT count(*) FROM pgroll.migrations WHERE schema = :'schema' AND migration_type = 'baseline';")" = 0 ]; then
@@ -87,6 +92,7 @@ done
 # Permissions follow the current declaration, outside the immutable ledger.
 # Suppress inferred migrations so restating them does not alter pgroll history.
 for file in "$dir"/*.sql; do
+	[ "$(basename "$file")" = roles.sql ] && continue
 	ask --single-transaction -c "SET LOCAL lock_timeout = '5s'; SET LOCAL statement_timeout = '60s'; SET LOCAL pgroll.no_inferred_migrations = 'TRUE';" --file="$file"
 done
 

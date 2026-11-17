@@ -19,6 +19,7 @@ exactly what those capabilities instantiate. The planes layer as
 | `server`, the data plane | on | database, crud, electric | Off, caddy runs alone and serves statics, for a consumer that stores nothing server-side |
 | `capture`, the change feed | on where the cluster is given a pipeline or a schedule, off otherwise | redis, mesh-events, conduit; transform when a pipeline is given ([change capture](change-capture.md)) | Refused off where it is given one: the pipeline would never run, and the ticker's wake is addressed to mesh-events. Stated on, it runs without either. Turning it on turns `server` on |
 | `auth`, the auth plane | off | auth: WebAuthn, and each provider `signIn` names, minting `app_user` JWTs ([its contract](../services/auth/README.md)) | crud verifies tokens (`PGRST_JWT_SECRET`) and transform is handed `SERVICE_JWT` ([routing](change-capture.md#routing)). Turning auth on turns `server` on, and naming a `signIn` provider turns auth on and requires its client at compose, from the program's settings for it or the deployment's `OIDC_<NAME>_CLIENT_ID`. The `auth_uid()` a policy reads the token's subject with is the tenancy floor's, in every database. crud verifies the service token also where a schedule or an effect wakes the cluster, auth off or on: PostgREST switches to `service` on the token's role claim, and the schedule tables admit no other role |
+| `issuers`, trusted issuers | off | nothing new | crud verifies tokens an OAuth2 or OpenID issuer signed beside the stack's own, for the roles the caller declares: the deployment gives `PGRST_JWKS`, the stack's secret as an `oct` key beside the issuer's public keys, and crud holds a token to `TRUSTED_AUDIENCE`, else `<origin>/crud`. Without `PGRST_JWKS` crud verifies the stack's tokens alone. A token naming an `iss` acts only as a role `mecha.token_role` lists (the tenancy floor's `app_pre_request`). Turning it on turns `server` on |
 | `blobs`, the blob plane | off | rclone-s3, imgproxy | |
 | a name in `state.schedules` | none | ticker, clock ([its contract](../services/ticker/README.md)) | The database gets `schedule`, the table they sweep ([its step](schema.md#how-a-schema-reaches-the-database)), and `capture` turns on. Set by declaring a schedule, not by a flag |
 | an entry in `state.effects` | none | airlock, airlock-mesh, a bridge per declared bridge, and the ticker and clock as a schedule brings them ([in a cluster](../services/airlock/README.md#in-a-cluster)) | The database gets Graphile's schema, the ledger and the schedule table ([their steps](schema.md#how-a-schema-reaches-the-database)), and `server` turns on and is refused off. The cluster publishes `surface.networks`, which the consumer declares in its compose model. mecha's own stack declares none: every app's compose includes its fragments, and those would name networks the app does not declare |
@@ -78,11 +79,13 @@ At browser tier, `rclone-js` answers the same S3 subset over IndexedDB
 An AI effect or capability turns on **tsbifrost**
 ([`services/airlock/tsbifrost.ts`](../services/airlock/tsbifrost.ts)), mecha's
 own TypeScript gateway, on `airlock-out` at port 8090. Handlers speak one
-OpenAI-shaped contract to it (`/v1/chat/completions`, `/v1/images/generations`
+OpenAI-shaped contract to it (`/v1/chat/completions` — plain string or
+multimodal `text` + `image_url` content parts — and `/v1/images/generations`
 with a `tier`), and it resolves `(target, modality, tier)` to a provider and
-model: Ollama and sd.cpp in docker and local, Workers AI on Cloudflare (the
-binding inside mecha-edge, REST elsewhere), Gemini and Imagen on GCP, any
-OpenAI-compatible endpoint by override.
+model: Ollama and sd.cpp in compose and host, Workers AI on Cloudflare (the
+binding inside mecha-edge, REST elsewhere), Gemini (translating multimodal
+`image_url` parts to `inlineData`/`fileData` and filtering `thought` parts) and
+Imagen on GCP, any OpenAI-compatible endpoint by override.
 
 A field only one provider knows goes one of two ways, and the head of
 `tsbifrost.ts` gives the order they merge in:
@@ -101,6 +104,19 @@ A field only one provider knows goes one of two ways, and the head of
 
 A field either one names wins over the one tsbifrost builds, and
 `extra_params` win over `params`.
+
+On Cloudflare a backend tier may be **routed**: `targets: cloudflare: image:
+heavy: {secret: "AI_IMAGE_HEAVY", routes: {google: {...}, cloudflare: {...}}}`.
+One release then serves deployments that differ by a setting, not a build:
+the dispatcher reads `AI_IMAGE_HEAVY` from its environment before each AI run
+and calls the route it names, refusing the run when it is unset, names no
+route, or selects one whose provider key the deployment does not hold. The
+setting is a dispatcher secret, as a named origin is: a release's `vars` are
+rewritten at each deploy, a secret is the deployment's. The publish requires
+it carried or held and `sayt verify@cloudflare` asks for it by name; a route's
+key is required only by a publish that carries the setting selecting it, since
+a value held on the Worker alone cannot be read back. Only cloudflare routes:
+a stack's environment is fixed when it starts.
 
 [Maxim's Bifrost](https://github.com/maximhq/bifrost), the Go gateway, is the
 alternative: more providers, but one more image and its configuration store,

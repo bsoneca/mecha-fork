@@ -16,7 +16,7 @@ import { androidOrigin } from "./origins.ts";
 import { adoptableGuest, admittedOrigin, apiKeysGate, ceremonyOrigin, handler, handoffSpender, issueUserToken, KEY_TOKEN_TTL_S, keyExchangedHook, links, MAX_LIVE_KEYS, migrate, searchPath, shapeTable, signJwt, sql, upgradeTtlOf, verifyJwt } from "./main.ts";
 import { handoffSpentSql } from "./schema.ts";
 import postgres from "postgres";
-import { PUBLIC_WHERE, signJwt as signWith } from "./jwt.ts";
+import { PUBLIC_WHERE, signJwt as signWith, STACK_ISSUER } from "./jwt.ts";
 import { PUBLIC_WHERE as CLIENT_PUBLIC_WHERE } from "../../packages/client/src/public-where.ts";
 
 await sql`CREATE TABLE IF NOT EXISTS app_user (
@@ -129,7 +129,7 @@ Deno.test({
     const body = await res.json();
     assertEquals(typeof body.challenge, "string");
     assertEquals(body.rp.id, "localhost");
-    assert(/^[a-z]+-[a-z]+-\d\d$/.test(body.user.name), `generated handle, got ${body.user.name}`);
+    assert(/^[a-z]+-[a-z]+-[0-9a-f]{4}$/.test(body.user.name), `generated handle, got ${body.user.name}`);
     assertEquals(body.authenticatorSelection.residentKey, "required");
     assert(Array.isArray(body.pubKeyCredParams) && body.pubKeyCredParams.length > 0);
     const st = await verifyJwt(body.state);
@@ -370,7 +370,7 @@ Deno.test({
     const res = await handler(post("/auth/guest", {}));
     assertEquals(res.status, 200);
     const body = await res.json();
-    assert(/^[a-z]+-[a-z]+-\d\d$/.test(body.user.handle), `generated handle, got ${body.user.handle}`);
+    assert(/^[a-z]+-[a-z]+-[0-9a-f]{4}$/.test(body.user.handle), `generated handle, got ${body.user.handle}`);
     const claims = await verifyJwt(body.token);
     assert(claims !== null);
     assertEquals(claims.role, "app_user");
@@ -502,7 +502,7 @@ Deno.test({
     const claims = await verifyJwt(res.body.token);
     assert(claims !== null, "signed with the key every reader verifies");
     const { exp: _, ...rest } = claims;
-    assertEquals(rest, { role: "app_user", sub: guest.user.id, handle: guest.user.handle, guest: true, ...operation });
+    assertEquals(rest, { iss: STACK_ISSUER, role: "app_user", sub: guest.user.id, handle: guest.user.handle, guest: true, ...operation });
     // whoami reads it as the same person.
     const who = await handler(new Request("http://auth:9999/auth/whoami", { headers: { authorization: `Bearer ${res.body.token}` } }));
     assertEquals(await who.json(), { id: guest.user.id, handle: guest.user.handle });
@@ -1406,7 +1406,14 @@ Deno.test("a configured origin is exact, and only localhost stands for the dev d
   assert(ceremonyOrigin("https://localhost:*", null).endsWith("*"));
 });
 
-const alice = { provider: "google", issuer: "https://accounts.google.com", sub: "g-alice", name: "Alice", picture: null, email: "alice@mail.test" };
+const alice = {
+  provider: "google",
+  issuer: "https://accounts.google.com",
+  sub: "g-alice",
+  name: "Alice",
+  picture: null,
+  email: "alice@example.test",
+};
 
 Deno.test({
   name: "a provider's subject is one person, however many sign-ins race to make it",
@@ -1420,14 +1427,26 @@ Deno.test({
       assertEquals(new Set(racers.map((u) => u.id)).size, 1, sub);
     }
     const users = [await links.userFor(alice)];
-    const [link] = await sql`select user_id from mecha_auth.identity_link where provider = 'google' and sub = 'g-alice'`;
+    const [link] = await sql`select user_id, email from mecha_auth.identity_link where provider = 'google' and sub = 'g-alice'`;
     assertEquals(link.user_id, users[0].id);
-    await links.userFor({ ...alice, name: "Alice B." });
-    assertEquals((await sql`select name from mecha_auth.identity_link where sub = 'g-alice'`)[0].name, "Alice B.");
-    assertEquals((await sql`select email from mecha_auth.identity_link where sub = 'g-alice'`)[0].email, "alice@mail.test");
-    await links.userFor({ ...alice, email: null });
+    assertEquals(link.email, "alice@example.test");
+    await links.userFor({ ...alice, name: "Alice B.", email: "alice.b@example.test" });
+    assertEquals((await sql`select name, email from mecha_auth.identity_link where sub = 'g-alice'`)[0], {
+      name: "Alice B.",
+      email: "alice.b@example.test",
+    });
+    assertEquals(await links.handleOf("google", alice.issuer, users[0].id), {
+      handle: users[0].handle,
+      name: "Alice B.",
+      email: "alice.b@example.test",
+    });
+    const token = await issueUserToken(users[0].id, users[0].handle, false, { name: "Alice B.", email: "alice.b@example.test" });
+    const who = await handler(new Request("http://auth:9999/auth/whoami", { headers: { authorization: `Bearer ${token}` } }));
+    assertEquals(who.status, 200);
+    assertEquals(await who.json(), { id: users[0].id, handle: users[0].handle, name: "Alice B.", email: "alice.b@example.test" });
+    await links.userFor({ ...alice, name: "Alice B.", email: null });
     assertEquals((await sql`select email from mecha_auth.identity_link where sub = 'g-alice'`)[0].email, null, "the provider no longer vouches for one");
-    assertEquals(await links.handleOf("google", alice.issuer, users[0].id), users[0].handle);
+    assertEquals(await links.handleOf("google", alice.issuer, users[0].id), { handle: users[0].handle, name: "Alice B.", email: null });
   },
 });
 
@@ -1437,7 +1456,7 @@ Deno.test({
   fn: async () => {
     const guest = (await (await handler(post("/auth/guest", {}))).json()).user;
     const taken = await links.userFor({ ...alice, sub: "g-adopts" }, guest.id);
-    assertEquals(taken, { id: guest.id, handle: guest.handle });
+    assertEquals(taken, { id: guest.id, handle: guest.handle, name: alice.name, email: alice.email });
     assertEquals((await sql`select user_id from mecha_auth.identity_link where sub = 'g-adopts'`)[0].user_id, guest.id);
     // Signing in again is the same person, the guest named or not.
     assertEquals((await links.userFor({ ...alice, sub: "g-adopts" })).id, guest.id);
@@ -1500,7 +1519,7 @@ Deno.test({
     const replacement = await links.userFor({ ...alice, issuer: "https://broker.test", sub: "pairwise-1" });
     assert(replacement.id !== guest.id);
     assertEquals(await links.handleOf("google", "https://broker.test", guest.id), null);
-    assertEquals(await links.handleOf("google", alice.issuer, guest.id), guest.handle);
+    assertEquals(await links.handleOf("google", alice.issuer, guest.id), { handle: guest.handle, name: null, email: null });
   },
 });
 
@@ -1741,6 +1760,7 @@ Deno.test({
     assertEquals(KEY_TOKEN_TTL_S, 15 * 60);
     const claims = await verifyJwt(body.token);
     assertEquals([claims?.role, claims?.sub, claims?.handle, claims?.guest, claims?.kid, claims?.scp], ["app_user", a.id, a.handle, false, k.id, ["read", "machines:match"]]);
+    assertEquals(claims?.iss, STACK_ISSUER, "a key token names the stack as its issuer, or the floor holds it to anon");
     const exp = claims?.exp as number;
     assert(exp >= at + KEY_TOKEN_TTL_S && exp <= at + KEY_TOKEN_TTL_S + 2, `exp ${exp - at}s from now`);
     const [after] = await sql`select last_used from mecha_auth.api_key where id = ${k.id}`;
