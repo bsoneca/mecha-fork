@@ -629,3 +629,27 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "a play token never takes a native account: one with a passkey or a provider's link is refused, not renamed, its token unspent",
+  ...opts,
+  fn: async () => {
+    await using s = serveJwks();
+    for (const native of ["passkey", "link"]) {
+      await sql`delete from app_user where id = ${SUB}`;
+      await sql`insert into app_user (id, handle) values (${SUB}, 'native')`;
+      if (native === "passkey") {
+        await sql`insert into mecha_auth.webauthn_credential (id, user_id, public_key, counter) values (${"cred-" + SUB}, ${SUB}, ${new Uint8Array([1])}, 0)`;
+      } else {
+        await sql`insert into mecha_auth.identity_link (provider, issuer, sub, user_id) values ('google', 'https://accounts.google.com', ${"g-" + SUB}, ${SUB})`;
+      }
+      const c = claims({ handle: "stolen" });
+      const res = await inStudio(s.url, async () => await handler(studio(await jws(c))));
+      assertEquals(res.status, 409, native);
+      assertEquals((await res.json()).reason, "native_account");
+      assertEquals((await userRow(SUB)).handle, "native");
+      assertEquals(await jtiRow(c.jti), undefined);
+      await sql`delete from app_user where id = ${SUB}`;
+    }
+  },
+});
