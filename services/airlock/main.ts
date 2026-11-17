@@ -59,10 +59,10 @@ if (import.meta.main) {
   // A release with no origin yet runs every effect that does not link back.
   const origin = Deno.env.get("ORIGIN");
   const runner = await start({ connectionString, db, effects, handlers, transport: meshTransport(mesh), secrets, headers, blobs, origin, target, reads, mesh, seal }, key);
-  Deno.serve({ hostname: Deno.env.get("SAYT_PLATFORM") === "host" ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("PORT") || 9997), onListen() {} }, (req) => new Response(null, { status: new URL(req.url).pathname === "/healthz" ? 204 : 404 }));
+  Deno.serve({ hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("PORT") || 9997), onListen() {} }, (req) => new Response(null, { status: new URL(req.url).pathname === "/healthz" ? 204 : 404 }));
   // The doors' port, which only their declared callers reach (door.ts).
   if (Object.keys(doors).length > 0) {
-    const hostname = Deno.env.get("SAYT_PLATFORM") === "host" ? "127.0.0.1" : "0.0.0.0";
+    const hostname = ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0";
     Deno.serve({ hostname, port: Number(Deno.env.get("DOOR_PORT") || 9998), onListen() {} }, serveDoors(doors, pgLedger(db), meshTransport(mesh), doorHeaders));
   }
   await runner.promise;

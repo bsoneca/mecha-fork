@@ -28,7 +28,7 @@ import { type EdgeFunctions, type EdgeMachines, installEngines, installHostStep 
 import { createEdgeAirlock, die, type EdgeAirlock, type EdgeEffectDeclarations } from './airlock.ts'
 import type { ClaimedRun, DispatchedRun, RunAnswer } from './dispatch.ts'
 import { hatchAt, type EdgeHatch } from './hatches.ts'
-import { verifyJwt } from '../../../services/auth/jwt.ts'
+import { STACK_ISSUER, verifyJwt } from '../../../services/auth/jwt.ts'
 import { providersFrom } from '../../../services/auth/oidc.ts'
 import { blobKeyOf, SIGNAL_MAX_BYTES } from './door.ts'
 import { applyScripts, ChangedScript, NoLedger, OutOfOrderScript, type Script, UnrunnableScript } from '../../pglite-workerd/scripts.ts'
@@ -140,15 +140,17 @@ export function edgeObject({ assets, tables, schema, storageFormat, machines = {
         // NULL, which ''::json refuses wherever a policy or trigger reads the
         // role: between requests the session holds the service's claims, as
         // the drains state theirs.
-        await db.exec(`SELECT set_config('request.jwt.claims', '{"role":"service"}', false)`)
+        await db.exec(`SELECT set_config('request.jwt.claims', '${JSON.stringify({ iss: STACK_ISSUER, role: 'service' })}', false)`)
         await installEngines(db, Object.keys(machines), Object.keys(functions))
         const ticks = clockMode === 'ticker' && await hasSchedules(db)
         const env = (name: string) => {
           const v = (this.env as unknown as Record<string, unknown>)[name]
           return typeof v === 'string' ? v : undefined
         }
-        // A provider that cannot be signed in through refuses the boot, as it
-        // refuses the auth service's start.
+        // A provider named in OIDC_PROVIDERS with neither a client id nor an
+        // issuer is dropped, not a boot failure; one with settings that cannot
+        // be signed in through still refuses the boot, as it refuses the auth
+        // service's start.
         const providers = providersFrom((name) => {
           if (/^OIDC_[A-Z0-9]+_CLIENT_ID$/.test(name)) return env(name) ?? (env(name.replace(/_CLIENT_ID$/, '_ISSUER')) ? 'origin' : undefined)
           if (/^OIDC_[A-Z0-9]+_AUTHORIZE_PARAMS$/.test(name)) {

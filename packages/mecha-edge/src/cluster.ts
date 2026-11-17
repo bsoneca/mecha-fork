@@ -634,7 +634,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
     u.pathname = u.pathname.replace(/^\/crud/, '')
     const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : await req.arrayBuffer()
     const inner = new Request(u, { method: req.method, headers: req.headers, body })
-    return serialize(() => createRestHandler(db, { role: 'service', scopes: () => [], claims: () => ({ role: 'service' }) }, cfg.schema)(inner))
+    return serialize(() => createRestHandler(db, { role: 'service', scopes: () => [], claims: () => ({ iss: STACK_ISSUER, role: 'service' }) }, cfg.schema)(inner))
   }
 
   async function handle(req: Request): Promise<Response> {

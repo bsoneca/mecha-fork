@@ -17,7 +17,8 @@
           "services/auth/main.ts",
           "services/auth/oidc.ts",
           "services/auth/origins.ts",
-          "services/auth/schema.ts"
+          "services/auth/schema.ts",
+          "services/auth/studio.ts"
         ],
         "dst": "/app/",
         "link": true,
@@ -55,7 +56,8 @@
       "services/auth/main.ts",
       "services/auth/oidc.ts",
       "services/auth/origins.ts",
-      "services/auth/schema.ts"
+      "services/auth/schema.ts",
+      "services/auth/studio.ts"
     ],
     "exclude": []
   },
@@ -148,7 +150,8 @@
           "services/auth/main.ts",
           "services/auth/oidc.ts",
           "services/auth/origins.ts",
-          "services/auth/schema.ts"
+          "services/auth/schema.ts",
+          "services/auth/studio.ts"
         ],
         "exclude": []
       },
@@ -188,7 +191,8 @@
           "services/auth/main.ts",
           "services/auth/oidc.ts",
           "services/auth/origins.ts",
-          "services/auth/schema.ts"
+          "services/auth/schema.ts",
+          "services/auth/studio.ts"
         ],
         "exclude": [],
         "defaultGlobs": null,
