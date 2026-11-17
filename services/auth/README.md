@@ -220,8 +220,8 @@ or a `STUDIO_JWKS_URL` that is not https (`localhost` is exempt).
   `STUDIO_ISS` (`iss`); `aud` equals `PUBLIC_ORIGIN` (`aud`); `exp` and `iat`
   are numbers (`claims`); `exp` is in the future, with no leeway (`expired`);
   `iat` is at most 30 s ahead (`iat`); `exp - iat` is at most 120 s
-  (`lifetime`); `sub` is a uuid (`sub`); `handle` is a non-empty string of at
-  most 120 characters (`handle`); `jti` is a string of at most 128 (`jti`).
+  (`lifetime`); `sub` is a uuid (`sub`); `handle`, trimmed, is 1 to 120 letters,
+  digits, spaces, `.`, `_` or `-` (`handle`); `jti` is a string of at most 128 (`jti`).
   A `handle` or `jti` holding a NUL is `claims`: Postgres stores none.
 - **The keys** come from `STUDIO_JWKS_URL` alone, never from the token's `iss`
   or a header. A key must be `kty` EC, `crv` P-256 and `use` sig; any other is
@@ -234,7 +234,9 @@ or a `STUDIO_JWKS_URL` that is not https (`localhost` is exempt).
   `mecha_auth.studio_jti (jti, exp)` and `app_user (id = sub, handle)` is
   upserted. A `jti` already there is 409 `replay`. A handle another account
   holds becomes `<handle>-<first 8 of sub>` (the session and the row say which);
-  when that is held too, 409 `handle_taken`. Any other failed upsert rolls the
+  when that is held too, 409 `handle_taken`. A `sub` that already names an account
+  with a passkey or a provider link is 409 `native_account`, and its `jti` is
+  left unspent. Any other failed upsert rolls the
   `jti` back, so the token is not spent. At each call that verified a token,
   rows more than 5 minutes past `exp` are deleted: `exp` has no leeway, so such
   a `jti` can never pass again, and the 5 minutes cover a database clock that

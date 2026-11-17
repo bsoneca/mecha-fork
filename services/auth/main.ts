@@ -1112,14 +1112,15 @@ async function studioSignIn(req: Request, ip: string): Promise<Response> {
     // savepoints keep the attempt atomic with the jti; past both, nothing is made and the token is not spent.
     const upsert = (h: string) =>
       tx.savepoint((sp) => sp`insert into app_user (id, handle) values (${sub}, ${h})
-        on conflict (id) do update set handle = excluded.handle`);
+        on conflict (id) do update set handle = excluded.handle
+        where app_user.handle is distinct from excluded.handle`);
     let taken = handle;
     try {
       await upsert(handle);
     } catch (e) {
       if ((e as { code?: string }).code !== "23505") throw e;
       try {
-        await upsert(taken = `${handle.slice(0, 100)}-${sub.slice(0, 8)}`);
+        await upsert(taken = `${[...handle].slice(0, 100).join("")}-${sub.slice(0, 8)}`);
       } catch (e2) {
         if ((e2 as { code?: string }).code !== "23505") throw e2;
         await tx`delete from mecha_auth.studio_jti where jti = ${jti}`;
