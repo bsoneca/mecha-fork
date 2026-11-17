@@ -670,6 +670,13 @@ BEGIN
     RAISE EXCEPTION '72 a read-only key wrote';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
+  -- A key token from before the stack named its issuer is held to its scopes too.
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1","scp":["read"]}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '77 an issuerless read-only key wrote';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
   PERFORM set_config('request.jwt.claims', '{"sub":"ana","iss":"mecha:stack","kid":"k1","scp":["write","machines:match"]}', true);
   PERFORM set_config('request.method', 'POST', true);
   PERFORM set_config('request.path', '/rpc/_f_call', true);
@@ -693,6 +700,12 @@ BEGIN
     RAISE EXCEPTION '75 a key token with no scopes read';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
+  PERFORM set_config('request.jwt.claims', '{"sub":"ana","kid":"k1"}', true);
+  BEGIN
+    PERFORM app_pre_request();
+    RAISE EXCEPTION '78 an issuerless key token with no scopes read';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
   -- The gate is the stack's own keys': a trusted issuer's token that happens
   -- to name a `kid`, with no `scp`, is that issuer's and passes.
   INSERT INTO mecha.token_role VALUES (current_user);
@@ -707,7 +720,7 @@ BEGIN
   PERFORM set_config('request.method', 'GET', true);
   PERFORM set_config('response.headers', '', true);
 
-  RAISE WARNING 'rls: 76/76 pass';
+  RAISE WARNING 'rls: 78/78 pass';
 END $$;
 
 DROP TABLE _f_posting, _f_note, _f_denied;

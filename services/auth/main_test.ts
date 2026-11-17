@@ -683,6 +683,21 @@ Deno.test({
   },
 });
 
+// The same read check stands at the gatekeeper: a key's token is a session to it, and its public shapes are reads.
+Deno.test({
+  name: "a key without read opens no public shape, and one with read does",
+  ...opts,
+  async fn() {
+    const { uid } = await mint("article");
+    const verifyAs = async (scp: unknown) => {
+      const token = await signJwt({ iss: STACK_ISSUER, role: "app_user", sub: uid, handle: "x", guest: false, kid: crypto.randomUUID(), ...(scp === undefined ? {} : { scp }), exp: nowS() + 600 });
+      return await handler(shapeReq(token, `/v1/shape?table=article&where=${encodeURIComponent(PUBLIC_WHERE)}`));
+    };
+    for (const scp of [["write"], [], undefined, "read"]) assertEquals((await verifyAs(scp)).status, 403, JSON.stringify(scp));
+    assertEquals((await verifyAs(["read"])).status, 200);
+  },
+});
+
 Deno.test({
   name: "the shape token carries the subject's scopes, not the client's request",
   ...opts,

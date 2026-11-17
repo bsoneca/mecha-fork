@@ -387,6 +387,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
     // The verifier stays in this browser's cookie; the state, which the
     // provider sees, carries only its hash.
     const state = await signJwt(cfg.secret, {
+      iss: STACK_ISSUER,
       purpose: "oidc",
       provider: name,
       issuer: p.issuer,
@@ -465,7 +466,7 @@ export function oidc(cfg: Config): (req: Request) => Promise<Response> | null {
       });
       return redirect(withHandoff(ret, handoff), [stateCookie(origin, name, "", 0)]);
     }
-    const session = await signJwt(cfg.secret, { purpose: "oidc-session", provider: name, issuer: p.issuer, sub: user.id, exp: now() + COOKIE_TTL_S });
+    const session = await signJwt(cfg.secret, { iss: STACK_ISSUER, purpose: "oidc-session", provider: name, issuer: p.issuer, sub: user.id, exp: now() + COOKIE_TTL_S });
     return redirect(ret, [
       `${sessionName(origin)}=${session}; Path=${sessionPath(origin)}; HttpOnly; SameSite=Lax${secure(origin)}; Max-Age=${COOKIE_TTL_S}`,
       `${HINT_COOKIE}=${name}; Path=/; SameSite=Lax${secure(origin)}; Max-Age=${COOKIE_TTL_S}`,

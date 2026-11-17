@@ -189,8 +189,9 @@ BEGIN
   -- write, a function call included, needs `write`; anything else, a read or a
   -- check with no request at all (the shape gatekeeper's), needs `read`. A
   -- session's token names no key and is unchanged. 42501 is PostgREST's 403.
-  -- Only a token the stack signed: another issuer's `kid` is its own claim.
-  IF stack AND claims ? 'kid' AND NOT coalesce(claims -> 'scp' ? CASE WHEN writes THEN 'write' ELSE 'read' END, false) THEN
+  -- Not another issuer's token, whose `kid` is its own claim: the stack's, and a
+  -- key token minted before it named an issuer, are held to their scopes.
+  IF NOT (named AND NOT stack) AND claims ? 'kid' AND NOT coalesce(claims -> 'scp' ? CASE WHEN writes THEN 'write' ELSE 'read' END, false) THEN
     RAISE EXCEPTION 'this API key''s scopes do not allow a %', CASE WHEN writes THEN 'write' ELSE 'read' END
       USING ERRCODE = '42501';
   END IF;

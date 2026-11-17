@@ -286,6 +286,8 @@ now (a page waiting for a checkout URL) goes through a **door** ([door.ts](door.
 `effects.json`'s `doors`, each `{idempotent: true, credential?, headers?, timeoutMs?, callers}`,
 with an HTTPEndpoint of its name on the airlock's daprd as an effect has (not the app's door, its caddy). Only the services named in
 `callers` reach port 9998 (`DOOR_PORT`), over a network or NetworkPolicy nothing else joins.
+Compose has no such per-caller wall, and the cluster targets neither expose nor admit that port
+in the airlock's container yet, so a door is for a cluster that supplies both.
 
 A caller POSTs `/door/<name>` with `{key, method, path, body?, contentType?, headers?, sinkKey?}`:
 the path as a handler's `sink.fetch` takes it, a body in JSON or, under another

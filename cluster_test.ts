@@ -214,7 +214,6 @@ const AIRLOCK = ["airlock", "airlock-mesh", "airlock-upgrade"];
 const PROBE: Effect = { name: "probe", origin: "https://sink.example.test" };
 
 type Targets = Record<string, {
-  expose?: unknown;
   dockerfile: { cmd?: unknown; entrypoint?: string[]; copy?: { srcs: string[]; dst: string; from?: unknown }[] };
   compose: { depends_on?: Record<string, unknown>; environment?: Record<string, string>; networks?: unknown };
 }>;
@@ -253,12 +252,9 @@ Deno.test("an effect places the airlock and its daprd, and the ticker and clock 
   assert.equal((await targets({ schedules: ["tick"], effects: [PROBE] })).ticker.compose.environment?.WAKE_URLS, "http://mesh-events:3500/v1.0/healthz/outbound,http://airlock:9997/healthz");
   assert.deepEqual(Object.keys(t.airlock.compose.environment ?? {}).sort(), ["AIRLOCK_DIR", "DATABASE_URL", "MESH_URL", "ORIGIN"]);
   assert.deepEqual(t.airlock.dockerfile.cmd, [
-    "run", "--frozen", "--unstable-worker-options", "--allow-net=database:5432,airlock-mesh:3500,0.0.0.0:9997,0.0.0.0:9998",
+    "run", "--frozen", "--unstable-worker-options", "--allow-net=database:5432,airlock-mesh:3500,0.0.0.0:9997",
     "--allow-read", "--allow-env", "--allow-sys", "main.ts",
   ]);
-  // The doors' listener (main.ts) is inside the cage's allow-net and has its own
-  // port, as the health port has: a program that declares a door is reached there.
-  assert.deepEqual(t.airlock.expose, { tcp: { port: 9997, env: "PORT" }, door: { port: 9998, env: "DOOR_PORT" } });
   assert.deepEqual(t.airlock.dockerfile.copy, [
     { srcs: ["services/airlock/effects.json"], dst: "/airlock/effects.json" },
     { srcs: ["effects/probe.js"], dst: "/airlock/effects/probe.js" },

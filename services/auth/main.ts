@@ -341,16 +341,17 @@ async function subjectOf(req: Request): Promise<Subject> {
   return { claims };
 }
 
+// An API key's token reaches what its scopes grant (rls.sql's app_pre_request): a shape
+// is a read, so a key without `read` mints none and is served none.
+const keyMayRead = (claims: Record<string, unknown>) =>
+  claims.kid === undefined || (Array.isArray(claims.scp) && claims.scp.includes("read"));
+
 // Mints one token per shape, so a token names the table it was issued for and
 // carries no reach beyond it.
 async function shapeToken(req: Request): Promise<Response> {
   const subject = await subjectOf(req);
   if (subject === "refused" || subject.claims === null) return jsonError(401, "invalid token");
-  // An API key's token reaches what its scopes grant (rls.sql's app_pre_request): a shape
-  // is a read, so a key without `read` mints none.
-  if (subject.claims.kid !== undefined && !(Array.isArray(subject.claims.scp) && subject.claims.scp.includes("read"))) {
-    return jsonError(403, "this API key's scopes do not allow a read");
-  }
+  if (!keyMayRead(subject.claims)) return jsonError(403, "this API key's scopes do not allow a read");
   const sub = subject.claims.sub as string;
   const body = await readBody(req);
   if (!body || !validTable(body.table)) return jsonError(400, "table required");
@@ -528,6 +529,7 @@ async function shapeVerify(req: Request): Promise<Response> {
     if (shapeTable(DB_SCHEMA, get("table") ?? "") !== claims.table) return jsonError(403, "table not authorized");
     if (get("where") !== claims.where) return jsonError(403, "where not authorized");
   } else {
+    if (!keyMayRead(claims)) return jsonError(403, "this API key's scopes do not allow a read");
     if (!validTable(get("table"))) return jsonError(403, "table not authorized");
     if (get("where") !== PUBLIC_WHERE) return jsonError(403, "where not authorized");
   }

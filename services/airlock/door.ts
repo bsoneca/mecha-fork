@@ -97,7 +97,7 @@ export function parseDoors(text: string, effects: Record<string, unknown> = {}):
       throw new Error(`effects.json: door ${name}: ${why}`);
     };
     if (!ENDPOINT.test(name)) bad("the name is not a DNS label");
-    if (name in effects) bad("an effect has the same name, and the name is the binding's");
+    if (Object.hasOwn(effects, name)) bad("an effect or a read has the same name, and the name is the binding's");
     if (d.idempotent !== true) bad("a door is idempotent: a call with no answer is called again with the same key");
     if (!Array.isArray(d.callers) || d.callers.length === 0 || !d.callers.every((c) => typeof c === "string" && ENDPOINT.test(c))) {
       bad("callers is not a list of services");

@@ -558,7 +558,7 @@ export async function createEdgeCluster(cfg: EdgeClusterConfig): Promise<EdgeClu
       ? ['public:']
       : await serialize(async () => (await publicOnly(table)) ? ['public:'] : await scopesOf(claims.sub as string))
     const where = shapeWhere(scopes)
-    const token = await signJwt(secret, { typ: 'shape', table, where, sub: claims.sub, exp: now() + SHAPE_TOKEN_TTL_S })
+    const token = await signJwt(secret, { iss: STACK_ISSUER, typ: 'shape', table, where, sub: claims.sub, exp: now() + SHAPE_TOKEN_TTL_S })
     return json(200, { token, table, where, expires_in: SHAPE_TOKEN_TTL_S })
   }
 
