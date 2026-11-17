@@ -1280,5 +1280,5 @@ export async function handler(req: Request, info?: { remoteAddr?: { hostname?: s
 if (import.meta.main) {
   await migrate();
   // A host launch moves the port (cluster.cue: AUTH_PORT); a container keeps 9999.
-  Deno.serve({ hostname: Deno.env.get("SAYT_PLATFORM") === "host" ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("AUTH_PORT") || Deno.env.get("PORT") || 9999) }, (req, info) => handler(req, info));
+  Deno.serve({ hostname: ["local", "host"].includes(Deno.env.get("SAYT_PLATFORM") ?? "") ? "127.0.0.1" : "0.0.0.0", port: Number(Deno.env.get("AUTH_PORT") || Deno.env.get("PORT") || 9999) }, (req, info) => handler(req, info));
 }
