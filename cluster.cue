@@ -332,7 +332,7 @@ _jobKeySql: _ @embed(file="services/airlock/job_key.sql", type=text)
 // system's loader, path and certificates, which a secret's value would
 // change or print; and the trusted issuer's settings crud's are interpolated
 // from (PGRST_JWKS among PG*), which the same environment would set.
-#ReservedSecretName: "^(DATABASE_URL|PG[A-Z0-9_]*|MESH_URL|AIRLOCK_[A-Z0-9_]*|TRUSTED_[A-Z0-9_]*|BLOB_URL|ORIGIN|PORT|SAYT_PLATFORM|BAYT_[A-Z0-9_]*|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|DENO_[A-Z0-9_]*|LD_[A-Z0-9_]*|PATH|HOME|TMPDIR|SSL_CERT_FILE|SSL_CERT_DIR)$"
+#ReservedSecretName: "^(DATABASE_URL|DOOR_PORT|PG[A-Z0-9_]*|MESH_URL|AIRLOCK_[A-Z0-9_]*|TRUSTED_[A-Z0-9_]*|BLOB_URL|ORIGIN|PORT|SAYT_PLATFORM|BAYT_[A-Z0-9_]*|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|DENO_[A-Z0-9_]*|LD_[A-Z0-9_]*|PATH|HOME|TMPDIR|SSL_CERT_FILE|SSL_CERT_DIR)$"
 
 #BridgeInstanceType: "lite" | "basic" | "standard-1" | "standard-2" | "standard-3" | "standard-4"
 
