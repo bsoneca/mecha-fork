@@ -10,6 +10,11 @@ A tier is what the cluster is made of in one place. The services, the schema
 and the door's routes are the same at every tier. What changes is the
 substrate, and with it what the change path can promise.
 
+The framework owns its database's schema, migrations, roles, grants and role
+passwords. Operators provide infrastructure and bootstrap credentials; other
+applications must not manage these objects or write around the framework's
+contracts. Externally managed roles and shared ownership are unsupported.
+
 ## The tiers
 
 | tier | the cluster runs as | in this tree |
