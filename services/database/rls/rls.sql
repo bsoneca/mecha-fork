@@ -379,6 +379,9 @@ DO $$ BEGIN
   END IF;
 END $$;
 DROP VIEW IF EXISTS mecha.rls_unprotected;
+-- Dropped before it is made: CREATE OR REPLACE refuses a changed row type on a
+-- database that holds the old one, and the view over it was dropped just above.
+DROP FUNCTION IF EXISTS mecha.rls_audit();
 CREATE OR REPLACE FUNCTION mecha.rls_audit()
   RETURNS TABLE (table_name text, reason text)
   LANGUAGE sql STABLE
