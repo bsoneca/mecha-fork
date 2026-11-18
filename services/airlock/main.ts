@@ -12,7 +12,7 @@ import { daprBlobs } from "./blobs.ts";
 import { admitAll, meshTransport } from "./handler.ts";
 import { parseDoors, pgLedger, serveDoors } from "./door.ts";
 import { parseReads } from "./read.ts";
-import { refuseDevKey, sealKeys } from "./seal.ts";
+import { refuseDevKey, sealKeys, sealLocal } from "./seal.ts";
 
 function required(name: string): string {
   const value = Deno.env.get(name);
@@ -49,7 +49,7 @@ if (import.meta.main) {
   // The key a secret field is sealed to, where an effect reads one, and the
   // one a rotation replaced, kept for what was sealed to it (seal.ts).
   const seal = Object.values(effects).some((e) => e.secretFields?.length)
-    ? refuseDevKey(await sealKeys(required("AIRLOCK_SEAL_KEY"), Deno.env.get("AIRLOCK_SEAL_KEY_PREVIOUS") || undefined), Deno.env.get("AIRLOCK_SEAL_DEV") === "local")
+    ? refuseDevKey(await sealKeys(required("AIRLOCK_SEAL_KEY"), Deno.env.get("AIRLOCK_SEAL_KEY_PREVIOUS") || undefined), sealLocal(Deno.env))
     : undefined;
   const db = new pg.Pool({ connectionString });
   const { key } = await hold(connectionString);
