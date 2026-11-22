@@ -53,7 +53,9 @@ const CALL_TIMEOUT_MS = 10_000;
 /**
  * The real transport: the effect's HTTP output binding on the airlock's daprd.
  * Metadata named with a capital letter goes out as a header, so the host alone
- * sets them: the idempotency key, and the content type when there is a body.
+ * sets them: the idempotency key, and the content type, the effect's own or JSON, on
+ * every call, a GET included: Stripe's /v2 API refuses a request that names none with
+ * 415 wsp_415_illegal_request_content_type, retrieving an account too (PRONTO-1616).
  * The binding answers the sink's status in `Metadata.statuscode`, because the
  * cluster declares it with errorIfNot2XX off; a status from daprd itself other
  * than 200 means the sink was never answered, and is no answer.
@@ -78,7 +80,7 @@ export function bindingsTransport(mesh: string): Transport {
           ...headers,
           path: sinkPath(path),
           "Idempotency-Key": key,
-          ...(init.body === undefined ? {} : { "Content-Type": init.contentType ?? "application/json" }),
+          "Content-Type": init.contentType ?? "application/json",
         },
       }),
     });
