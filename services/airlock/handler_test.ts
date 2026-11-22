@@ -216,6 +216,26 @@ Deno.test("the bindings transport sends the host's metadata last, so a credentia
   }
 });
 
+Deno.test("the bindings transport names a content type on a call with no body too, as Stripe's /v2 GETs need (PRONTO-1616)", async () => {
+  const sent: Record<string, unknown>[] = [];
+  const fetched = globalThis.fetch;
+  globalThis.fetch = (_url, init) => {
+    sent.push(JSON.parse(init!.body as string));
+    return Promise.resolve(new Response("{}", { status: 200, headers: { "metadata.statuscode": "200", "metadata.content-type": "application/json" } }));
+  };
+  try {
+    const t = bindingsTransport("http://mesh");
+    await t("stripe", "/v2/core/accounts/acct_1", { method: "GET" }, "k1", {});
+    await t("form", "/v1/sessions", { method: "GET", contentType: "application/x-www-form-urlencoded" }, "k2", {});
+    assertEquals(sent.map((r) => [r.operation, "data" in r, (r.metadata as Record<string, string>)["Content-Type"]]), [
+      ["get", false, "application/json"],
+      ["get", false, "application/x-www-form-urlencoded"],
+    ]);
+  } finally {
+    globalThis.fetch = fetched;
+  }
+});
+
 Deno.test("the bindings transport waits a call's own timeoutMs, else CALL_TIMEOUT_MS (PRONTO-271)", async () => {
   const real = globalThis.fetch;
   let calls = 0;
