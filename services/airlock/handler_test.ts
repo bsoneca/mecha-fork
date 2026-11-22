@@ -224,6 +224,13 @@ Deno.test("the mesh transport invokes the effect's endpoint, the host's key last
   assertEquals(sent[0].init.headers, { Accept: "application/json", "X-Api-Key": "vk", "Idempotency-Key": "charge:p1", "Content-Type": "application/json" });
 });
 
+Deno.test("the mesh transport names a content type on a call with no body too, as Stripe's /v2 GETs need (PRONTO-1616)", async () => {
+  const { sent } = await meshCall(Response.json({}), (t) => t("stripe", "/v2/core/accounts/acct_1", { method: "GET" }, "k1", {}));
+  assertEquals(sent[0].init.method, "GET");
+  assertEquals("body" in sent[0].init, false);
+  assertEquals((sent[0].init.headers as Record<string, string>)["Content-Type"], "application/json");
+});
+
 Deno.test("the mesh transport sends a declared content type's string as it is", async () => {
   const { sent } = await meshCall(new Response("ok"), (t) => t("form", "/v1/sessions", { method: "POST", body: "a=1&b=2", contentType: "application/x-www-form-urlencoded" }, "k", {}));
   assertEquals(sent[0].init.body, "a=1&b=2");
