@@ -71,7 +71,9 @@ export function meshTransport(mesh: string): Transport {
         ...init.headers,
         ...headers,
         "Idempotency-Key": key,
-        ...(init.body === undefined ? {} : { "Content-Type": init.contentType ?? "application/json" }),
+        // On every call, a GET too: Stripe's /v2 refuses a request that names none with
+        // 415 wsp_415_illegal_request_content_type (PRONTO-1616).
+        "Content-Type": init.contentType ?? "application/json",
       },
       ...(init.body === undefined ? {} : { body: encodedBody(init.contentType, init.body) }),
     });
